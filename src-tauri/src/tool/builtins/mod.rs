@@ -11,10 +11,12 @@ mod python;
 mod read_outline;
 mod search;
 mod search_core;
+pub(crate) mod search_engine;
 mod shell;
 mod skill;
 mod unity;
 mod view;
+mod web_fetch;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,7 +35,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(python::python());
     registry.register_builtin(search::grep());
     registry.register_builtin(unity::unity_asset_search());
-    registry.register_builtin(misc::web_fetch());
+    registry.register_builtin(web_fetch::web_fetch());
     registry.register_builtin(misc::todowrite());
 
     registry.register_builtin(filesystem::list());

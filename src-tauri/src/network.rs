@@ -136,6 +136,7 @@ pub struct ReqwestClientOptions {
     user_agent: Option<String>,
     gzip: Option<bool>,
     deflate: Option<bool>,
+    follow_redirects: Option<bool>,
 }
 
 impl Default for ReqwestClientOptions {
@@ -153,6 +154,7 @@ impl Default for ReqwestClientOptions {
             user_agent: None,
             gzip: None,
             deflate: None,
+            follow_redirects: None,
         }
     }
 }
@@ -219,6 +221,13 @@ impl ReqwestClientOptions {
 
     pub fn deflate(mut self, value: bool) -> Self {
         self.deflate = Some(value);
+        self
+    }
+
+    /// `false` returns 3xx responses to the caller instead of following them,
+    /// so it can inspect every hop (e.g. a destination check per redirect).
+    pub fn follow_redirects(mut self, value: bool) -> Self {
+        self.follow_redirects = Some(value);
         self
     }
 }
@@ -688,6 +697,9 @@ fn build_reqwest_client(
     }
     if let Some(value) = options.deflate {
         builder = builder.deflate(value);
+    }
+    if options.follow_redirects == Some(false) {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
     }
 
     let builder = {

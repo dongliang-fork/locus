@@ -105,6 +105,12 @@ tree-sitter-c-sharp = "=0.23.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "std"] }
 html2md = "0.2.15"
+# web_fetch: iterative HTML conversion on html2md's parser stack, plus
+# charset detection for pages that declare no encoding.
+html5ever = "0.27.0"
+markup5ever_rcdom = "0.3.0"
+encoding_rs = "0.8.35"
+chardetng = "1.0.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ndarray = "0.17.2"
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }

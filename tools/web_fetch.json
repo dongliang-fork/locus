@@ -1,24 +1,28 @@
 {
-  "description": "Fetch a URL for agent-readable content.\n- The URL must start with http:// or https://\n- Format options: \"markdown\" (default), \"html\", or \"text\"\n- For markdown output, the tool asks the original URL for markdown/text first, returns markdown or plain text directly, and converts HTML responses to markdown\n- Results are truncated at maxChars characters, default 50,000",
+  "description": "Fetch a public http(s) URL and return its content as markdown (default), plain text, or raw HTML.\n- The output starts with a header (final URL after redirects, title, content type, notes), followed by the content.\n- HTML becomes readable markdown: scripts, navigation, hidden elements and form controls are removed, the page's <main>/<article> is used when it holds the content, links are absolute, and the page charset is detected.\n- Long content is paged: each call returns up to maxChars characters (default 50000, max 200000) and the footer gives the offset for the next call. Calls with offset > 0 reuse the fetched page for 15 minutes.\n- Only text content is returned (HTML, markdown, plain text, JSON, XML, ...). PDFs, images, archives and other binary files are rejected, as are responses over 5 MiB; download those with bash or python.\n- Local and private network addresses (localhost, LAN, cloud metadata) are blocked; use bash or python for them.\n- Pages that need JavaScript, a login, or a bot check (e.g. Cloudflare) cannot be read; a note or the error says so. Use another source instead of retrying the same URL.\n- format \"text\" returns plain text without markdown syntax; \"html\" returns the raw HTML.",
   "parameters": {
     "type": "object",
     "properties": {
       "url": {
         "type": "string",
-        "description": "The URL to fetch (must start with http:// or https://)"
+        "description": "The http:// or https:// URL to fetch"
       },
       "format": {
         "type": "string",
-        "enum": ["markdown", "html", "text"],
-        "description": "Return format: markdown (default), html, or text"
+        "enum": ["markdown", "text", "html"],
+        "description": "Return format: markdown (default), text, or html"
       },
       "timeout": {
         "type": "integer",
-        "description": "Timeout in seconds (max 120, default 30)"
+        "description": "Timeout in seconds for the whole fetch (1-120, default 30)"
       },
       "maxChars": {
         "type": "integer",
-        "description": "Maximum number of characters to return (max 200000, default 50000)"
+        "description": "Maximum characters of content to return (default 50000, max 200000)"
+      },
+      "offset": {
+        "type": "integer",
+        "description": "Character offset to start from, for reading the next part of long content (default 0)"
       }
     },
     "required": ["url"]
