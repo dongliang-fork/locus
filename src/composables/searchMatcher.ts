@@ -49,43 +49,66 @@ export function prepareSearchText(text: string): PreparedSearchText {
   return { terms, compact: terms.join("") };
 }
 
-export function scorePreparedSearchText(query: PreparedSearchText, field: PreparedSearchText): number | null {
+/** Match classes from strongest to weakest; `fuzzy` is an in-order subsequence. */
+export const SEARCH_MATCH_RANK = {
+  fuzzy: 0,
+  allTerms: 1,
+  substring: 2,
+  termPrefix: 3,
+  termExact: 4,
+  prefix: 5,
+  exact: 6,
+} as const;
+
+export interface PreparedSearchMatch {
+  rank: number;
+  score: number;
+}
+
+/** Classifies a non-empty query against one field. Scores match `scorePreparedSearchText`. */
+export function matchPreparedSearchText(query: PreparedSearchText, field: PreparedSearchText): PreparedSearchMatch | null {
   const queryTerms = query.terms;
   const compactQuery = query.compact;
-  if (!compactQuery) return 0;
+  if (!compactQuery) return { rank: SEARCH_MATCH_RANK.exact, score: 0 };
 
   const candidateTerms = field.terms;
   if (candidateTerms.length === 0) return null;
   const compactCandidate = field.compact;
 
   if (compactCandidate === compactQuery) {
-    return 1000;
+    return { rank: SEARCH_MATCH_RANK.exact, score: 1000 };
   }
 
   if (compactCandidate.startsWith(compactQuery)) {
-    return 920 - Math.min(compactCandidate.length, 40);
+    return { rank: SEARCH_MATCH_RANK.prefix, score: 920 - Math.min(compactCandidate.length, 40) };
   }
 
   if (candidateTerms.some((term) => term === compactQuery)) {
-    return 860;
+    return { rank: SEARCH_MATCH_RANK.termExact, score: 860 };
   }
 
   if (candidateTerms.some((term) => term.startsWith(compactQuery))) {
-    return 820;
+    return { rank: SEARCH_MATCH_RANK.termPrefix, score: 820 };
   }
 
   const compactIndex = compactCandidate.indexOf(compactQuery);
   if (compactIndex >= 0) {
-    return 760 - compactIndex * 4;
+    return { rank: SEARCH_MATCH_RANK.substring, score: 760 - compactIndex * 4 };
   }
 
   if (queryTerms.length > 1 && queryTerms.every((term) =>
     candidateTerms.some((candidateTerm) => candidateTerm.includes(term))
   )) {
-    return 640;
+    return { rank: SEARCH_MATCH_RANK.allTerms, score: 640 };
   }
 
-  return subsequenceGapScore(compactQuery, compactCandidate);
+  const fuzzyScore = subsequenceGapScore(compactQuery, compactCandidate);
+  return fuzzyScore === null ? null : { rank: SEARCH_MATCH_RANK.fuzzy, score: fuzzyScore };
+}
+
+export function scorePreparedSearchText(query: PreparedSearchText, field: PreparedSearchText): number | null {
+  if (!query.compact) return 0;
+  return matchPreparedSearchText(query, field)?.score ?? null;
 }
 
 export function scoreSearchFields(query: string, fields: SearchField[]): number | null {

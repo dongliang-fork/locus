@@ -1,6 +1,11 @@
-import { prepareSearchText, scorePreparedSearchText } from "../../composables/searchMatcher";
+import {
+  SEARCH_MATCH_RANK,
+  matchPreparedSearchText,
+  prepareSearchText,
+  type PreparedSearchText,
+} from "../../composables/searchMatcher";
 
-export type MentionSearchEntryKind = "asset" | "knowledge" | "sceneObject" | "view" | "session";
+export type MentionSearchEntryKind = "asset" | "knowledge" | "sceneObject" | "view" | "session" | "branch";
 
 export interface MentionSearchRankable {
   name: string;
@@ -25,6 +30,8 @@ function sourcePriority(result: MentionSearchRankable): number {
 }
 
 export function mentionResultKey(result: Pick<MentionSearchRankable, "relPath"> & { entryKind?: MentionSearchEntryKind }): string {
+  // Git ref names are case-sensitive and may equal a workspace path.
+  if (result.entryKind === "branch") return `branch:${result.relPath}`;
   const path = result.relPath.replace(/\\/g, "/").replace(/\/+$/, "");
   if (result.entryKind === "sceneObject") return `scene:${path}`;
   // Knowledge refs use type-relative paths; workspace search returns the same
@@ -36,12 +43,34 @@ export function mentionResultKey(result: Pick<MentionSearchRankable, "relPath"> 
   return workspacePath.toLowerCase();
 }
 
-function searchFields(result: MentionSearchRankable) {
+interface MentionSearchField {
+  text: PreparedSearchText;
+  weight: number;
+  /** The display name (file name, title, object name) rather than a path. */
+  isName: boolean;
+}
+
+interface MentionMatch {
+  /** Name match > path match; substring-level matches > fuzzy subsequences. */
+  tier: number;
+  rank: number;
+  score: number;
+}
+
+function compareMatches(left: MentionMatch, right: MentionMatch): number {
+  return right.tier - left.tier || right.rank - left.rank || right.score - left.score;
+}
+
+function searchFields(result: MentionSearchRankable): MentionSearchField[] {
   // Session discovery is by title; IDs and archive labels are only metadata.
-  if (result.entryKind === "session") return [{ text: prepareSearchText(result.name), weight: 180 }];
+  // Branches match by ref name; commit subjects in their metadata would add noise.
+  if (result.entryKind === "session" || result.entryKind === "branch") {
+    return [{ text: prepareSearchText(result.name), weight: 180, isName: true }];
+  }
   return [
     {
       text: result.name,
+      isName: true,
       weight: result.entryKind === "knowledge"
         ? 210 + Math.min(Math.floor(result.matchScore / 12), 60)
         : result.entryKind === "sceneObject"
@@ -50,17 +79,36 @@ function searchFields(result: MentionSearchRankable) {
     },
     {
       text: result.relPath,
+      isName: false,
       weight: result.entryKind === "knowledge"
         ? 145 + Math.min(Math.floor(result.matchScore / 24), 35)
         : result.entryKind === "sceneObject"
           ? 135
           : 90 + Math.min(Math.floor(result.matchScore / 24), 45),
     },
-    { text: result.parentPath, weight: 30 },
-    { text: result.meta || "", weight: 50 },
-  ].filter((field) => field.text).map((field) => ({
-    text: prepareSearchText(field.text), weight: field.weight,
-  }));
+    { text: result.parentPath, isName: false, weight: 30 },
+    { text: result.meta || "", isName: false, weight: 50 },
+  ].filter((field) => field.text)
+    .map((field) => ({ text: prepareSearchText(field.text), weight: field.weight, isName: field.isName }));
+}
+
+function bestFieldMatch(query: PreparedSearchText, fields: MentionSearchField[]): MentionMatch | null {
+  let best: MentionMatch | null = null;
+  for (const field of fields) {
+    const match = matchPreparedSearchText(query, field.text);
+    if (!match) continue;
+    const fuzzy = match.rank === SEARCH_MATCH_RANK.fuzzy;
+    // Characters scattered so widely that the gap penalty used the whole
+    // budget are not a meaningful match (typically across a long path).
+    if (fuzzy && match.score <= 0) continue;
+    const candidate = {
+      tier: (fuzzy ? 0 : 2) + (field.isName ? 1 : 0),
+      rank: match.rank,
+      score: match.score + field.weight,
+    };
+    if (!best || compareMatches(candidate, best) < 0) best = candidate;
+  }
+  return best;
 }
 
 export function rankMentionSearchResults<T extends MentionSearchRankable>(
@@ -88,10 +136,10 @@ export function rankMentionSearchResults<T extends MentionSearchRankable>(
     }
   }
   const preparedQuery = prepareSearchText(query);
-  const matches: Array<{ item: T; score: number }> = [];
+  const matches: Array<{ item: T; match: MentionMatch }> = [];
   for (const item of unique.values()) {
     if (!preparedQuery.compact) {
-      matches.push({ item, score: 0 });
+      matches.push({ item, match: { tier: 0, rank: 0, score: 0 } });
       continue;
     }
     let cached = preparedFields.get(item);
@@ -104,13 +152,14 @@ export function rankMentionSearchResults<T extends MentionSearchRankable>(
       };
       preparedFields.set(item, cached);
     }
-    let best = -Infinity;
-    for (const field of cached.fields) {
-      const score = scorePreparedSearchText(preparedQuery, field.text);
-      if (score !== null) best = Math.max(best, score + field.weight);
-    }
-    if (best !== -Infinity) matches.push({ item, score: best });
+    const match = bestFieldMatch(preparedQuery, cached.fields);
+    if (match) matches.push({ item, match });
   }
-  return matches.sort((a, b) => sourcePriority(a.item) - sourcePriority(b.item) || b.score - a.score)
+  // A name match always outranks a path-only match. Open tabs and workspace
+  // tree entries only lead among results of the same tier and match class.
+  return matches.sort((a, b) => b.match.tier - a.match.tier
+    || b.match.rank - a.match.rank
+    || sourcePriority(a.item) - sourcePriority(b.item)
+    || b.match.score - a.match.score)
     .slice(0, limit).map((match) => match.item);
 }

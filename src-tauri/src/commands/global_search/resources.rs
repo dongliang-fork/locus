@@ -1,12 +1,8 @@
 use super::{bounded_title, excerpt, GlobalSearchHit, GlobalSearchPage};
 use crate::commands::workspace::{
-    is_allowed_linked_asset_rel_path, normalize_workspace_sub_path,
-    should_skip_workspace_entry_with_hidden,
+    is_allowed_linked_asset_rel_path, should_skip_workspace_entry_with_hidden,
 };
-use std::{
-    path::Path,
-    time::{Duration, Instant, UNIX_EPOCH},
-};
+use std::{path::Path, time::UNIX_EPOCH};
 
 fn resource_hit(
     kind: &'static str,
@@ -31,38 +27,59 @@ fn resource_hit(
     }
 }
 
+/// File hits per page. The ranked list is rebuilt for every page, so one page
+/// covers the panel's initial result budget with a single walk.
+const FILE_PAGE_SIZE: usize = 40;
+
+/// Ranks a path that contains `query_lower` (ASCII case-insensitive). Lower
+/// keys sort first: an exact file name or stem, a file-name prefix, a match
+/// inside the file name (earlier first), and last a match only in a parent
+/// directory, so every file-name match precedes every path-only match.
+fn file_match_key(rel: &str, name: &str, query_lower: &str) -> Option<(u8, usize)> {
+    if !rel.to_ascii_lowercase().contains(query_lower) {
+        return None;
+    }
+    let name_lower = name.to_ascii_lowercase();
+    let stem = name_lower
+        .rsplit_once('.')
+        .map_or(name_lower.as_str(), |(stem, _)| stem);
+    Some(if name_lower == query_lower || stem == query_lower {
+        (0, 0)
+    } else if name_lower.starts_with(query_lower) {
+        (1, 0)
+    } else if let Some(index) = name_lower.find(query_lower) {
+        (2, index)
+    } else {
+        (3, 0)
+    })
+}
+
+struct RankedFile {
+    tier: u8,
+    position: usize,
+    rel: String,
+    entry: walkdir::DirEntry,
+}
+
 pub(super) fn search_files_page(
     root: &Path,
     query: &str,
     cursor: Option<&str>,
 ) -> Result<GlobalSearchPage, String> {
-    if let Some(cursor) = cursor {
-        if cursor.len() > 8192
-            || cursor.is_empty()
-            || normalize_workspace_sub_path(cursor).map_err(|e| e.to_string())? != cursor
-        {
-            return Err("Invalid file search cursor".into());
-        }
-    }
-    let started = Instant::now();
-    let mut matches = Vec::new();
-    let mut scanned = 0;
-    // Component ordering is the same as sorted depth-first traversal (a/x
-    // precedes a.cs). Prune completed branches when resuming a page.
+    let offset = match cursor {
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| "Invalid file search cursor".to_string())?,
+        None => 0,
+    };
+    let query_lower = query.to_ascii_lowercase();
+    let mut ranked = Vec::new();
     let walk = walkdir::WalkDir::new(root)
         .min_depth(1)
         .max_depth(64)
         .follow_links(true)
-        .sort_by(|left, right| {
-            left.file_name()
-                .to_string_lossy()
-                .cmp(&right.file_name().to_string_lossy())
-        })
         .into_iter()
         .filter_entry(|entry| {
-            if entry.depth() == 0 {
-                return true;
-            }
             let name = entry.file_name().to_string_lossy();
             let is_dir = entry.file_type().is_dir();
             if should_skip_workspace_entry_with_hidden(&name, is_dir, false, None)
@@ -70,21 +87,16 @@ pub(super) fn search_files_page(
             {
                 return false;
             }
+            if !(is_dir && entry.path_is_symlink()) {
+                return true;
+            }
             let rel = entry
                 .path()
                 .strip_prefix(root)
                 .unwrap_or(entry.path())
                 .to_string_lossy()
                 .replace('\\', "/");
-            if is_dir && entry.path_is_symlink() && !is_allowed_linked_asset_rel_path(&rel) {
-                return false;
-            }
-            !is_dir
-                || cursor.is_none_or(|after| {
-                    rel.split('/').cmp(after.split('/')).is_gt()
-                        || after.starts_with(&format!("{rel}/"))
-                        || rel == after
-                })
+            is_allowed_linked_asset_rel_path(&rel)
         });
     for entry in walk {
         let entry = match entry {
@@ -100,43 +112,75 @@ pub(super) fn search_files_page(
             }
             Err(error) => return Err(format!("File search failed: {error}")),
         };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // Unity `.meta` sidecars duplicate every asset hit.
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("meta"))
+        {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
         let rel = entry
             .path()
             .strip_prefix(root)
             .map_err(|e| e.to_string())?
             .to_string_lossy()
             .replace('\\', "/");
-        if cursor.is_some_and(|after| !rel.split('/').cmp(after.split('/')).is_gt()) {
+        let Some((tier, position)) = file_match_key(&rel, &name, &query_lower) else {
             continue;
-        }
-        scanned += 1;
-        if entry.file_type().is_file() && excerpt(&rel, query).is_some() {
-            let modified_at = entry
+        };
+        ranked.push(RankedFile {
+            tier,
+            position,
+            rel,
+            entry,
+        });
+    }
+    ranked.sort_by(|left, right| {
+        left.tier
+            .cmp(&right.tier)
+            .then(left.position.cmp(&right.position))
+            .then(
+                left.entry
+                    .file_name()
+                    .len()
+                    .cmp(&right.entry.file_name().len()),
+            )
+            .then(left.entry.depth().cmp(&right.entry.depth()))
+            .then_with(|| left.rel.cmp(&right.rel))
+    });
+    let total = ranked.len();
+    let end = offset.saturating_add(FILE_PAGE_SIZE).min(total);
+    let matches = ranked
+        .into_iter()
+        .skip(offset)
+        .take(FILE_PAGE_SIZE)
+        .map(|file| {
+            let modified_at = file
+                .entry
                 .metadata()
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|time| time.as_millis().min(i64::MAX as u128) as i64)
                 .unwrap_or(0);
-            matches.push(resource_hit(
+            resource_hit(
                 "file",
-                rel.clone(),
-                &entry.file_name().to_string_lossy(),
-                rel.clone(),
+                file.rel.clone(),
+                &file.entry.file_name().to_string_lossy(),
+                file.rel,
                 query,
                 modified_at,
-            ));
-        }
-        if matches.len() >= 20 || scanned >= 256 || started.elapsed() >= Duration::from_millis(60) {
-            return Ok(GlobalSearchPage {
-                matches,
-                next_cursor: Some(rel),
-            });
-        }
-    }
+            )
+        })
+        .collect();
     Ok(GlobalSearchPage {
         matches,
-        next_cursor: None,
+        next_cursor: (end < total).then(|| end.to_string()),
     })
 }
 
@@ -265,7 +309,7 @@ mod tests {
         let mut paths = std::collections::HashSet::new();
         loop {
             let page = search_files_page(temp.path(), "character-中文", cursor.as_deref()).unwrap();
-            assert!(page.matches.len() <= 20);
+            assert!(page.matches.len() <= FILE_PAGE_SIZE);
             for hit in page.matches {
                 assert_eq!(hit.kind, "file");
                 assert!(hit.modified_at > 0);
@@ -278,7 +322,7 @@ mod tests {
         }
         assert_eq!(paths.len(), 135);
         let page = search_files_page(temp.path(), "assets/scripts/character", None).unwrap();
-        assert_eq!(page.matches.len(), 20);
+        assert_eq!(page.matches.len(), FILE_PAGE_SIZE);
         assert!(search_files_page(temp.path(), "character.*", None)
             .unwrap()
             .matches
@@ -287,23 +331,46 @@ mod tests {
     }
 
     #[test]
-    fn file_search_can_resume_after_a_page_without_matches() {
+    fn file_search_returns_a_late_match_on_the_first_page() {
         let temp = tempfile::tempdir().unwrap();
         for i in 0..300 {
             std::fs::write(temp.path().join(format!("a-{i:03}.txt")), "").unwrap();
         }
         std::fs::write(temp.path().join("z-needle.txt"), "").unwrap();
         let first = search_files_page(temp.path(), "needle", None).unwrap();
-        assert!(first.matches.is_empty());
-        assert!(first.next_cursor.is_some());
-        let mut cursor = first.next_cursor;
-        let mut hits = Vec::new();
-        while let Some(after) = cursor {
-            let page = search_files_page(temp.path(), "needle", Some(&after)).unwrap();
-            hits.extend(page.matches);
-            cursor = page.next_cursor;
+        assert_eq!(first.matches.len(), 1);
+        assert_eq!(first.matches[0].id, "z-needle.txt");
+        assert!(first.next_cursor.is_none());
+    }
+
+    #[test]
+    fn file_search_ranks_file_name_matches_before_path_matches_and_skips_meta() {
+        let temp = tempfile::tempdir().unwrap();
+        for path in [
+            "Assets/Characters/C003_Kalan/Actions/Configuration/Foo.asset",
+            "Assets/Characters/C003_Kalan/Actions/Configuration.meta",
+            "Assets/Characters/Elora/EloraWithKalan.asset",
+            "Assets/Characters/Elora/Elora_KalanActions.asset",
+            "Assets/Scripts/KalanController.cs",
+            "Assets/Scripts/KalanController.cs.meta",
+            "Assets/Zeta/Kalan.unity",
+        ] {
+            let path = temp.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
         }
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "z-needle.txt");
+        let page = search_files_page(temp.path(), "kalan", None).unwrap();
+        let ids: Vec<&str> = page.matches.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "Assets/Zeta/Kalan.unity",
+                "Assets/Scripts/KalanController.cs",
+                "Assets/Characters/Elora/Elora_KalanActions.asset",
+                "Assets/Characters/Elora/EloraWithKalan.asset",
+                "Assets/Characters/C003_Kalan/Actions/Configuration/Foo.asset",
+            ]
+        );
+        assert!(page.next_cursor.is_none());
     }
 }

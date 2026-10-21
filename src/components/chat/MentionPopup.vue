@@ -3,7 +3,7 @@
 import { useWindowSurface } from "../../composables/useWindowSurface";
 const { ownerWindow } = useWindowSurface();
 import { computed, ref, watch } from "vue";
-import { MessageSquare } from "lucide";
+import { GitBranch, MessageSquare } from "lucide";
 import { t } from "../../i18n";
 import { formatWorkspaceUpdatedTime } from "../../composables/useFormatters";
 import LucideIcon from "../icons/LucideIcon.vue";
@@ -178,6 +178,7 @@ function presentation(entry: MentionDisplayEntry) {
 
 function iconNodeForEntry(entry: MentionDisplayEntry) {
   if (entry.entryKind === "session") return MessageSquare;
+  if (entry.entryKind === "branch") return GitBranch;
   if (entry.entryKind === "view") return resolveLocusViewIcon(entry.viewIcon);
   return unityAssetIconNodeForPath(entry.relPath, {
     isFolder: entry.isDir,
@@ -187,7 +188,7 @@ function iconNodeForEntry(entry: MentionDisplayEntry) {
 }
 
 function iconClassForEntry(entry: MentionDisplayEntry) {
-  if (entry.entryKind === "session") return "";
+  if (entry.entryKind === "session" || entry.entryKind === "branch") return "";
   if (entry.entryKind === "view") return "";
   return unityAssetIconClassForPath(entry.relPath, {
     isFolder: entry.isDir,

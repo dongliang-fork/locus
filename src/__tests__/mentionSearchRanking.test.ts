@@ -57,13 +57,46 @@ describe("mention search ranking", () => {
     ]);
   });
 
-  it("ranks matching tabs, then tree entries, then backend results without duplicates", () => {
+  it("orders by match class before tab and tree sources without duplicates", () => {
     const tab = { ...result("asset", "PlayerInput.cs", "Assets/PlayerInput.cs"), source: "tab" as const };
     const tree = { ...result("asset", "InputSettings", "Assets/InputSettings"), source: "tree" as const };
     const remote = result("asset", "Input", "Assets/Input");
     const duplicate = result("asset", "PlayerInput.cs", "assets\\PlayerInput.cs");
     const unrelated = { ...result("asset", "Camera", "Assets/Camera"), source: "tab" as const };
-    expect(rankMentionSearchResults([remote, duplicate, tree, tab, unrelated], "input")).toEqual([tab, tree, remote]);
+    expect(rankMentionSearchResults([remote, duplicate, tree, tab, unrelated], "input")).toEqual([remote, tree, tab]);
+  });
+
+  it("ranks matching tabs, then tree entries, then backend results within the same match class", () => {
+    const tab = { ...result("asset", "InputTabSettings.cs", "Assets/InputTabSettings.cs"), source: "tab" as const };
+    const tree = { ...result("asset", "InputTree", "Assets/InputTree"), source: "tree" as const };
+    const remote = result("asset", "InputRemote", "Assets/InputRemote");
+    expect(rankMentionSearchResults([remote, tree, tab], "input")).toEqual([tab, tree, remote]);
+  });
+
+  it("ranks a file name prefix above names that only contain the query", () => {
+    const elora = {
+      ...result("asset", "Elora_KalanActions_CombatProfile.asset", "Assets/Characters/Elora/Elora_KalanActions_CombatProfile.asset"),
+      source: "tree" as const,
+    };
+    const glb = result(
+      "asset",
+      "A_Kalan_Kalan_Attack1.glb",
+      "Assets/Characters/C003_Kalan/Animations/Imported/Kalan/AttackCombo_20260911/A_Kalan_Kalan_Attack1.glb",
+    );
+    expect(rankMentionSearchResults([elora, glb], "A_Kalan")).toEqual([glb, elora]);
+  });
+
+  it("ranks any file name match above a path-only match, including from tabs", () => {
+    const folderMatch = { ...result("asset", "Foo.prefab", "Assets/Characters/C003_Kalan/Attack/Foo.prefab"), source: "tab" as const };
+    const nameMatch = result("asset", "Kalanattack.prefab", "Assets/Characters/C003_Kalan/Prefabs/Kalanattack.prefab");
+    expect(rankMentionSearchResults([folderMatch, nameMatch], "attack")).toEqual([nameMatch, folderMatch]);
+  });
+
+  it("drops subsequence matches scattered across a long path but keeps close fuzzy names", () => {
+    const scattered = result("asset", "Lan.prefab", `Assets/K${"x".repeat(40)}/A${"y".repeat(40)}/Lan.prefab`);
+    const close = result("asset", "Kalan.prefab", "Assets/Kalan.prefab");
+    expect(rankMentionSearchResults([scattered], "kalan")).toEqual([]);
+    expect(rankMentionSearchResults([scattered, close], "kln")).toEqual([close]);
   });
 
   it.each(["design", "plan", "memory", "skill", "reference"])(
@@ -96,6 +129,19 @@ describe("mention search ranking", () => {
     const items = Array.from({ length: 500 }, (_, index) => result("asset", `Item${index}`, `Assets/Item${index}`));
     expect(rankMentionSearchResults(items, "")).toEqual(items.slice(0, 120));
     expect(rankMentionSearchResults(items, "Item")).toHaveLength(120);
+  });
+
+  it("keeps branches distinct from same-named paths and case variants", () => {
+    const folder = result("asset", "dev", "dev");
+    const branch = { ...result("branch", "dev", "dev"), parentPath: "" };
+    const upper = { ...result("branch", "Dev", "Dev"), parentPath: "" };
+    expect(rankMentionSearchResults([folder, branch, upper], "dev")).toHaveLength(3);
+  });
+
+  it("matches branches by ref name but not by commit subject metadata", () => {
+    const branch = { ...result("branch", "origin/main", "origin/main"), parentPath: "", meta: "Remote branch · 31d4 · input refactor" };
+    expect(rankMentionSearchResults([branch], "originmain")).toEqual([branch]);
+    expect(rankMentionSearchResults([branch], "refactor")).toEqual([]);
   });
 
   it("refreshes prepared text when a candidate is renamed", () => {

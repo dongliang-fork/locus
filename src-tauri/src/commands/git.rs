@@ -3791,6 +3791,37 @@ pub struct GitBranchesResult {
     pub remotes: Vec<(String, Vec<GitRemoteBranch>)>,
 }
 
+/// Parses one `git branch -v` line: `<marker> <name> <hash> <subject>`. The
+/// marker is `*` for the current branch and `+` for a branch checked out in
+/// another worktree. A detached HEAD is listed as `* (HEAD detached at …)`,
+/// which is not a branch.
+fn parse_local_branch_line(line: &str) -> Option<GitBranchInfo> {
+    let is_current = line.starts_with('*');
+    let line = line.trim_start_matches(['*', '+']).trim();
+    if is_current && line.starts_with('(') {
+        return None;
+    }
+    let (name, short_hash, message) = split_branch_columns(line)?;
+    Some(GitBranchInfo {
+        name: name.to_string(),
+        is_current,
+        short_hash: short_hash.to_string(),
+        message: message.to_string(),
+    })
+}
+
+/// Splits `<name> <hash> <subject>`; `git branch -v` pads the name column
+/// with a variable run of spaces.
+fn split_branch_columns(line: &str) -> Option<(&str, &str, &str)> {
+    let (name, rest) = line.trim().split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let (short_hash, message) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if short_hash.is_empty() {
+        return None;
+    }
+    Some((name, short_hash, message.trim()))
+}
+
 #[tauri::command]
 pub async fn git_branches(
     registry: State<'_, Arc<ProjectRegistry>>,
@@ -3813,34 +3844,14 @@ pub async fn git_branches(
         .output()
         .map_err(|e| format!("git branch failed: {}", e))?;
 
-    let mut local = Vec::new();
-    if local_output.status.success() {
-        let stdout = String::from_utf8_lossy(&local_output.stdout);
-        for line in stdout.lines() {
-            let is_current = line.starts_with('*');
-            let line = line.trim_start_matches('*').trim();
-            if line.is_empty() {
-                continue;
-            }
-            // format: "branch_name  hash message..."
-            let parts: Vec<&str> = line.splitn(3, char::is_whitespace).collect();
-            if parts.len() >= 2 {
-                let name = parts[0].to_string();
-                let short_hash = parts[1].to_string();
-                let message = if parts.len() >= 3 {
-                    parts[2].trim().to_string()
-                } else {
-                    String::new()
-                };
-                local.push(GitBranchInfo {
-                    name,
-                    is_current,
-                    short_hash,
-                    message,
-                });
-            }
-        }
-    }
+    let local = if local_output.status.success() {
+        String::from_utf8_lossy(&local_output.stdout)
+            .lines()
+            .filter_map(parse_local_branch_line)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let remote_output = command("git")
         .args([
@@ -3870,15 +3881,9 @@ pub async fn git_branches(
             if line.contains("->") {
                 continue;
             }
-            let parts: Vec<&str> = line.splitn(3, char::is_whitespace).collect();
-            if parts.len() >= 2 {
-                let full_name = parts[0];
-                let short_hash = parts[1].to_string();
-                let message = if parts.len() >= 3 {
-                    parts[2].trim().to_string()
-                } else {
-                    String::new()
-                };
+            if let Some((full_name, short_hash, message)) = split_branch_columns(line) {
+                let short_hash = short_hash.to_string();
+                let message = message.to_string();
                 // split "origin/branch_name"
                 if let Some(slash_pos) = full_name.find('/') {
                     let remote_name = full_name[..slash_pos].to_string();
@@ -4595,6 +4600,46 @@ pub async fn git_set_user_config(name: String, email: String) -> Result<(), AppE
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod git_branch_parse_tests {
+    use super::{parse_local_branch_line, split_branch_columns};
+
+    #[test]
+    fn local_branch_lines_keep_padded_hash_and_markers() {
+        let current = parse_local_branch_line("* main          31d47686 chore: release")
+            .expect("current branch");
+        assert_eq!(current.name, "main");
+        assert!(current.is_current);
+        assert_eq!(current.short_hash, "31d47686");
+        assert_eq!(current.message, "chore: release");
+
+        let linked = parse_local_branch_line("+ feat/hotreload 0f804270 [ahead 1] test")
+            .expect("branch checked out in another worktree");
+        assert_eq!(linked.name, "feat/hotreload");
+        assert!(!linked.is_current);
+        assert_eq!(linked.short_hash, "0f804270");
+        assert_eq!(linked.message, "[ahead 1] test");
+
+        let plain = parse_local_branch_line("  dev 48633715").expect("branch without subject");
+        assert_eq!((plain.name.as_str(), plain.message.as_str()), ("dev", ""));
+    }
+
+    #[test]
+    fn local_branch_lines_skip_detached_head_and_blank_lines() {
+        assert!(parse_local_branch_line("* (HEAD detached at 31d4686) 31d4686 msg").is_none());
+        assert!(parse_local_branch_line("* (no branch, rebasing dev) 31d4686 msg").is_none());
+        assert!(parse_local_branch_line("   ").is_none());
+    }
+
+    #[test]
+    fn remote_branch_columns_tolerate_padding() {
+        assert_eq!(
+            split_branch_columns("origin/main          31d47686 chore: release"),
+            Some(("origin/main", "31d47686", "chore: release"))
+        );
+    }
 }
 
 #[cfg(test)]
