@@ -93,11 +93,11 @@
     },
     {
       "path": "src/services/project.ts",
-      "bytes": 8639
+      "bytes": 10119
     },
     {
       "path": "src/stores/workspaceContext.ts",
-      "bytes": 25400
+      "bytes": 25477
     },
     {
       "path": "src/services/workspaceEventHub.ts",
@@ -473,11 +473,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 302610
+      "bytes": 307315
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 294600
+      "bytes": 299280
     },
     {
       "path": "src/services/asset.ts",
@@ -561,7 +561,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 88101
+      "bytes": 89801
     }
   ]
 }
