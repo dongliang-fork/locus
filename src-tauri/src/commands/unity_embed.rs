@@ -1174,36 +1174,36 @@ pub(crate) fn handle_unity_embed_webview_event(
 }
 
 pub(crate) fn handle_locus_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
-    if !is_locus_drop_target_label(window.label()) {
+    if let tauri::WindowEvent::DragDrop(drag_event) = event {
+        handle_locus_window_drag_drop(window.app_handle(), window.label(), drag_event);
+    }
+}
+
+/// Window-level file drag handling, shared by Tauri's drag events and the
+/// supplementary Windows drop targets in `webview_drop_target`.
+pub(crate) fn handle_locus_window_drag_drop(
+    app_handle: &AppHandle,
+    label: &str,
+    drag_event: &tauri::DragDropEvent,
+) {
+    if !is_locus_drop_target_label(label) {
         return;
     }
 
-    if let tauri::WindowEvent::DragDrop(drag_event) = event {
-        if let Err(error) =
-            emit_locus_file_drag_state_to(window.app_handle(), window.label(), drag_event)
-        {
-            eprintln!("[Locus] failed to emit local file drag state: {error}");
-        }
+    if let Err(error) = emit_locus_file_drag_state_to(app_handle, label, drag_event) {
+        eprintln!("[Locus] failed to emit local file drag state: {error}");
     }
 
-    let (paths, x, y) = match event {
-        tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) => {
-            (paths.clone(), position.x, position.y)
-        }
+    let (paths, x, y) = match drag_event {
+        tauri::DragDropEvent::Drop { paths, position } => (paths.clone(), position.x, position.y),
         _ => return,
     };
     if paths.is_empty() {
-        commit_cached_unity_asset_drag_drop_to(window.app_handle(), window.label());
+        commit_cached_unity_asset_drag_drop_to(app_handle, label);
         return;
     }
 
-    handle_locus_drop_paths(
-        window.app_handle().clone(),
-        window.label().to_string(),
-        paths,
-        x,
-        y,
-    );
+    handle_locus_drop_paths(app_handle.clone(), label.to_string(), paths, x, y);
 }
 
 fn handle_locus_drop_paths(
@@ -1262,7 +1262,7 @@ fn commit_cached_unity_asset_drag_drop_to(app_handle: &AppHandle, label: &str) {
     clear_unity_embed_asset_drag_after_release(app_handle, &workspace_ref);
 }
 
-fn is_locus_drop_target_label(label: &str) -> bool {
+pub(crate) fn is_locus_drop_target_label(label: &str) -> bool {
     is_unity_embed_window_label(label)
         || is_locus_view_window_label(label)
         || crate::workspace_window::is_workspace_window(label)
