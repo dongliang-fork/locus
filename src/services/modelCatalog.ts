@@ -9,11 +9,33 @@ import type {
   EffortLevel,
   ModelCatalogModel,
   ModelCatalogProvider,
+  OpenRouterSearchEngine,
   ReasoningParamFormat,
   ReasoningReplayField,
 } from "../types";
 
 export const DEFAULT_CATALOG_CONTEXT_LENGTH = 256_000;
+
+/** Engines forwarded as `openrouter:web_search` `parameters.engine`
+ *  (mirrors `OPENROUTER_SEARCH_ENGINES` in src-tauri llm/web_search.rs). */
+export const OPENROUTER_SEARCH_ENGINES: readonly OpenRouterSearchEngine[] = [
+  "native",
+  "exa",
+  "parallel",
+  "firecrawl",
+  "perplexity",
+];
+
+/** OpenRouter gets its own server-side search tool on both chat and
+ *  Anthropic-format endpoints (same host check as the backend). */
+export function isOpenRouterEndpoint(endpoint: string | null | undefined): boolean {
+  try {
+    const host = new URL((endpoint ?? "").trim()).hostname.toLowerCase();
+    return host === "openrouter.ai" || host.endsWith(".openrouter.ai");
+  } catch {
+    return false;
+  }
+}
 
 export const DEFAULT_REASONING_EFFORTS: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 export const DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS = 5 * 60;

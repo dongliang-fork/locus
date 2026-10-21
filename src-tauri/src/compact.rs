@@ -536,6 +536,14 @@ fn estimate_tool_call_prompt_tokens(tool_call: &ToolCallInfo) -> u32 {
         .saturating_add(estimate_text_tokens(
             tool_call.server_tool_output.as_deref().unwrap_or_default(),
         ))
+        // Native replay sends the provider's result block (encrypted excerpts).
+        .saturating_add(
+            tool_call
+                .server_tool_result
+                .as_ref()
+                .map(|result| estimate_text_tokens(&result.content.to_string()))
+                .unwrap_or(0),
+        )
 }
 
 pub(crate) fn estimate_message_prompt_tokens(message: &ChatMessage) -> u32 {
@@ -2875,6 +2883,7 @@ mod tests {
                     order: Some(2),
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: Some(crate::commands::ToolCallOutcome::Done),
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -3113,6 +3122,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -3142,6 +3152,7 @@ mod tests {
                 order: None,
                 server_tool: None,
                 server_tool_output: None,
+                server_tool_result: None,
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,
@@ -3368,6 +3379,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -3380,6 +3392,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: Some(crate::commands::ToolCallOutcome::Done),
             recorded_output: Some("nested output ".repeat(60_000)),
             nested_tool_calls: None,
@@ -3443,6 +3456,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -3518,6 +3532,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: Some("recorded output should be stripped".repeat(200)),
                     nested_tool_calls: None,
@@ -3564,6 +3579,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -3616,6 +3632,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -3825,6 +3842,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -3863,6 +3881,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -3893,6 +3912,7 @@ mod tests {
                     order: None,
                     server_tool: Some(crate::session::models::ServerToolKind::WebSearch),
                     server_tool_output: Some("search result ".repeat(4_000)),
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -4132,6 +4152,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -4188,6 +4209,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -4241,6 +4263,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -4304,6 +4327,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,

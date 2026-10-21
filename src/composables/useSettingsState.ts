@@ -84,6 +84,7 @@ import {
   isDeepSeekV4Model,
   modelRowIdFromApiModel,
   newCustomProvider,
+  OPENROUTER_SEARCH_ENGINES,
 } from "../services/modelCatalog";
 import { t } from "../i18n";
 import { filterVisibleProviders } from "../config/providerVisibility";
@@ -1471,8 +1472,11 @@ export function useSettingsState(emit: SettingsEmit) {
   function normalizeServerTools(
     value?: Partial<CustomProviderModel["serverTools"]> | null,
   ): CustomProviderModel["serverTools"] {
+    const engine = value?.webSearchEngine;
     return {
       webSearch: value?.webSearch === true,
+      // Absent = OpenRouter's automatic engine; keeps the legacy shape intact.
+      ...(engine && OPENROUTER_SEARCH_ENGINES.includes(engine) ? { webSearchEngine: engine } : {}),
     };
   }
 

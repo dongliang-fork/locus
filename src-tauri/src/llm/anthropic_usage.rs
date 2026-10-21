@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
+use super::anthropic::CLAUDE_CODE_VERSION;
+
 const ANTHROPIC_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
-const USER_AGENT: &str = "claude-code/2.1.92";
 const USAGE_REFRESH_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug)]
@@ -133,7 +134,7 @@ pub async fn fetch_anthropic_rate_limits(
         .get(ANTHROPIC_USAGE_ENDPOINT)
         .header("Authorization", format!("Bearer {access_token}"))
         .header("Content-Type", "application/json")
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", format!("claude-code/{CLAUDE_CODE_VERSION}"))
         .header("anthropic-beta", OAUTH_BETA_HEADER)
         .send()
         .await

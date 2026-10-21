@@ -1,0 +1,22 @@
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"The latest","role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":" stable Rust release is version 1.99.1, published on October 15","role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":", 2026. It is a point release following the 1.99","role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":".0 release that addresses several regression fixes, including missing compiler built-in symbols and FFI return value handling","role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":".","role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":null,"reasoning_details":[{"type":"reasoning.encrypted","data":"REDACTED","format":"google-gemini-v1","index":0}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","annotations":[{"type":"url_citation","url_citation":{"url":"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGo60M3P9XITgGfNteOheKyxAs2fINpWEl6YZUIOPoRMiapZ4xWEcye7W4ip1Tc5yIKL2_3kxJH-sTDZ2i0bU6PbjY0ybPrMqsZHrquYRRFBoNyzCAx-sUHcAmFk7Cp6w_W5KyncrE=","title":"rust-lang.org","start_index":0,"end_index":79}}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","annotations":[{"type":"url_citation","url_citation":{"url":"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQGhAgsyhv4c1iZ_edWL5Rhg7FKZwnkJLOjEnQpvZsSTMjhU0Y57fd1yRtZbADukvtKV3kTTCDJn9FwVfV4fnH6-Z6k0NNjYo94LjbEGjVwRgURs_XMN_VZX1l72slZUdQ==","title":"rust-lang.org","start_index":81,"end_index":246}}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":null},"finish_reason":"stop","native_finish_reason":"STOP"}]}
+
+data: {"id":"gen-1792410777-Zyc0AKgrVC0msfVgjbaW","object":"chat.completion.chunk","created":1792410777,"model":"google/gemini-3.8-flash","provider":"Google","service_tier":"provisioned","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop","native_finish_reason":"STOP"}],"usage":{"prompt_tokens":80,"completion_tokens":82,"total_tokens":162,"cost":0.0283675,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":0,"video_tokens":0},"cost_details":{"upstream_inference_cost":0.0283675,"upstream_inference_prompt_cost":6e-05,"upstream_inference_completions_cost":0.0003075},"completion_tokens_details":{"reasoning_tokens":0,"image_tokens":0,"audio_tokens":0},"server_tool_use_details":{"web_search_requests":2}}}
+
+data: [DONE]
+

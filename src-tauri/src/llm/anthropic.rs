@@ -4,11 +4,19 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::utf8_stream::Utf8StreamDecoder;
-use crate::session::models::{ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo};
+use super::web_search::{self, SearchHit, WebSearchTool};
+use crate::session::models::{
+    ChatMessage, Citation, ImageData, MessageRole, ServerToolKind, ServerToolResultBlock,
+    ToolCallInfo,
+};
 
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub text: String,
+    /// Source citations attached to non-empty text blocks (UTF-16 offsets).
+    pub citations: Vec<Citation>,
+    /// Provider-reported request cost (OpenRouter `usage.cost`); 0 when absent.
+    pub cost_usd: f64,
     pub tool_calls: Vec<ToolCallInfo>,
     pub finish_reason: String,
     pub input_tokens: u32,
@@ -44,7 +52,8 @@ const NATIVE_LAZY_BETA_FLAG: &str = "advanced-tool-use-2025-11-20";
 const API_VERSION: &str = "2023-06-01";
 const API_BASE: &str = "https://api.anthropic.com";
 
-const USER_AGENT: &str = "claude-cli/2.1.92 (external, sdk-cli)";
+// Keep OAuth messages, billing metadata and quota requests on one client version.
+pub(super) const CLAUDE_CODE_VERSION: &str = "2.1.302";
 const X_APP: &str = "cli";
 const X_STAINLESS_LANG: &str = "js";
 const X_STAINLESS_PACKAGE_VERSION: &str = "0.80.0";
@@ -53,9 +62,8 @@ const X_STAINLESS_RUNTIME_VERSION: &str = "v24.3.0";
 const X_STAINLESS_TIMEOUT: &str = "600";
 const CACHE_TTL: &str = "1h";
 const RAW_CHUNK_DEBUG_PREVIEW_CHARS: usize = 1600;
+const WEB_SEARCH_TOOL_RESULT_TYPE: &str = "web_search_tool_result";
 
-const BILLING_HEADER_BLOCK: &str =
-    "x-anthropic-billing-header: cc_version=2.1.92.19c; cc_entrypoint=sdk-rs; cch=00000;";
 const AGENT_SDK_IDENTITY: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 const OAUTH_COMPAT_FALLBACK_MODEL: &str = "claude-opus-4-1-20250805";
 
@@ -667,7 +675,7 @@ pub async fn stream_chat_native<F, G, H>(
     base_url: &str,
     thinking_level: Option<&str>,
     replay_thinking_blocks: bool,
-    include_web_search: bool,
+    web_search: Option<&WebSearchTool>,
     request_session_id: Option<&str>,
     tag: &str,
     debug: bool,
@@ -695,17 +703,23 @@ where
 
     let tool_reference_names = tool_reference_names_for_request(tools);
     let uses_native_lazy_tools = tool_reference_names.is_some();
+    // Recorded search result blocks go back natively only to the endpoint
+    // that produced them, and only while its Anthropic search tool is on.
+    let server_tool_replay_origin = matches!(web_search, Some(WebSearchTool::AnthropicNative))
+        .then(|| endpoint_host(base_url))
+        .flatten();
     let mut messages = build_anthropic_messages(
         history,
         AnthropicHistoryOptions::custom_endpoint(replay_thinking_blocks)
-            .with_tool_reference_names(tool_reference_names),
+            .with_tool_reference_names(tool_reference_names)
+            .with_server_tool_replay_origin(server_tool_replay_origin),
     );
     // No ttl on custom endpoints: the 1h value needs the official
     // `extended-cache-ttl-2025-04-11` beta header, which this path does not
     // send, and third-party gateways expect the plain ephemeral form.
     apply_cache_control(&mut messages, None);
 
-    let anthropic_tools = build_native_anthropic_tools(tools, include_web_search);
+    let anthropic_tools = build_native_anthropic_tools(tools, web_search);
     let tool_count = anthropic_tools.len();
 
     let (thinking_field, output_config, standard_max_tokens) =
@@ -974,7 +988,17 @@ where
     let mut thinking_start: Option<std::time::Instant> = None;
     let mut thinking_duration_secs: u32 = 0;
     let mut web_search_results: Vec<WebSearchResult> = Vec::new();
-    let mut server_tool_inputs: HashMap<usize, String> = HashMap::new();
+    let mut message_id = String::new();
+    let mut full_text_utf16: u32 = 0;
+    // UTF-16 span of each text block inside `full_text`, keyed by block index.
+    let mut text_spans: HashMap<usize, (u32, u32)> = HashMap::new();
+    // Every search-result citation in arrival order, with its text block index.
+    let mut cited_hits: Vec<(usize, SearchHit)> = Vec::new();
+    // Citations for searches that never surfaced a tool block (OpenRouter
+    // Google-native grounding only reports them as citations plus usage).
+    let mut unattached_hits: Vec<SearchHit> = Vec::new();
+    let mut provider_search_requests: u32 = 0;
+    let mut cost_usd: f64 = 0.0;
 
     const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     let mut got_message_stop = false;
@@ -1090,10 +1114,21 @@ where
                                     name,
                                     input_json: String::new(),
                                     server_tool_output: None,
+                                    server_tool: false,
+                                    search_hits: Vec::new(),
+                                    server_tool_result: None,
                                 });
                             }
                             "server_tool_use" => {
-                                let name = ev.content_block.name.unwrap_or_default();
+                                // Provider-executed: never dispatched locally,
+                                // whether or not a result block follows
+                                // (OpenRouter sends results only as citations).
+                                let raw_name = ev.content_block.name.unwrap_or_default();
+                                let name = if web_search::is_web_search_tool_name(&raw_name) {
+                                    web_search::WEB_SEARCH_TOOL_NAME.to_string()
+                                } else {
+                                    raw_name
+                                };
                                 let id = ev.content_block.id.unwrap_or_default();
                                 on_tool_call_start(id.clone(), name.clone());
                                 tool_calls.push(PartialToolCall {
@@ -1102,27 +1137,36 @@ where
                                     name,
                                     input_json: String::new(),
                                     server_tool_output: None,
+                                    server_tool: true,
+                                    search_hits: Vec::new(),
+                                    server_tool_result: None,
                                 });
-                                server_tool_inputs.insert(ev.index, String::new());
                             }
                             "web_search_tool_result" => {
-                                // Find the most recent server tool call to attach results to.
-                                let server_tc = tool_calls
-                                    .iter_mut()
-                                    .rev()
-                                    .find(|tc| tc.name == "web_search");
+                                // Attach results to the call they name, else to
+                                // the most recent search call.
+                                let result_for = ev.content_block.tool_use_id.as_deref();
+                                let is_search = |tc: &PartialToolCall| {
+                                    tc.server_tool && tc.name == web_search::WEB_SEARCH_TOOL_NAME
+                                };
+                                let target = result_for
+                                    .and_then(|id| {
+                                        tool_calls
+                                            .iter()
+                                            .rposition(|tc| is_search(tc) && tc.id == id)
+                                    })
+                                    .or_else(|| tool_calls.iter().rposition(is_search));
+                                let mut server_tc = target.map(|index| &mut tool_calls[index]);
+                                if let (Some(tc), Some(content)) =
+                                    (server_tc.as_deref_mut(), &ev.content_block.content)
+                                {
+                                    tc.server_tool_result = Some(content.clone());
+                                }
                                 if let Some(content) = &ev.content_block.content {
                                     if let Some(arr) = content.as_array() {
-                                        let query = server_tool_inputs
-                                            .values()
-                                            .last()
-                                            .and_then(|json| {
-                                                serde_json::from_str::<serde_json::Value>(json).ok()
-                                            })
-                                            .and_then(|v| {
-                                                v.get("query")
-                                                    .and_then(|q| q.as_str().map(String::from))
-                                            })
+                                        let query = server_tc
+                                            .as_ref()
+                                            .and_then(|tc| search_query_from_input(&tc.input_json))
                                             .unwrap_or_default();
                                         let hits: Vec<WebSearchHit> = arr
                                             .iter()
@@ -1133,27 +1177,31 @@ where
                                                 })
                                             })
                                             .collect();
-                                        if !hits.is_empty() {
-                                            let summary = format!(
-                                                "{}\n{}",
-                                                query,
-                                                hits.iter()
-                                                    .enumerate()
-                                                    .map(|(i, h)| format!(
-                                                        "{}. {} ({})",
-                                                        i + 1,
-                                                        h.title,
-                                                        h.url
-                                                    ))
-                                                    .collect::<Vec<_>>()
-                                                    .join("\n")
-                                            );
-                                            if let Some(tc) = server_tc {
+                                        let summary = if hits.is_empty() {
+                                            format!("{}\nNo results.", query).trim().to_string()
+                                        } else {
+                                            let search_hits: Vec<SearchHit> = hits
+                                                .iter()
+                                                .map(|hit| SearchHit {
+                                                    url: hit.url.clone(),
+                                                    title: Some(hit.title.clone()),
+                                                    excerpt: None,
+                                                })
+                                                .collect();
+                                            web_search::format_search_output(
+                                                Some(&query),
+                                                &search_hits,
+                                            )
+                                        };
+                                        if let Some(tc) = server_tc {
+                                            if !query.is_empty() {
                                                 tc.input_json =
                                                     serde_json::json!({ "query": &query })
                                                         .to_string();
-                                                tc.server_tool_output = Some(summary);
                                             }
+                                            tc.server_tool_output = Some(summary);
+                                        }
+                                        if !hits.is_empty() {
                                             web_search_results.push(WebSearchResult {
                                                 query,
                                                 results: hits,
@@ -1171,7 +1219,10 @@ where
                                     }
                                 }
                             }
-                            _ => {} // text block, thinking block, etc.
+                            "text" => {
+                                text_spans.insert(ev.index, (full_text_utf16, full_text_utf16));
+                            }
+                            _ => {} // thinking, redacted_thinking, etc.
                         }
                     }
                 }
@@ -1193,20 +1244,47 @@ where
                                             0
                                         };
                                     }
+                                    let span_start = full_text_utf16;
                                     full_text.push_str(text);
+                                    full_text_utf16 =
+                                        full_text_utf16.saturating_add(web_search::utf16_len(text));
+                                    text_spans
+                                        .entry(ev.index)
+                                        .or_insert((span_start, span_start))
+                                        .1 = full_text_utf16;
                                     on_text_delta(text.clone());
+                                }
+                            }
+                            "citations_delta" => {
+                                if let Some(hit) = ev
+                                    .delta
+                                    .citation
+                                    .as_ref()
+                                    .and_then(SearchHit::from_citation)
+                                {
+                                    // Results belong to the latest search that has
+                                    // no `web_search_tool_result` of its own.
+                                    match tool_calls.iter_mut().rev().find(|tc| {
+                                        tc.server_tool
+                                            && tc.name == web_search::WEB_SEARCH_TOOL_NAME
+                                    }) {
+                                        Some(tc) if tc.server_tool_output.is_none() => {
+                                            web_search::push_hit(&mut tc.search_hits, hit.clone());
+                                        }
+                                        Some(_) => {}
+                                        None => {
+                                            web_search::push_hit(&mut unattached_hits, hit.clone());
+                                        }
+                                    }
+                                    cited_hits.push((ev.index, hit));
                                 }
                             }
                             "input_json_delta" => {
                                 if let Some(ref json) = ev.delta.partial_json {
                                     if let Some(tc) =
-                                        tool_calls.iter_mut().find(|tc| tc.index == ev.index)
+                                        tool_calls.iter_mut().rev().find(|tc| tc.index == ev.index)
                                     {
                                         tc.input_json.push_str(json);
-                                    }
-                                    // Also accumulate for server tool inputs (web search)
-                                    if let Some(input) = server_tool_inputs.get_mut(&ev.index) {
-                                        input.push_str(json);
                                     }
                                 }
                             }
@@ -1243,6 +1321,25 @@ where
                         }
                         if let Some(ref usage) = ev.usage {
                             output_tokens = usage.output_tokens;
+                            // message_delta usage is cumulative. OpenRouter reports
+                            // input/cache totals only here (message_start says 0),
+                            // and server-tool loops grow them after message_start.
+                            if usage.input_tokens > 0 {
+                                input_tokens = usage.input_tokens;
+                            }
+                            if usage.cache_read_input_tokens > 0 {
+                                cache_read_tokens = usage.cache_read_input_tokens;
+                            }
+                            if usage.cache_creation_input_tokens > 0 {
+                                cache_write_tokens = usage.cache_creation_input_tokens;
+                            }
+                            if let Some(ref server_tool_use) = usage.server_tool_use {
+                                provider_search_requests = provider_search_requests
+                                    .max(server_tool_use.web_search_requests);
+                            }
+                            if let Some(cost) = usage.cost.filter(|cost| cost.is_finite()) {
+                                cost_usd = cost;
+                            }
                         }
                     }
                 }
@@ -1256,6 +1353,9 @@ where
                         &data_str,
                         debug,
                     ) {
+                        if let Some(id) = ev.message.id.filter(|id| !id.is_empty()) {
+                            message_id = id;
+                        }
                         if let Some(ref usage) = ev.message.usage {
                             input_tokens = usage.input_tokens;
                             output_tokens = usage.output_tokens;
@@ -1317,19 +1417,21 @@ where
         ));
     }
 
-    let final_tool_calls: Vec<ToolCallInfo> = tool_calls
+    let surfaced_searches = tool_calls
+        .iter()
+        .filter(|tc| tc.server_tool && tc.name == web_search::WEB_SEARCH_TOOL_NAME)
+        .count() as u32;
+    let origin = endpoint_host(api_url);
+    let mut final_tool_calls: Vec<ToolCallInfo> = tool_calls
         .into_iter()
         .map(|tc| {
-            let (name, arguments) = if tc.server_tool_output.is_some() {
-                (tc.name, tc.input_json)
-            } else if let Some(aliases) = oauth_tool_aliases {
+            if tc.server_tool {
+                return finish_server_tool_call(tc, origin.as_deref());
+            }
+            let (name, arguments) = if let Some(aliases) = oauth_tool_aliases {
                 aliases.internalize_tool_call(&tc.name, &tc.input_json)
             } else {
                 (tc.name, tc.input_json)
-            };
-            let server_tool = match name.as_str() {
-                "web_search" if tc.server_tool_output.is_some() => Some(ServerToolKind::WebSearch),
-                _ => None,
             };
 
             ToolCallInfo {
@@ -1337,14 +1439,43 @@ where
                 name,
                 arguments,
                 order: None,
-                server_tool,
-                server_tool_output: tc.server_tool_output,
+                server_tool: None,
+                server_tool_output: None,
+                server_tool_result: None,
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,
             }
         })
         .collect();
+
+    // Searches the provider ran without a `server_tool_use` block (OpenRouter
+    // with Google-native grounding) still get a record, so the UI shows them
+    // and their sources are replayed to later rounds.
+    if provider_search_requests > surfaced_searches || !unattached_hits.is_empty() {
+        let id = if message_id.is_empty() {
+            format!("srvtoolu_{}", uuid::Uuid::new_v4().simple())
+        } else {
+            format!("{}_web_search", message_id)
+        };
+        final_tool_calls.push(web_search::provider_search_record(
+            id,
+            provider_search_requests.saturating_sub(surfaced_searches),
+            &unattached_hits,
+        ));
+    }
+
+    // Only citations on text the user sees become inline references; ones on
+    // empty carrier blocks (OpenRouter Exa results) live in the search record.
+    let citations = web_search::finalize_citations(
+        cited_hits
+            .iter()
+            .filter_map(|(index, hit)| {
+                let (start, end) = *text_spans.get(index)?;
+                (end > start).then(|| web_search::url_citation(hit, start, end))
+            })
+            .collect(),
+    );
 
     let finish_reason = if final_tool_calls
         .iter()
@@ -1365,6 +1496,8 @@ where
 
     Ok(LlmResponse {
         text: full_text,
+        citations,
+        cost_usd,
         tool_calls: final_tool_calls,
         finish_reason,
         input_tokens,
@@ -1378,6 +1511,66 @@ where
         thinking_signature,
         web_search_results,
     })
+}
+
+fn search_query_from_input(input_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(input_json)
+        .ok()?
+        .get("query")?
+        .as_str()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_string)
+}
+
+/// Lower-cased host of an endpoint URL: the scope within which a provider's
+/// opaque server-tool content (encrypted search excerpts) can be replayed.
+fn endpoint_host(url: &str) -> Option<String> {
+    url::Url::parse(url.trim())
+        .ok()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .filter(|host| !host.is_empty())
+}
+
+/// Provider-executed tool call: always carries `server_tool_output`, so it is
+/// never dispatched locally and never forces a follow-up round. `origin` is the
+/// endpoint host, recorded with the raw result block for native replay.
+fn finish_server_tool_call(tc: PartialToolCall, origin: Option<&str>) -> ToolCallInfo {
+    let is_search = tc.name == web_search::WEB_SEARCH_TOOL_NAME;
+    let server_tool_result = match (origin, tc.server_tool_result) {
+        (Some(origin), Some(content)) if is_search => Some(ServerToolResultBlock {
+            origin: origin.to_string(),
+            block_type: WEB_SEARCH_TOOL_RESULT_TYPE.to_string(),
+            content,
+        }),
+        _ => None,
+    };
+    let output = match tc.server_tool_output {
+        Some(output) => output,
+        None if is_search => web_search::format_search_output(
+            search_query_from_input(&tc.input_json).as_deref(),
+            &tc.search_hits,
+        ),
+        None => format!("Provider-side tool `{}` ran on the server.", tc.name),
+    };
+    let arguments = if tc.input_json.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        tc.input_json
+    };
+    ToolCallInfo {
+        id: tc.id,
+        name: tc.name,
+        arguments,
+        order: None,
+        server_tool: is_search.then_some(ServerToolKind::WebSearch),
+        server_tool_output: Some(output),
+        server_tool_result,
+        outcome: None,
+        recorded_output: None,
+        nested_tool_calls: None,
+    }
 }
 
 ///
@@ -1405,6 +1598,7 @@ fn build_thinking_params(
         || normalized_model.contains("claude-mythos-5")
         || normalized_model.contains("claude-mythos-preview");
     let is_adaptive = is_always_adaptive
+        || normalized_model.contains("opus-5-5")
         || normalized_model.contains("sonnet-4-6")
         || normalized_model.contains("opus-4-8")
         || normalized_model.contains("opus-4-7")
@@ -1470,6 +1664,10 @@ struct AnthropicHistoryOptions {
     /// reference to an undeclared tool (deleted skill, renamed tool) degrades
     /// to plain text instead of a `Tool reference not found` 400.
     tool_reference_names: Option<std::collections::HashSet<String>>,
+    /// Endpoint host whose recorded server-tool result blocks may be replayed
+    /// natively. Set only when this request declares that endpoint's own
+    /// Anthropic search tool; other results fall back to user-side text.
+    server_tool_replay_origin: Option<String>,
 }
 
 impl AnthropicHistoryOptions {
@@ -1478,6 +1676,7 @@ impl AnthropicHistoryOptions {
             replay_thinking_blocks: true,
             require_thinking_signature: false,
             tool_reference_names: None,
+            server_tool_replay_origin: None,
         }
     }
 
@@ -1486,6 +1685,7 @@ impl AnthropicHistoryOptions {
             replay_thinking_blocks,
             require_thinking_signature: true,
             tool_reference_names: None,
+            server_tool_replay_origin: None,
         }
     }
 
@@ -1494,6 +1694,11 @@ impl AnthropicHistoryOptions {
         names: Option<std::collections::HashSet<String>>,
     ) -> Self {
         self.tool_reference_names = names;
+        self
+    }
+
+    fn with_server_tool_replay_origin(mut self, origin: Option<String>) -> Self {
+        self.server_tool_replay_origin = origin;
         self
     }
 }
@@ -1535,6 +1740,17 @@ enum HistoryContentBlock {
     ToolResult {
         tool_use_id: String,
         content: ToolResultContent,
+    },
+    /// Provider-executed call, replayed together with its result block.
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// The provider's own search result, `encrypted_content` included.
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
     },
     /// Reference to a deferred tool (`defer_loading: true`); the API expands
     /// the full definition in place. Only emitted when the native lazy
@@ -1591,30 +1807,22 @@ fn build_anthropic_messages(
 ) -> Vec<AnthropicMessage> {
     let history = crate::session::history::normalize_tool_round_history_for_request(history);
     let mut messages: Vec<AnthropicMessage> = Vec::new();
+    // Server-tool output that cannot be replayed natively rides in the next
+    // user-role message. Replayed inside the assistant turn it read as text
+    // the model had written itself, and DeepSeek started writing fabricated
+    // `[Web Search Result]` lists instead of calling the tool.
+    let mut pending_server_notes: Vec<HistoryContentBlock> = Vec::new();
 
     let mut i = 0;
     while i < history.len() {
         let msg = &history[i];
         match msg.role {
             MessageRole::User => {
-                if let Some(ref images) = msg.images {
-                    if !images.is_empty() {
-                        let mut blocks: Vec<HistoryContentBlock> = Vec::new();
-                        for img in images {
-                            blocks.push(HistoryContentBlock::image(img));
-                        }
-                        blocks.extend(build_text_blocks(&msg.content));
-                        if !blocks.is_empty() {
-                            messages.push(AnthropicMessage {
-                                role: "user",
-                                content: blocks,
-                            });
-                        }
-                        i += 1;
-                        continue;
-                    }
+                let mut blocks = std::mem::take(&mut pending_server_notes);
+                for img in msg.images.iter().flatten() {
+                    blocks.push(HistoryContentBlock::image(img));
                 }
-                let blocks = build_text_blocks(&msg.content);
+                blocks.extend(build_text_blocks(&msg.content));
                 if !blocks.is_empty() {
                     messages.push(AnthropicMessage {
                         role: "user",
@@ -1624,6 +1832,12 @@ fn build_anthropic_messages(
                 i += 1;
             }
             MessageRole::Assistant => {
+                if !pending_server_notes.is_empty() {
+                    messages.push(AnthropicMessage {
+                        role: "user",
+                        content: std::mem::take(&mut pending_server_notes),
+                    });
+                }
                 let has_text = !msg.content.is_empty();
                 let thinking_text = msg
                     .thinking_content
@@ -1636,59 +1850,47 @@ fn build_anthropic_messages(
                 let has_thinking = options.replay_thinking_blocks
                     && thinking_text.is_some()
                     && (!options.require_thinking_signature || thinking_signature.is_some());
-                let tool_calls = msg.tool_calls.as_ref();
-                let has_tool_calls = tool_calls.is_some_and(|calls| !calls.is_empty());
 
-                if !has_tool_calls && !has_thinking {
-                    if has_text {
-                        let text_blocks = build_text_blocks(&msg.content);
-                        messages.push(AnthropicMessage {
-                            role: "assistant",
-                            content: text_blocks,
-                        });
+                let mut server_blocks: Vec<HistoryContentBlock> = Vec::new();
+                let mut tool_use_blocks: Vec<HistoryContentBlock> = Vec::new();
+                for tc in msg.tool_calls.iter().flatten() {
+                    // Server tools are never sent back as client tool_use blocks.
+                    if tc.is_server_tool() {
+                        if let Some(native) = native_server_tool_blocks(
+                            tc,
+                            options.server_tool_replay_origin.as_deref(),
+                        ) {
+                            server_blocks.extend(native);
+                        } else if let Some(note) = server_tool_note(tc) {
+                            pending_server_notes.push(note);
+                        }
+                        continue;
                     }
-                    i += 1;
-                    continue;
+                    let input: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    tool_use_blocks.push(HistoryContentBlock::ToolUse {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        input,
+                    });
                 }
 
                 let mut content_blocks: Vec<HistoryContentBlock> = Vec::new();
-
                 if has_thinking {
                     content_blocks.push(HistoryContentBlock::Thinking {
                         thinking: thinking_text.unwrap_or_default().to_string(),
                         signature: thinking_signature.map(str::to_string),
                     });
                 }
-
+                // Searches run before the text that discusses their results.
+                content_blocks.extend(server_blocks);
                 if has_text {
                     content_blocks.extend(build_text_blocks(&msg.content));
                 }
-
-                if let Some(tool_calls) = tool_calls {
-                    for tc in tool_calls {
-                        // Server tools should not be sent back as tool_use blocks. Web search
-                        // output is useful conversational context; tool search output is provider
-                        // control-plane state and should stay out of replayed text.
-                        if tc.is_server_tool() {
-                            if tc.server_tool.as_ref() == Some(&ServerToolKind::WebSearch) {
-                                if let Some(ref output) = tc.server_tool_output {
-                                    content_blocks.push(HistoryContentBlock::text(format!(
-                                        "[Web Search Result]\n{}",
-                                        output
-                                    )));
-                                }
-                            }
-                            continue;
-                        }
-                        let input: serde_json::Value =
-                            serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
-                        content_blocks.push(HistoryContentBlock::ToolUse {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            input,
-                        });
-                    }
-                }
+                // Client tool_use blocks close the message: their tool_result
+                // blocks open the next user message, and compatible gateways
+                // (DeepSeek) reject any block that follows a pending tool_use.
+                content_blocks.extend(tool_use_blocks);
 
                 if content_blocks.is_empty() {
                     i += 1;
@@ -1724,6 +1926,8 @@ fn build_anthropic_messages(
                     }
                     i += 1;
                 }
+                // tool_result blocks must lead the user message; notes follow.
+                tool_result_blocks.extend(std::mem::take(&mut pending_server_notes));
 
                 if !tool_result_blocks.is_empty() {
                     messages.push(AnthropicMessage {
@@ -1735,7 +1939,64 @@ fn build_anthropic_messages(
         }
     }
 
+    if !pending_server_notes.is_empty() {
+        messages.push(AnthropicMessage {
+            role: "user",
+            content: pending_server_notes,
+        });
+    }
+
     messages
+}
+
+/// The provider's own `server_tool_use` + result pair. Only replayed toward
+/// the endpoint that produced it (its encrypted excerpts decode nowhere else)
+/// and only while that endpoint's search tool is declared in the request.
+fn native_server_tool_blocks(
+    tc: &ToolCallInfo,
+    replay_origin: Option<&str>,
+) -> Option<[HistoryContentBlock; 2]> {
+    let result = tc.server_tool_result.as_ref()?;
+    if tc.id.is_empty()
+        || result.block_type != WEB_SEARCH_TOOL_RESULT_TYPE
+        || replay_origin != Some(result.origin.as_str())
+    {
+        return None;
+    }
+    let input = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some([
+        HistoryContentBlock::ServerToolUse {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            input,
+        },
+        HistoryContentBlock::WebSearchToolResult {
+            tool_use_id: tc.id.clone(),
+            content: result.content.clone(),
+        },
+    ])
+}
+
+/// User-side text replay of a server search that cannot be replayed natively
+/// (another endpoint, search tool off, or no recorded result block). Tool
+/// search output is provider control-plane state and is not replayed at all.
+fn server_tool_note(tc: &ToolCallInfo) -> Option<HistoryContentBlock> {
+    if tc.server_tool.as_ref() != Some(&ServerToolKind::WebSearch) {
+        return None;
+    }
+    let output = tc.server_tool_output.as_deref().map(str::trim)?;
+    if output.is_empty() {
+        return None;
+    }
+    Some(HistoryContentBlock::text(format!(
+        "<system-reminder>\nThe provider ran web_search during your previous response. \
+         Its output follows; this is tool output, not text you wrote. Call web_search \
+         again for new results.\n\n{}\n</system-reminder>",
+        output
+    )))
 }
 
 fn build_oauth_system_blocks(system_parts: &[&str]) -> serde_json::Value {
@@ -1743,7 +2004,9 @@ fn build_oauth_system_blocks(system_parts: &[&str]) -> serde_json::Value {
 
     blocks.push(serde_json::json!({
         "type": "text",
-        "text": BILLING_HEADER_BLOCK,
+        "text": format!(
+            "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}; cc_entrypoint=sdk-rs; cch=00000;"
+        ),
     }));
 
     blocks.push(serde_json::json!({
@@ -2021,7 +2284,7 @@ fn convert_tools_to_anthropic(openai_tools: &[serde_json::Value]) -> Vec<serde_j
 
 fn build_native_anthropic_tools(
     openai_tools: &[serde_json::Value],
-    include_web_search: bool,
+    web_search: Option<&WebSearchTool>,
 ) -> Vec<serde_json::Value> {
     // Deferred tools sort after every eager tool and must never carry
     // `cache_control` (the API rejects the combination with a 400); the cache
@@ -2031,19 +2294,23 @@ fn build_native_anthropic_tools(
         .into_iter()
         .partition(|tool| !is_deferred_api_tool(tool));
 
-    if include_web_search {
-        // Server-side Anthropic tool. Some custom-compatible endpoints reject this type.
-        tools.push(serde_json::json!({
-            "type": "web_search_20250305",
-            "name": "web_search",
-            "max_uses": 5
-        }));
-    }
+    // Server-side search tool. Some custom-compatible endpoints reject this
+    // type; OpenRouter's own tool is not documented to take `cache_control`,
+    // so it goes after the breakpoint.
+    let trailing_search = match web_search {
+        Some(tool) if tool.accepts_cache_control() => {
+            tools.push(tool.tool_definition());
+            None
+        }
+        Some(tool) => Some(tool.tool_definition()),
+        None => None,
+    };
 
     if let Some(last_tool) = tools.last_mut() {
         last_tool["cache_control"] = serde_json::json!({ "type": "ephemeral", "ttl": CACHE_TTL });
     }
 
+    tools.extend(trailing_search);
     tools.extend(deferred);
     tools
 }
@@ -2398,7 +2665,10 @@ fn build_claude_code_headers(
             "true".to_string(),
         ),
         ("anthropic-version".to_string(), API_VERSION.to_string()),
-        ("User-Agent".to_string(), USER_AGENT.to_string()),
+        (
+            "User-Agent".to_string(),
+            format!("claude-cli/{CLAUDE_CODE_VERSION} (external, sdk-cli)"),
+        ),
         ("x-app".to_string(), X_APP.to_string()),
         (
             "x-claude-code-session-id".to_string(),
@@ -2472,6 +2742,13 @@ struct PartialToolCall {
     input_json: String,
     /// Pre-computed output for server tools (e.g. web_search).
     server_tool_output: Option<String>,
+    /// Came from a `server_tool_use` block (provider-executed).
+    server_tool: bool,
+    /// Results delivered as citations instead of a `web_search_tool_result`.
+    search_hits: Vec<SearchHit>,
+    /// Raw `content` of this call's `web_search_tool_result`, kept for
+    /// native replay to the same endpoint.
+    server_tool_result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2486,6 +2763,8 @@ struct ContentBlock {
     block_type: String,
     id: Option<String>,
     name: Option<String>,
+    /// Server tool result blocks name the `server_tool_use` they answer.
+    tool_use_id: Option<String>,
     content: Option<serde_json::Value>,
 }
 
@@ -2503,6 +2782,8 @@ struct DeltaContent {
     partial_json: Option<String>,
     thinking: Option<String>,
     signature: Option<String>,
+    /// `citations_delta` payload (e.g. `web_search_result_location`).
+    citation: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2512,19 +2793,39 @@ struct MessageStartEvent {
 
 #[derive(Debug, Deserialize)]
 struct MessageStartMessage {
+    #[serde(default)]
+    id: Option<String>,
     usage: Option<UsageInfo>,
 }
 
+/// Gateways (OpenRouter) send explicit `null` token counts; plain
+/// `#[serde(default)]` only covers missing keys, so a `null` would drop the
+/// whole event (stop reason and usage included).
 #[derive(Debug, Deserialize)]
 struct UsageInfo {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     input_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     output_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     cache_read_input_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     cache_creation_input_tokens: u32,
+    #[serde(default)]
+    server_tool_use: Option<ServerToolUsage>,
+    /// OpenRouter extension: total request cost in USD, search fees included.
+    #[serde(default)]
+    cost: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerToolUsage {
+    #[serde(default, deserialize_with = "null_as_zero")]
+    web_search_requests: u32,
+}
+
+fn null_as_zero<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    Ok(Option::<u32>::deserialize(deserializer)?.unwrap_or(0))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2539,16 +2840,22 @@ struct MessageDelta {
 }
 
 #[cfg(test)]
+mod web_search_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
-        apply_cache_control, build_anthropic_messages, build_native_anthropic_tools,
-        build_oauth_system_blocks, build_text_blocks, build_thinking_params,
-        convert_tools_to_oauth_sdk_like_anthropic, next_sse_separator,
-        rewrite_oauth_tool_use_blocks, sse_line_value, utf8_prefix_chars, AnthropicHistoryOptions,
-        AnthropicMessage, HistoryContentBlock, NativeChatRequest, NativeSystemBlock, ThinkingParam,
-        CACHE_TTL,
+        apply_cache_control, build_anthropic_messages, build_claude_code_headers,
+        build_native_anthropic_tools, build_oauth_system_blocks, build_text_blocks,
+        build_thinking_params, convert_tools_to_oauth_sdk_like_anthropic, next_sse_separator,
+        normalize_anthropic_model, rewrite_oauth_tool_use_blocks, sse_line_value,
+        utf8_prefix_chars, AnthropicHistoryOptions, AnthropicMessage, HistoryContentBlock,
+        NativeChatRequest, NativeSystemBlock, ThinkingParam, WebSearchTool, BETA_FLAGS, CACHE_TTL,
+        CLAUDE_CODE_VERSION,
     };
-    use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
+    use crate::session::models::{
+        ChatMessage, ImageData, MessageRole, ServerToolKind, ServerToolResultBlock, ToolCallInfo,
+    };
     use serde_json::json;
 
     /// Assertions below inspect the serialized request shape — the actual
@@ -2608,6 +2915,66 @@ mod tests {
             serde_json::to_string(&ThinkingParam::Disabled).unwrap(),
             r#"{"type":"disabled"}"#
         );
+    }
+
+    #[test]
+    fn oauth_client_version_is_current_and_consistent() {
+        assert_eq!(CLAUDE_CODE_VERSION, "2.1.302");
+        let headers = build_claude_code_headers(
+            "test-token", None, "session", "request", Some(BETA_FLAGS), 0,
+        );
+        assert_eq!(
+            headers.iter().find(|(name, _)| name == "User-Agent").unwrap().1,
+            "claude-cli/2.1.302 (external, sdk-cli)"
+        );
+        let system = build_oauth_system_blocks(&["test system"]);
+        assert_eq!(
+            system[0]["text"],
+            "x-anthropic-billing-header: cc_version=2.1.302; cc_entrypoint=sdk-rs; cch=00000;"
+        );
+    }
+
+    #[test]
+    fn current_oauth_model_ids_pass_through_unchanged() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
+            assert_eq!(normalize_anthropic_model(model), model);
+        }
+        // Historical sessions keep their existing model mapping.
+        assert_eq!(normalize_anthropic_model("claude-opus-4.8"), "claude-opus-4-8");
+    }
+
+    #[test]
+    fn current_oauth_models_preserve_effort_params() {
+        for model in ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5"] {
+            for level in ["low", "medium", "high", "xhigh", "max"] {
+                let (thinking, output_config, max_tokens) = build_thinking_params(model, Some(level));
+                assert_eq!(
+                    serde_json::to_value(thinking.unwrap()).unwrap(),
+                    json!({ "type": "adaptive" })
+                );
+                assert_eq!(output_config, Some(json!({ "effort": level })));
+                let expected_max_tokens = if matches!(level, "xhigh" | "max") { 64000 } else { 32000 };
+                assert_eq!(max_tokens, expected_max_tokens);
+            }
+        }
+        let (thinking, output_config, _) = build_thinking_params("claude-opus-5-5", None);
+        assert_eq!(
+            serde_json::to_value(thinking.unwrap()).unwrap(),
+            json!({ "type": "adaptive" })
+        );
+        assert_eq!(output_config, None);
+
+        let (thinking, output_config, _) = build_thinking_params("claude-haiku-5-5", Some("high"));
+        assert_eq!(
+            serde_json::to_value(thinking.unwrap()).unwrap(),
+            json!({ "type": "enabled", "budget_tokens": 16000 })
+        );
+        assert_eq!(output_config, None);
     }
 
     #[test]
@@ -2723,7 +3090,7 @@ mod tests {
                 openai_tool("pdf_export", true),
                 openai_tool("edit", false),
             ],
-            false,
+            None,
         );
 
         // Eager tools first (input order), deferred after; breakpoint on the
@@ -2742,7 +3109,7 @@ mod tests {
     fn native_tools_without_deferred_match_legacy_shape() {
         let tools = build_native_anthropic_tools(
             &[openai_tool("read", false), openai_tool("edit", false)],
-            true,
+            Some(&WebSearchTool::AnthropicNative),
         );
 
         assert_eq!(tools.len(), 3);
@@ -3051,14 +3418,14 @@ mod tests {
 
     #[test]
     fn native_anthropic_tools_omit_web_search_when_disabled() {
-        let tools = build_native_anthropic_tools(&[], false);
+        let tools = build_native_anthropic_tools(&[], None);
 
         assert!(tools.is_empty());
     }
 
     #[test]
     fn native_anthropic_tools_include_web_search_when_enabled() {
-        let tools = build_native_anthropic_tools(&[], true);
+        let tools = build_native_anthropic_tools(&[], Some(&WebSearchTool::AnthropicNative));
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], json!("web_search_20250305"));
@@ -3240,6 +3607,7 @@ mod tests {
                 order: None,
                 server_tool: None,
                 server_tool_output: None,
+                server_tool_result: None,
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,
@@ -3307,6 +3675,7 @@ mod tests {
                         order: None,
                         server_tool: None,
                         server_tool_output: None,
+                        server_tool_result: None,
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
@@ -3318,6 +3687,7 @@ mod tests {
                         order: None,
                         server_tool: None,
                         server_tool_output: None,
+                        server_tool_result: None,
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
@@ -3381,6 +3751,170 @@ mod tests {
         assert_eq!(user_blocks[0]["text"], json!("继续"));
     }
 
+    const SEARCH_OUTPUT: &str = "老舍 茶馆\n1. 茶馆 第一幕 (https://example.com/chaguan)";
+
+    fn search_call(result_origin: Option<&str>) -> ToolCallInfo {
+        ToolCallInfo {
+            id: "call_01_search".to_string(),
+            name: "web_search".to_string(),
+            arguments: r#"{"query":"老舍 茶馆"}"#.to_string(),
+            order: Some(103),
+            server_tool: Some(ServerToolKind::WebSearch),
+            server_tool_output: Some(SEARCH_OUTPUT.to_string()),
+            server_tool_result: result_origin.map(|origin| ServerToolResultBlock {
+                origin: origin.to_string(),
+                block_type: "web_search_tool_result".to_string(),
+                content: json!([{
+                    "type": "web_search_result",
+                    "title": "茶馆 第一幕",
+                    "url": "https://example.com/chaguan",
+                    "encrypted_content": "enc",
+                    "page_age": null
+                }]),
+            }),
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        }
+    }
+
+    /// The DeepSeek turn that failed: a client `todowrite` streamed before a
+    /// server `web_search` that came back with its result block.
+    fn deepseek_mixed_turn(result_origin: Option<&str>) -> Vec<ChatMessage> {
+        let mut assistant = assistant_message("现在处理现代中文作品。", Some("plan"), Some("sig"));
+        assistant.tool_calls = Some(vec![
+            ToolCallInfo {
+                id: "call_00_todo".to_string(),
+                name: "todowrite".to_string(),
+                arguments: r#"{"todos":[]}"#.to_string(),
+                order: Some(102),
+                server_tool: None,
+                server_tool_output: None,
+                server_tool_result: None,
+                outcome: None,
+                recorded_output: None,
+                nested_tool_calls: None,
+            },
+            search_call(result_origin),
+        ]);
+        vec![assistant, tool_message("call_00_todo", "Todos updated.")]
+    }
+
+    fn block_types(message: &serde_json::Value) -> Vec<&str> {
+        message["content"]
+            .as_array()
+            .expect("content blocks")
+            .iter()
+            .map(|block| block["type"].as_str().expect("block type"))
+            .collect()
+    }
+
+    fn assert_search_note(block: &serde_json::Value) {
+        let note = block["text"].as_str().expect("note text");
+        assert!(note.starts_with("<system-reminder>"), "{note}");
+        assert!(note.contains("not text you wrote"), "{note}");
+        assert!(note.contains(SEARCH_OUTPUT), "{note}");
+        assert!(!note.contains("[Web Search Result]"), "{note}");
+    }
+
+    #[test]
+    fn server_search_without_result_block_replays_as_user_side_note() {
+        // Search text after the pending tool_use was rejected ("messages.N.3:
+        // tool_use ids were found without tool_result blocks immediately
+        // after"), and in the assistant's voice it taught DeepSeek to write
+        // fabricated `[Web Search Result]` lists itself.
+        let messages = to_json(build_anthropic_messages(
+            &deepseek_mixed_turn(None),
+            AnthropicHistoryOptions::custom_endpoint(true),
+        ));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            block_types(&messages[0]),
+            vec!["thinking", "text", "tool_use"]
+        );
+        assert_eq!(messages[0]["content"][2]["id"], json!("call_00_todo"));
+        assert_eq!(messages[1]["role"], json!("user"));
+        assert_eq!(block_types(&messages[1]), vec!["tool_result", "text"]);
+        assert_eq!(
+            messages[1]["content"][0]["tool_use_id"],
+            json!("call_00_todo")
+        );
+        assert_search_note(&messages[1]["content"][1]);
+    }
+
+    #[test]
+    fn server_search_replays_natively_to_the_endpoint_that_ran_it() {
+        let messages = to_json(build_anthropic_messages(
+            &deepseek_mixed_turn(Some("api.deepseek.com")),
+            AnthropicHistoryOptions::custom_endpoint(true)
+                .with_server_tool_replay_origin(Some("api.deepseek.com".to_string())),
+        ));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            block_types(&messages[0]),
+            vec![
+                "thinking",
+                "server_tool_use",
+                "web_search_tool_result",
+                "text",
+                "tool_use"
+            ]
+        );
+        let server_use = &messages[0]["content"][1];
+        assert_eq!(server_use["id"], json!("call_01_search"));
+        assert_eq!(server_use["name"], json!("web_search"));
+        assert_eq!(server_use["input"], json!({ "query": "老舍 茶馆" }));
+        assert_eq!(
+            messages[0]["content"][2]["content"][0]["encrypted_content"],
+            json!("enc")
+        );
+        assert_eq!(block_types(&messages[1]), vec!["tool_result"]);
+    }
+
+    #[test]
+    fn server_search_from_another_endpoint_falls_back_to_user_side_note() {
+        let messages = to_json(build_anthropic_messages(
+            &deepseek_mixed_turn(Some("openrouter.ai")),
+            AnthropicHistoryOptions::custom_endpoint(true)
+                .with_server_tool_replay_origin(Some("api.deepseek.com".to_string())),
+        ));
+
+        assert_eq!(
+            block_types(&messages[0]),
+            vec!["thinking", "text", "tool_use"]
+        );
+        assert_eq!(block_types(&messages[1]), vec!["tool_result", "text"]);
+        assert_search_note(&messages[1]["content"][1]);
+    }
+
+    #[test]
+    fn server_search_note_leads_the_next_user_message_or_stands_alone() {
+        let mut assistant = assistant_message("搜到了。", None, None);
+        assistant.tool_calls = Some(vec![search_call(None)]);
+        let mut user = assistant_message("继续", None, None);
+        user.role = MessageRole::User;
+
+        let messages = to_json(build_anthropic_messages(
+            &[assistant.clone(), user],
+            AnthropicHistoryOptions::standard(),
+        ));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(block_types(&messages[0]), vec!["text"]);
+        assert_eq!(block_types(&messages[1]), vec!["text", "text"]);
+        assert_search_note(&messages[1]["content"][0]);
+        assert_eq!(messages[1]["content"][1]["text"], json!("继续"));
+
+        let trailing = to_json(build_anthropic_messages(
+            &[assistant],
+            AnthropicHistoryOptions::standard(),
+        ));
+        assert_eq!(trailing.len(), 2);
+        assert_eq!(trailing[1]["role"], json!("user"));
+        assert_search_note(&trailing[1]["content"][0]);
+    }
+
     #[test]
     fn tool_result_images_are_nested_in_anthropic_tool_result_content() {
         let history = vec![
@@ -3401,6 +3935,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,

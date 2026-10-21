@@ -6,11 +6,14 @@ import { t } from "../../i18n";
 import {
   defaultReasoningParamFormat,
   isDeepSeekV4Model,
+  isOpenRouterEndpoint,
+  OPENROUTER_SEARCH_ENGINES,
 } from "../../services/modelCatalog";
 import type {
   ApiFormat,
   CustomProviderModel,
   EffortLevel,
+  OpenRouterSearchEngine,
   ReasoningParamFormat,
   ReasoningReplayField,
 } from "../../types";
@@ -19,6 +22,8 @@ const props = defineProps<{
   /** Draft row, mutated in place (same contract as the provider draft itself). */
   model: CustomProviderModel;
   apiFormat: ApiFormat;
+  /** Provider base URL; OpenRouter gets its own server-side search tool. */
+  endpoint?: string;
   saving?: boolean;
 }>();
 
@@ -91,6 +96,32 @@ function setReasoningEffortEnabled(effort: EffortLevel, enabled: boolean) {
 
 function updateReplayField(value: string) {
   props.model.reasoningReplayField = value === "" ? null : (value as ReasoningReplayField);
+}
+
+const isOpenRouter = computed(() => isOpenRouterEndpoint(props.endpoint));
+/** Anthropic-format endpoints take `web_search_20250305`; on OpenAI chat only
+ *  OpenRouter has a server search tool (`openrouter:web_search`). */
+const showServerTools = computed(
+  () => props.apiFormat === "anthropic_messages" || (props.apiFormat === "openai_chat" && isOpenRouter.value),
+);
+const webSearchEngineOptions = computed(() => [
+  { value: "auto", label: t("settings.custom.webSearchEngineAuto") },
+  ...OPENROUTER_SEARCH_ENGINES.map((engine) => ({
+    value: engine,
+    label: engine.charAt(0).toUpperCase() + engine.slice(1),
+  })),
+]);
+
+function updateWebSearch(enabled: boolean) {
+  props.model.serverTools = { ...(props.model.serverTools ?? { webSearch: false }), webSearch: enabled };
+}
+
+function updateWebSearchEngine(value: string) {
+  const engine = OPENROUTER_SEARCH_ENGINES.find((candidate) => candidate === value) ?? null;
+  props.model.serverTools = {
+    ...(props.model.serverTools ?? { webSearch: false }),
+    webSearchEngine: engine as OpenRouterSearchEngine | null,
+  };
 }
 
 const responsesTransportOptions = computed(() => [
@@ -280,7 +311,12 @@ function updateCodexTransport(value: string) {
           </div>
         </div>
       </div>
+    </template>
 
+    <template v-if="showServerTools">
+      <div v-if="apiFormat !== 'anthropic_messages'" class="form-section-title">
+        {{ t("settings.custom.serverTools") }}
+      </div>
       <span class="form-row-label form-row-label-top">{{ t("settings.custom.serverTools") }}</span>
       <div class="form-control">
         <div class="form-option-row">
@@ -288,14 +324,32 @@ function updateCodexTransport(value: string) {
             :disabled="saving"
             :model-value="model.serverTools?.webSearch ?? false"
             aria-label="web_search"
-            @update:model-value="model.serverTools = { ...(model.serverTools ?? {}), webSearch: $event }"
+            @update:model-value="updateWebSearch"
           />
           <div class="form-option-copy">
-            <span class="form-option-name mono">web_search</span>
-            <span class="form-option-desc">{{ t("settings.custom.serverToolWebSearch") }}</span>
+            <span class="form-option-name mono">{{ isOpenRouter ? "openrouter:web_search" : "web_search" }}</span>
+            <span class="form-option-desc">{{
+              t(isOpenRouter ? "settings.custom.serverToolWebSearchOpenRouter" : "settings.custom.serverToolWebSearch")
+            }}</span>
           </div>
         </div>
       </div>
+      <template v-if="isOpenRouter && model.serverTools?.webSearch">
+        <span class="form-row-label form-row-label-top">{{ t("settings.custom.webSearchEngine") }}</span>
+        <div class="form-control">
+          <BaseDropdown
+            class="select-md"
+            size="md"
+            menu-align="start"
+            :model-value="model.serverTools?.webSearchEngine ?? 'auto'"
+            :options="webSearchEngineOptions"
+            :aria-label="t('settings.custom.webSearchEngine')"
+            :disabled="saving"
+            @update:model-value="updateWebSearchEngine"
+          />
+          <span class="form-option-desc">{{ t("settings.custom.webSearchEngineDesc") }}</span>
+        </div>
+      </template>
     </template>
   </div>
 </template>

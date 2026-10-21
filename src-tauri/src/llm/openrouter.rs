@@ -613,27 +613,41 @@ fn build_api_messages(system_prompt: &str, history: &[ChatMessage]) -> Vec<serde
                 let mut m = serde_json::json!({
                     "role": "assistant",
                 });
-                if !msg.content.is_empty() {
-                    m["content"] = serde_json::json!(msg.content);
+                // Server tools (provider-executed search) have no `tool` result
+                // message; replay their output as text, never as `tool_calls`.
+                let mut content = msg.content.clone();
+                if let Some(search_text) = msg
+                    .tool_calls
+                    .as_deref()
+                    .and_then(super::web_search::replay_search_results)
+                {
+                    if !content.is_empty() {
+                        content.push_str("\n\n");
+                    }
+                    content.push_str(&search_text);
+                }
+                if !content.is_empty() {
+                    m["content"] = serde_json::json!(content);
                 }
                 if let Some(ref tool_calls) = msg.tool_calls {
-                    if !tool_calls.is_empty() {
-                        let tcs: Vec<serde_json::Value> = tool_calls
-                            .iter()
-                            .map(|tc| {
-                                serde_json::json!({
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.name,
-                                        "arguments": super::normalize_tool_call_arguments(
-                                            &tc.name,
-                                            &tc.arguments,
-                                        ),
-                                    }
-                                })
+                    let tcs: Vec<serde_json::Value> = tool_calls
+                        .iter()
+                        .filter(|tc| !tc.is_server_tool())
+                        .map(|tc| {
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": super::normalize_tool_call_arguments(
+                                        &tc.name,
+                                        &tc.arguments,
+                                    ),
+                                }
                             })
-                            .collect();
+                        })
+                        .collect();
+                    if !tcs.is_empty() {
                         m["tool_calls"] = serde_json::json!(tcs);
                     }
                 }
@@ -769,6 +783,7 @@ fn collect_tool_calls(
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -1120,6 +1135,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,

@@ -5,7 +5,8 @@ use std::time::Instant;
 use super::openrouter::LlmResponse;
 use super::think_tag_filter::{ThinkTagEmit, ThinkTagFilter};
 use super::utf8_stream::Utf8StreamDecoder;
-use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
+use super::web_search::{self, SearchHit, WebSearchTool};
+use crate::session::models::{ChatMessage, Citation, ImageData, MessageRole, ToolCallInfo};
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const RAW_CHUNK_DEBUG_PREVIEW_CHARS: usize = 1600;
@@ -42,6 +43,8 @@ pub struct CustomChatTuning<'a> {
     pub reasoning_replay_field: Option<crate::commands::ReasoningReplayField>,
     pub thinking_toggle: Option<ThinkingToggle>,
     pub max_output_tokens: Option<u32>,
+    /// Provider-executed search tool (OpenRouter `openrouter:web_search`).
+    pub web_search: Option<&'a WebSearchTool>,
 }
 
 pub async fn stream_chat<F, G, H>(
@@ -387,8 +390,12 @@ fn build_request_body(
         "stream_options": { "include_usage": true },
     });
 
-    if !tools.is_empty() {
-        body["tools"] = serde_json::json!(tools);
+    let mut request_tools = tools.to_vec();
+    if let Some(search) = tuning.web_search {
+        request_tools.push(search.tool_definition());
+    }
+    if !request_tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(request_tools);
     }
 
     match flavor {
@@ -572,9 +579,38 @@ fn build_api_messages(
                     continue;
                 }
 
+                // Provider-executed tools have no `tool` result message, so they
+                // cannot be replayed as `tool_calls` (the API would reject the
+                // orphan call). Search output goes back as text instead, which
+                // keeps sources and excerpts available without searching again.
+                let (client_tool_calls, server_tool_calls): (Vec<ToolCallInfo>, Vec<ToolCallInfo>) =
+                    msg.tool_calls
+                        .iter()
+                        .flatten()
+                        .cloned()
+                        .partition(|tool_call| !tool_call.is_server_tool());
+                let mut content = msg.content.clone();
+                if let Some(search_text) = web_search::replay_search_results(&server_tool_calls) {
+                    if !content.is_empty() {
+                        content.push_str("\n\n");
+                    }
+                    content.push_str(&search_text);
+                }
+                let has_thinking = msg
+                    .thinking_content
+                    .as_deref()
+                    .is_some_and(|thinking| !thinking.is_empty());
+                if content.is_empty()
+                    && client_tool_calls.is_empty()
+                    && !server_tool_calls.is_empty()
+                    && !has_thinking
+                {
+                    i += 1;
+                    continue;
+                }
                 let mut m = serde_json::json!({
                     "role": "assistant",
-                    "content": msg.content,
+                    "content": content,
                 });
                 if replay_reasoning_content {
                     apply_reasoning_replay(
@@ -584,10 +620,8 @@ fn build_api_messages(
                         reasoning_replay_field,
                     );
                 }
-                if let Some(ref tool_calls) = msg.tool_calls {
-                    if !tool_calls.is_empty() {
-                        m["tool_calls"] = serde_json::json!(build_tool_call_values(tool_calls));
-                    }
+                if !client_tool_calls.is_empty() {
+                    m["tool_calls"] = serde_json::json!(build_tool_call_values(&client_tool_calls));
                 }
                 messages.push(m);
             }
@@ -852,11 +886,21 @@ struct ChatStreamState {
     cache_read_tokens: u32,
     cache_write_tokens: u32,
     cost_usd: f64,
+    /// Completion id (`gen-…`), used to name the provider search record.
+    response_id: Option<String>,
+    /// Sources from `delta.annotations` (OpenRouter `openrouter:web_search`).
+    search_hits: Vec<SearchHit>,
+    text_citations: Vec<Citation>,
+    provider_search_requests: u32,
 }
 
 impl ChatStreamState {
     fn new() -> Self {
         Self {
+            response_id: None,
+            search_hits: Vec::new(),
+            text_citations: Vec::new(),
+            provider_search_requests: 0,
             full_text: String::new(),
             thinking_text: String::new(),
             thinking_started_at: None,
@@ -901,6 +945,28 @@ impl ChatStreamState {
         };
         self.last_tool_call_slot = Some(slot);
         slot
+    }
+
+    /// `url_citation` with a real span cites the visible text; zero-width ones
+    /// (OpenRouter Exa results, `start_index == end_index == 0`) only carry
+    /// search results. Both feed the search record.
+    fn push_annotation(&mut self, annotation: &serde_json::Value) {
+        let Some(hit) = SearchHit::from_citation(annotation) else {
+            return;
+        };
+        let body = annotation.get("url_citation").unwrap_or(annotation);
+        let index = |key: &str| {
+            body.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+        };
+        if let (Some(start), Some(end)) = (index("start_index"), index("end_index")) {
+            if end > start {
+                self.text_citations
+                    .push(web_search::url_citation(&hit, start, end));
+            }
+        }
+        web_search::push_hit(&mut self.search_hits, hit);
     }
 
     fn note_dropped_chunk(&mut self, error: &str, data: &str) {
@@ -1187,7 +1253,15 @@ fn apply_stream_chunk<F, G, H>(
     G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send + 'static,
 {
+    if state.response_id.is_none() {
+        state.response_id = chunk.id.clone().filter(|id| !id.is_empty());
+    }
     if let Some(choice) = chunk.choices.first() {
+        if let Some(ref annotations) = choice.delta.annotations {
+            for annotation in annotations {
+                state.push_annotation(annotation);
+            }
+        }
         if let Some(ref reasoning) = choice.delta.reasoning_content {
             state.push_thinking(reasoning, on_thinking_delta);
         }
@@ -1241,6 +1315,11 @@ fn apply_stream_chunk<F, G, H>(
         state.cache_read_tokens = usage_totals.cache_read_tokens;
         state.cache_write_tokens = usage_totals.cache_write_tokens;
         state.cost_usd = usage_totals.cost_usd.unwrap_or(state.cost_usd);
+        if let Some(ref server_tool_use) = usage.server_tool_use_details {
+            state.provider_search_requests = state
+                .provider_search_requests
+                .max(server_tool_use.web_search_requests);
+        }
     }
 }
 
@@ -1273,7 +1352,7 @@ fn finalize_stream_response(
         return Err("Stream ended with no data and no [DONE]".to_string());
     }
 
-    let tool_calls = match collect_tool_calls(&state.tool_calls_map) {
+    let mut tool_calls = match collect_tool_calls(&state.tool_calls_map) {
         Ok(tool_calls) => tool_calls,
         Err(error) => {
             if debug {
@@ -1313,9 +1392,25 @@ fn finalize_stream_response(
         ));
     }
 
+    // OpenRouter runs `openrouter:web_search` inside the request and exposes
+    // no tool call on this protocol; record it as a server tool so the UI
+    // shows the search and later rounds replay its sources as text. Appended
+    // after `finish_reason` is settled: server tools never need a follow-up.
+    if state.provider_search_requests > 0 || !state.search_hits.is_empty() {
+        let id = match state.response_id.as_deref() {
+            Some(id) => format!("{}_web_search", id),
+            None => format!("srvtoolu_{}", uuid::Uuid::new_v4().simple()),
+        };
+        tool_calls.push(web_search::provider_search_record(
+            id,
+            state.provider_search_requests,
+            &state.search_hits,
+        ));
+    }
+
     let resp = LlmResponse {
         text: state.full_text,
-        citations: Vec::new(),
+        citations: web_search::finalize_citations(state.text_citations),
         tool_calls,
         finish_reason: state.finish_reason,
         end_turn: None,
@@ -1457,6 +1552,7 @@ fn collect_tool_calls(
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -1498,6 +1594,8 @@ fn usage_totals(usage: &StreamUsage) -> UsageTotals {
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     choices: Vec<StreamChoice>,
     usage: Option<StreamUsage>,
 }
@@ -1514,6 +1612,15 @@ struct StreamUsage {
     cache_write_tokens: Option<u32>,
     #[serde(default)]
     cost: Option<f64>,
+    /// OpenRouter server tools (`openrouter:web_search`) run inside the request.
+    #[serde(default, alias = "server_tool_use")]
+    server_tool_use_details: Option<ChatServerToolUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatServerToolUsage {
+    #[serde(default)]
+    web_search_requests: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1536,6 +1643,9 @@ struct StreamDelta {
     reasoning_content: Option<String>,
     reasoning_details: Option<Vec<StreamReasoningDetail>>,
     tool_calls: Option<Vec<StreamToolCallDelta>>,
+    /// `url_citation` annotations (OpenRouter web search sources).
+    #[serde(default)]
+    annotations: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1562,6 +1672,9 @@ struct StreamFunctionDelta {
     name: Option<String>,
     arguments: Option<String>,
 }
+
+#[cfg(test)]
+mod web_search_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1656,6 +1769,7 @@ mod tests {
                 order: None,
                 server_tool: None,
                 server_tool_output: None,
+                server_tool_result: None,
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,

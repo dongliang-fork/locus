@@ -104,7 +104,10 @@ vi.mock("../stores/notification", () => ({
 }));
 
 import { useSettingsState } from "../composables/useSettingsState";
-import { DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS } from "../services/modelCatalog";
+import {
+  DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS,
+  isOpenRouterEndpoint,
+} from "../services/modelCatalog";
 import type { CustomEndpoint, CustomProvider, CustomProviderModel } from "../types";
 
 function providerModel(partial: Partial<CustomProviderModel> = {}): CustomProviderModel {
@@ -442,6 +445,37 @@ describe("custom provider persistence", () => {
     await state.loadCustomProviders();
 
     expect(state.customProviders.value[0].models[0].serverTools).toEqual({ webSearch: false });
+  });
+
+  it("keeps a known OpenRouter search engine and drops unknown ones", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({
+        id: "openrouter-search",
+        name: "OpenRouter",
+        models: [
+          providerModel({ id: "exa", apiModel: "google/exa", serverTools: { webSearch: true, webSearchEngine: "exa" } }),
+          providerModel({
+            id: "bogus",
+            apiModel: "google/bogus",
+            serverTools: { webSearch: true, webSearchEngine: "bogus" } as never,
+          }),
+        ],
+      }),
+    ]);
+
+    await state.loadCustomProviders();
+
+    const [exa, bogus] = state.customProviders.value[0].models;
+    expect(exa.serverTools).toEqual({ webSearch: true, webSearchEngine: "exa" });
+    expect(bogus.serverTools).toEqual({ webSearch: true });
+  });
+
+  it("recognizes OpenRouter endpoints by host", () => {
+    expect(isOpenRouterEndpoint("https://openrouter.ai/api/v1")).toBe(true);
+    expect(isOpenRouterEndpoint("https://eu.openrouter.ai/api/v1")).toBe(true);
+    expect(isOpenRouterEndpoint("https://openrouter.ai.example.com/v1")).toBe(false);
+    expect(isOpenRouterEndpoint("")).toBe(false);
   });
 
   it("normalizes legacy remote compaction and preserves an enabled Codex compact mode", async () => {

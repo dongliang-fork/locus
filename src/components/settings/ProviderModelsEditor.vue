@@ -278,7 +278,7 @@ function handleBrowseSelect(
           </div>
 
           <div v-if="expandedKey === rowKey(model, index)" class="model-row-body">
-            <ProviderModelForm :model="model" :api-format="provider.apiFormat" :saving="saving" />
+            <ProviderModelForm :model="model" :api-format="provider.apiFormat" :endpoint="provider.endpoint" :saving="saving" />
             <div class="model-row-footer">
               <BaseButton
                 size="sm"

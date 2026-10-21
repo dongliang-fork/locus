@@ -1,0 +1,36 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_k8FaH26OVa8HUz9xz3Q4","type":"message","role":"assistant","container":null,"content":[],"model":"google/gemini-3.8-flash","stop_reason":null,"stop_details":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"output_tokens_details":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"cache_creation":null,"inference_geo":null,"server_tool_use":null,"service_tier":null,"speed":"standard"},"provider":"Google"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"**Searching for Rust Release**\n\nI'm prioritizing the web search to pinpoint the most recent stable Rust version. Once that information is secured, I'll proceed with reading the Cargo.toml file to enable a comparison of project-specific Rust versions.\n\n"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"openrouter.reasoning:REDACTED"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_1949521","caller":{"type":"direct"},"name":"read_file","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"Cargo.toml\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"container":null,"stop_details":null,"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":102,"output_tokens":233,"output_tokens_details":{"thinking_tokens":215},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":null,"server_tool_use":{"web_search_requests":2,"web_fetch_requests":0},"service_tier":"standard","speed":"standard","cost":0.02895025,"is_byok":false,"cost_details":{"upstream_inference_cost":0.02895025,"upstream_inference_prompt_cost":7.65e-05,"upstream_inference_completions_cost":0.00087375}},"context_management":null}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+event: data
+data: [DONE]
+

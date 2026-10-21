@@ -463,6 +463,8 @@ pub struct PendingQuestion {
     pub tool_call_id: String,
     pub question: String,
     pub options: Vec<crate::commands::AskOption>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<crate::user_question::AskQuestion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,6 +496,18 @@ pub struct PendingToolConfirm {
     pub display: crate::commands::ToolConfirmDisplay,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaudeCodePhase {
+    Starting,
+    Recovering,
+    Requesting,
+    Thinking,
+    ToolInput,
+    ToolUse,
+    Responding,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSnapshot {
@@ -504,6 +518,8 @@ pub struct SessionRuntimeSnapshot {
     pub streaming_text: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub streaming_thinking: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_phase: Option<ClaudeCodePhase>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub live_render_parts: Vec<AssistantRenderPart>,
     #[serde(default)]
@@ -570,6 +586,22 @@ pub enum ServerToolKind {
     WebSearch,
 }
 
+/// A server tool's own result block as the provider returned it (Anthropic
+/// `web_search_tool_result`, `encrypted_content` included). Later requests to
+/// the same endpoint replay it natively, so the model sees a tool result rather
+/// than search output it appears to have written itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerToolResultBlock {
+    /// Host of the endpoint that produced the block; encrypted content only
+    /// decodes there.
+    pub origin: String,
+    /// Result block type, e.g. `web_search_tool_result`.
+    pub block_type: String,
+    /// The block's `content`, verbatim (result list or error object).
+    pub content: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallInfo {
@@ -583,6 +615,8 @@ pub struct ToolCallInfo {
     /// Pre-computed output for server tools (e.g. web_search) that don't need local execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_result: Option<ServerToolResultBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<crate::commands::ToolCallOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -741,6 +775,10 @@ pub struct PendingSessionInput {
     pub message_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Monotonic per-process state version. Event order and command replies can
+    /// interleave, so clients use it instead of second-resolution timestamps.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 fn default_pending_input_delivery() -> String {

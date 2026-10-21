@@ -696,7 +696,7 @@ fn build_claude_code_custom_endpoint(config: ImportedClaudeCodeCustomEndpoint) -
             .collect(),
         reasoning_param_format: Some(CustomReasoningParamFormat::AnthropicThinking),
         replay_reasoning_content: Some(false),
-        server_tools: CustomEndpointServerTools { web_search: false },
+        server_tools: CustomEndpointServerTools::default(),
         supports_tool_lazy_loading: false,
         supports_vision: true,
     }

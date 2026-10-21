@@ -1,4 +1,6 @@
 pub mod anthropic;
+#[cfg(test)]
+mod antigravity_cli_probe;
 pub mod anthropic_usage;
 pub mod chat_completions;
 pub mod citations;
@@ -16,6 +18,7 @@ pub mod think_tag_filter;
 pub mod tool_references;
 pub mod utf8_stream;
 pub(crate) mod upstream_model;
+pub mod web_search;
 
 // The subscription /models endpoint filters its catalog by client version.
 // Baseline: @openai/codex stable on 2026-10-08. Desktop app build numbers
