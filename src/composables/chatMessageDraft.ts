@@ -46,9 +46,12 @@ export interface UserMessageDraftConsoleText {
 }
 
 export interface UserMessageDraftKnowledgeQuote {
+  /** Type-prefixed knowledge path, or the physical file path when `source` is `file`. */
   path: string;
   name?: string;
   content: string;
+  /** Quoted document kind; absent means project knowledge. */
+  source?: "knowledge" | "file";
 }
 
 export interface UserMessageDraft {
@@ -264,6 +267,7 @@ function normalizeUserMessageDraft(value: unknown): UserMessageDraft | null {
           path,
           name: typeof quote.name === "string" ? quote.name.trim() || undefined : undefined,
           content: quote.content,
+          ...(quote.source === "file" ? { source: "file" as const } : {}),
         };
       })
       .filter((quote): quote is UserMessageDraftKnowledgeQuote => !!quote)
@@ -435,8 +439,11 @@ export function buildUserMessageDraft(message: ChatMessage): UserMessageDraft {
     path: quote.path,
     name: quote.name || undefined,
     content: quote.content,
+    ...(quote.source === "file" ? { source: "file" as const } : {}),
   }));
-  const quotedPaths = new Set(knowledgeQuotes.map((quote) => normalizeKnowledgeRefPath(quote.path)));
+  const quotedPaths = new Set(knowledgeQuotes
+    .filter((quote) => quote.source !== "file")
+    .map((quote) => normalizeKnowledgeRefPath(quote.path)));
   return {
     text: inlineSessions.sessionRefs.length ? inlineSessions.text.trim() : inlineSessions.text,
     ...(inlineSessions.sessionRefs.length ? { sessionRefs: inlineSessions.sessionRefs } : {}),

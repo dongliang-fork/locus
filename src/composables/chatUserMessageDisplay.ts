@@ -43,6 +43,8 @@ export interface UserKnowledgeQuoteDisplay {
   path: string;
   name: string;
   content: string;
+  /** Present for quotes of non-knowledge files; absent means project knowledge. */
+  source?: "file";
 }
 
 function trimInjectedPadding(text: string) {
@@ -160,6 +162,7 @@ function parseKnowledgeQuoteBlock(block: string): UserKnowledgeQuoteDisplay[] {
       const metadata = JSON.parse(decodeURIComponent(match[1] ?? "")) as {
         path?: unknown;
         name?: unknown;
+        source?: unknown;
       };
       const path = typeof metadata.path === "string" ? metadata.path.trim() : "";
       const content = (match[2] ?? "").replace(/^\r?\n|\r?\n$/g, "");
@@ -168,6 +171,7 @@ function parseKnowledgeQuoteBlock(block: string): UserKnowledgeQuoteDisplay[] {
         path,
         name: typeof metadata.name === "string" ? metadata.name.trim() : "",
         content,
+        ...(metadata.source === "file" ? { source: "file" as const } : {}),
       });
     } catch {
       // Ignore malformed injected metadata while preserving the user's text.

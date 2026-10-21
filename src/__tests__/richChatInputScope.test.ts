@@ -13,6 +13,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceRef } from "../services/project";
 import type { ViewPackageSummary } from "../services/view";
+import type { LiveSelectionQuote } from "../composables/documentSelection";
 
 const mocks = vi.hoisted(() => ({
   searchWorkspaceAssets: vi.fn(),
@@ -22,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   knowledgeQuery: vi.fn(),
   viewList: vi.fn(),
   searchSessionTitles: vi.fn(),
+  gitBranches: vi.fn(),
   checkUnityConnectionStatus: vi.fn(),
   getUnityConsoleText: vi.fn(),
   validateUnitySceneObject: vi.fn(),
@@ -63,6 +65,11 @@ vi.mock("../services/permissions", () => ({
 vi.mock("../services/session", async (importOriginal) => ({
   ...await importOriginal<typeof import("../services/session")>(),
   searchSessionTitles: mocks.searchSessionTitles,
+}));
+
+vi.mock("../services/git", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/git")>(),
+  gitBranches: mocks.gitBranches,
 }));
 
 vi.mock("../services/unity", () => ({
@@ -118,6 +125,7 @@ interface HarnessState {
   workspaceRef: WorkspaceRef | null;
   workspaceRoot: string;
   planModeActive: boolean;
+  liveSelectionQuote?: LiveSelectionQuote | null;
 }
 
 interface MountedInput {
@@ -182,6 +190,7 @@ async function mountInput(options: Partial<HarnessState> & { managedNativeDrops?
         workspaceRef: state.workspaceRef,
         workspaceRoot: state.workspaceRoot,
         planModeActive: state.planModeActive,
+        liveSelectionQuote: state.liveSelectionQuote ?? null,
         managedNativeDrops: options.managedNativeDrops ?? true,
         beforeSend: options.beforeSend,
         draftStateKey: options.draftStateKey,
@@ -286,6 +295,7 @@ beforeEach(() => {
   mocks.knowledgeQuery.mockReset().mockResolvedValue([]);
   mocks.viewList.mockReset().mockResolvedValue([]);
   mocks.searchSessionTitles.mockReset().mockResolvedValue([]);
+  mocks.gitBranches.mockReset().mockResolvedValue({ local: [], remotes: [] });
   mocks.checkUnityConnectionStatus.mockReset().mockResolvedValue({ connected: false });
   mocks.getUnityConsoleText.mockReset().mockResolvedValue({ text: "", entries: [] });
   mocks.validateUnitySceneObject.mockReset().mockResolvedValue(undefined);
@@ -307,6 +317,77 @@ afterEach(() => {
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+describe("RichChatInput live document selection", () => {
+  const fileSelection = (id: string): LiveSelectionQuote => ({
+    id,
+    path: "C:/projects/a/docs/Hero.md",
+    source: "file",
+    name: "Hero.md",
+    location: "Hero.md:3-4",
+    content: "C:/projects/a/docs/Hero.md:3-4\n```markdown\nline three\nline four\n```",
+  });
+
+  function liveChip(host: HTMLElement) {
+    return host.querySelector<HTMLElement>(".live-selection-chip");
+  }
+
+  it("shows the selection as a separate attachment and sends its path, lines and text", async () => {
+    const mounted = await mountInput({ liveSelectionQuote: fileSelection("sel-1") });
+    expect(liveChip(mounted.host)?.querySelector(".local-file-chip-name")?.textContent).toBe("Hero.md:3-4");
+    expect(liveChip(mounted.host)?.querySelector(".local-file-chip-meta")?.textContent).toBe("Selection");
+
+    // The selection is context only; it never sends an empty message.
+    await mounted.input.value!.send();
+    expect(mounted.send).not.toHaveBeenCalled();
+    expect(mounted.input.value!.isDraftEmpty()).toBe(true);
+    expect(mounted.input.value!.exportDraft().knowledgeQuotes).toEqual([]);
+
+    await setComposerText(mounted.host, "解释这段");
+    await mounted.input.value!.send();
+    const payload = mounted.send.mock.calls[0]![0];
+    expect(payload.text).toContain("解释这段");
+    expect(payload.text).toContain("<locus-knowledge-quotes>");
+    expect(payload.text).toContain("C:/projects/a/docs/Hero.md:3-4\n```markdown\nline three\nline four\n```");
+    expect(payload.text).toContain(encodeURIComponent(JSON.stringify({ path: "C:/projects/a/docs/Hero.md", name: "Hero.md", source: "file" })));
+    expect(payload.assetRefs).toEqual([]);
+    await flushAsync();
+    expect(liveChip(mounted.host)).toBeNull();
+
+    mounted.state.liveSelectionQuote = fileSelection("sel-2");
+    await flushAsync();
+    expect(liveChip(mounted.host)).not.toBeNull();
+  });
+
+  it("follows selection changes, can be dismissed, and cites knowledge by its knowledge path", async () => {
+    const mounted = await mountInput({
+      liveSelectionQuote: {
+        id: "sel-k",
+        path: "design/combat/boss.md",
+        source: "knowledge",
+        name: "boss",
+        location: "boss.md:9",
+        content: "C:/projects/a/Locus/knowledge/design/combat/boss.md:9\n```markdown\nrepeat\n```",
+      },
+    });
+    liveChip(mounted.host)!.querySelector<HTMLButtonElement>(".local-file-chip-remove")!.click();
+    await flushAsync();
+    expect(liveChip(mounted.host)).toBeNull();
+
+    mounted.state.liveSelectionQuote = { ...mounted.state.liveSelectionQuote!, id: "sel-k2" };
+    await flushAsync();
+    expect(liveChip(mounted.host)).not.toBeNull();
+    await setComposerText(mounted.host, "改写");
+    await mounted.input.value!.send();
+    expect(mounted.send.mock.calls[0]![0].assetRefs).toEqual([
+      { kind: "knowledge", path: "design/combat/boss.md", name: "boss", source: "manual" },
+    ]);
+
+    mounted.state.liveSelectionQuote = null;
+    await flushAsync();
+    expect(liveChip(mounted.host)).toBeNull();
+  });
 });
 
 describe("RichChatInput scoped controller", () => {
@@ -333,6 +414,68 @@ describe("RichChatInput scoped controller", () => {
     await flushAsync();
     expect(mounted.host.querySelector(".session-ref-attachment")).toBeNull();
     expect(mounted.input.value!.isDraftEmpty()).toBe(true);
+  });
+
+  const BRANCHES = {
+    local: [
+      { name: "main", isCurrent: true, shortHash: "31d47686", message: "chore: release" },
+      { name: "dev", isCurrent: false, shortHash: "48633715", message: "fix: input" },
+      { name: "feature/input", isCurrent: false, shortHash: "0f804270", message: "feat: input" },
+    ],
+    remotes: [["origin", [{ name: "main", shortHash: "31d47686", message: "chore: release" }]]] as [string, { name: string; shortHash: string; message: string }[]][],
+  };
+
+  it.each(["Enter", "Tab"])("writes a branch mention inline as its ref name using %s and sends it", async (key) => {
+    mocks.gitBranches.mockResolvedValue(BRANCHES);
+    const mounted = await mountInput();
+    const textarea = await setComposerText(mounted.host, "合并 @dev");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mocks.gitBranches).toHaveBeenCalledWith(CHECKOUT_A);
+    expect(mentionNames(mounted)).toEqual(["dev"]);
+    expect(mounted.host.querySelector(".mention-path")?.textContent).toBe("Local branch · 48633715 · fix: input");
+    textarea.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    await flushAsync();
+    expect(mounted.state.text).toBe("合并 `dev`");
+    expect(mounted.input.value!.exportDraft().localFiles).toEqual([]);
+    expect(mounted.input.value!.exportDraft().assetRefs).toEqual([]);
+    await mounted.input.value!.send();
+    expect(mounted.send.mock.calls[0]![0].text).toBe("合并 `dev`");
+  });
+
+  it("lists branches once per popup and offers slash names ahead of a missing folder", async () => {
+    mocks.gitBranches.mockResolvedValue(BRANCHES);
+    mocks.listDirEntriesPage.mockRejectedValue(new Error("not found"));
+    const mounted = await mountInput();
+    await setComposerText(mounted.host, "@origin/ma");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mentionNames(mounted)).toEqual(["origin/main", "origin/"]);
+    const textarea = await setComposerText(mounted.host, "@origin/mai");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mentionNames(mounted)).toEqual(["origin/main", "origin/"]);
+    expect(mocks.gitBranches).toHaveBeenCalledOnce();
+    textarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await flushAsync();
+    expect(mounted.state.text).toBe("`origin/main`");
+
+    await setComposerText(mounted.host, "`origin/main` @feat");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mocks.gitBranches).toHaveBeenCalledTimes(2);
+    expect(mentionNames(mounted)).toEqual(["feature/input"]);
+  });
+
+  it("keeps folder contents ahead of branches and works without a git repository", async () => {
+    mocks.gitBranches.mockResolvedValue({ local: [{ name: "docs/Hero-notes", isCurrent: false, shortHash: "1", message: "" }], remotes: [] });
+    const mounted = await mountInput();
+    seedMentionWorkspace(mounted);
+    await setComposerText(mounted.host, "@docs/Hero");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mentionNames(mounted)).toEqual(["docs/", "Hero.md", "HeroTree.md", "docs/Hero-notes"]);
+
+    mocks.gitBranches.mockRejectedValue(new Error("not a git repository"));
+    await setComposerText(mounted.host, "");
+    await setComposerText(mounted.host, "@Hero");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mentionNames(mounted)).toEqual(["Hero.md", "HeroTree.md"]);
   });
 
   it("supports session-only attachments, deduplication, removal and sends the remaining reference", async () => {

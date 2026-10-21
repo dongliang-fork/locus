@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Compartment, EditorState, StateEffect, Transaction, type Extension } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState, StateEffect, Transaction, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { openSearchPanel } from "@codemirror/search";
 import { useSearchScope } from "../../composables/useSearchScope";
@@ -23,7 +23,11 @@ import MarkdownProperties from "./MarkdownProperties.vue";
 import { markdownFrontmatterField, markdownFrontmatterHiding, type MarkdownFrontmatter } from "./markdown-editor/markdownFrontmatter";
 import { isolateHistory } from "@codemirror/commands";
 import MarkdownEditorContextMenu from "./markdown-editor/MarkdownEditorContextMenu.vue";
-import type { MarkdownEditorSelection } from "./markdown-editor/markdownEditorSelection";
+import {
+  captureMarkdownEditorSelection,
+  syncMarkdownDOMSelection,
+  type MarkdownEditorSelection,
+} from "./markdown-editor/markdownEditorSelection";
 import { useNotificationStore } from "../../stores/notification";
 import { t } from "../../i18n";
 import {
@@ -102,6 +106,8 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   (e: "quoteSelection", selection: MarkdownEditorSelection): void;
+  /** Settled user selection; null once it collapses or the editor shows another document. */
+  (e: "selectionChange", selection: MarkdownEditorSelection | null): void;
   (e: "update:modelValue", value: string): void;
   (e: "documentChange", value: MarkdownEditorDocumentChange): void;
   (e: "shortcutSave"): void;
@@ -188,6 +194,64 @@ const recovery = useDocumentRecovery({
   },
 });
 let releaseImageRenames: RuntimeUnsubscribe | null = null;
+const SELECTION_CHANGE_DELAY_MS = 150;
+let selectionChangeTimer: ReturnType<typeof setTimeout> | null = null;
+// Identifies the last emitted selection ("" = none), so cursor moves and
+// repeated DOM syncs do not re-emit an unchanged selection.
+let emittedSelectionKey = "";
+let selectionDocument: Document | null = null;
+
+function hasSelectionListener(): boolean {
+  return !!instance?.vnode.props?.onSelectionChange;
+}
+
+function selectionKey(state: EditorState): string {
+  const ranges = state.selection.ranges.filter((range) => !range.empty);
+  return ranges.length
+    ? `${state.doc.length}|${ranges.map((range) => `${range.from}:${range.to}`).join(",")}`
+    : "";
+}
+
+function emitSelectionChange(): void {
+  if (selectionChangeTimer) clearTimeout(selectionChangeTimer);
+  selectionChangeTimer = null;
+  const view = editorView;
+  if (!view) return;
+  const key = selectionKey(view.state);
+  if (key === emittedSelectionKey) return;
+  emittedSelectionKey = key;
+  emit("selectionChange", key ? captureMarkdownEditorSelection(view.state) : null);
+}
+
+function scheduleSelectionChange(): void {
+  if (!hasSelectionListener()) return;
+  if (selectionChangeTimer) clearTimeout(selectionChangeTimer);
+  selectionChangeTimer = setTimeout(emitSelectionChange, SELECTION_CHANGE_DELAY_MS);
+}
+
+/** Another document replaces this one; its selection no longer applies. */
+function resetSelectionChange(): void {
+  if (selectionChangeTimer) clearTimeout(selectionChangeTimer);
+  selectionChangeTimer = null;
+  if (!emittedSelectionKey) return;
+  emittedSelectionKey = "";
+  emit("selectionChange", null);
+}
+
+/** Non-editable content keeps the browser selection; mirror it into the editor state. */
+function handleDocumentSelectionChange(): void {
+  const view = editorView;
+  if (!view || !view.state.readOnly) return;
+  const selection = view.dom.ownerDocument.getSelection();
+  if (!selection?.anchorNode || !view.contentDOM.contains(selection.anchorNode)) return;
+  if (!selection.isCollapsed) {
+    syncMarkdownDOMSelection(view);
+    return;
+  }
+  if (view.state.selection.ranges.some((range) => !range.empty)) {
+    view.dispatch({ selection: EditorSelection.cursor(view.state.selection.main.head) });
+  }
+}
 
 function normalizeMarkdown(value: string): string {
   return normalizeMarkdownEditorLineEndings(value);
@@ -323,7 +387,10 @@ function editorExtensions(): Extension[] {
     }),
     EditorView.updateListener.of((update) => {
       frontmatter.value = update.state.field(markdownFrontmatterField, false) ?? null;
-      if (update.docChanged || update.selectionSet) contextMenuRef.value?.close(false);
+      if (update.docChanged || update.selectionSet) {
+        contextMenuRef.value?.close(false);
+        scheduleSelectionChange();
+      }
       controlsRef.value?.update(update);
       if (!update.docChanged) return;
       recovery.changed();
@@ -495,6 +562,7 @@ function restoreSession(contentKey: string, nextModelValue: string, previousMode
   }
 
   resetCompositionState(true);
+  resetSelectionChange();
   saveActiveSession(previousModelValue, activeSessionPinned);
   activeSessionKey = normalizeSessionKey(contentKey);
   activeSessionCache = props.sessionCache ?? localSessionCache;
@@ -556,6 +624,8 @@ function mountEditor(): void {
 
 function suspendEditor(): void {
   if (!editorView) return;
+  // A hidden tab keeps its last selection; deliver one that is still settling.
+  if (selectionChangeTimer) emitSelectionChange();
   resetCompositionState(true);
   saveActiveSession();
   removeScrollTracking?.();
@@ -590,6 +660,10 @@ function handleContextMenuError(error: unknown): void {
 
 onMounted(() => {
   mountEditor();
+  if (hasSelectionListener()) {
+    selectionDocument = mountRef.value?.ownerDocument ?? null;
+    selectionDocument?.addEventListener("selectionchange", handleDocumentSelectionChange);
+  }
   void getLocusRuntime().subscribe<{ checkoutId?: string; workspaceGeneration?: number; materializationEpoch?: number; oldPath: string; newPath: string }>("markdown-image-renamed", async (event) => {
     const workspaceRef = props.workspaceRef;
     const view = editorView;
@@ -691,6 +765,10 @@ watch(textViewerZoomScale, () => {
 
 onBeforeUnmount(() => {
   editorUnmounted = true;
+  selectionDocument?.removeEventListener("selectionchange", handleDocumentSelectionChange);
+  selectionDocument = null;
+  if (selectionChangeTimer) clearTimeout(selectionChangeTimer);
+  selectionChangeTimer = null;
   releaseWorkspaceFileChanges?.();
   releaseWorkspaceFileChanges = null;
   releaseImageRenames?.();

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch, watchPostEffect } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, ref, watch, watchPostEffect } from "vue";
 import { t } from "../../i18n";
+import { DOCUMENT_SELECTION_HUB_KEY, liveSelectionQuoteForCheckout } from "../../composables/documentSelection";
 import { useEmbeddedChatSession } from "../../composables/useEmbeddedChatSession";
 import { useWorkspaceNavigationMode } from "../../composables/useWorkspaceNavigationMode";
 import { readSharedComposerDraft } from "../../composables/chatComposerDraftMemory";
@@ -96,6 +97,13 @@ const { skillItems, loadSkills } = useSkills(() => props.workspaceRef);
 const { state: knowledgeAccessState } = useKnowledgeAccessMode();
 const selectionMemory = useSelectionMemoryStore();
 const chatViewRef = ref<InstanceType<typeof ChatView> | null>(null);
+const documentSelectionHub = inject(DOCUMENT_SELECTION_HUB_KEY, null);
+// Only a conversation that has not started follows the window's document selection.
+const liveSelectionQuote = computed(() => {
+  const selection = documentSelectionHub?.current.value;
+  if (!selection || props.editor.resource.kind !== "newSession") return null;
+  return liveSelectionQuoteForCheckout(selection, props.workspaceRef?.checkoutId);
+});
 
 const requestedSessionId = computed(() => (
   props.editor.resource.kind === "session"
@@ -209,6 +217,7 @@ const {
   isCompacting,
   compactQueued,
   isThinking,
+  claudeCodePhase,
   hasThinking,
   thinkingDuration,
   activeToolCalls,
@@ -686,6 +695,7 @@ defineExpose({
     :is-compacting="isCompacting"
     :compact-queued="compactQueued"
     :is-thinking="isThinking"
+    :claude-code-phase="claudeCodePhase"
     :has-thinking="hasThinking"
     :thinking-order="thinkingOrder"
     :thinking-duration="thinkingDuration"
@@ -753,6 +763,7 @@ defineExpose({
     :show-session-navigation="false"
     :session-panel-storage-scope="sessionKey"
     :composer-draft-state-key="sessionKey"
+    :live-selection-quote="liveSelectionQuote"
     @send="handleSend"
     @compact="compact"
     @fork="handleForkSession"

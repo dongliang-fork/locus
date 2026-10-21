@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import BaseMarkdownEditor from "../components/ui/BaseMarkdownEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../components/ui/markdown-editor/markdownEditorDocumentChange";
 import type { MarkdownReferenceToken } from "../components/ui/markdown-editor/markdownComplexTokens";
+import type { MarkdownEditorSelection } from "../components/ui/markdown-editor/markdownEditorSelection";
 import { MarkdownEditorSessionCache } from "../components/ui/markdown-editor/markdownEditorSessionCache";
 import { useDocumentEditingSettings } from "../composables/useDocumentEditingSettings";
 import { EditorView as CodeMirrorView } from "@codemirror/view";
@@ -46,6 +47,44 @@ afterEach(() => {
 });
 
 describe("BaseMarkdownEditor runtime", () => {
+  it("emits settled selections once and clears them on collapse and document switch", async () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const editorRef = ref<EditorExpose | null>(null);
+    const contentKey = ref("doc-a");
+    const emitted: Array<MarkdownEditorSelection | null> = [];
+    app = createApp({ setup: () => () => h(BaseMarkdownEditor, {
+      ref: editorRef, modelValue: "one\ntwo\nthree", viewMode: "native", contentKey: contentKey.value,
+      onSelectionChange: (selection: MarkdownEditorSelection | null) => { emitted.push(selection); },
+    }) });
+    app.mount(root);
+    await nextTick();
+    const view = editorRef.value!.getEditorView()!;
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
+
+    view.dispatch({ selection: { anchor: 4, head: 6 } });
+    view.dispatch({ selection: { anchor: 4, head: 7 } });
+    await settle();
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]!.ranges).toMatchObject([{ text: "two", startLine: 2, endLine: 2 }]);
+
+    view.dispatch({ selection: { anchor: 4, head: 7 } });
+    await settle();
+    expect(emitted).toHaveLength(1);
+
+    view.dispatch({ selection: { anchor: 2 } });
+    await settle();
+    expect(emitted).toEqual([expect.anything(), null]);
+
+    view.dispatch({ selection: { anchor: 0, head: 3 } });
+    await settle();
+    expect(emitted[2]!.ranges[0]!.text).toBe("one");
+    contentKey.value = "doc-b";
+    await nextTick();
+    expect(emitted).toHaveLength(4);
+    expect(emitted[3]).toBeNull();
+  });
+
   it("applies the default-off pairing setting live in both document modes", async () => {
     const settings = useDocumentEditingSettings();
     expect(settings.state.punctuationPairing).toBe(false);

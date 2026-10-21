@@ -3,7 +3,7 @@ import { useWindowSurface } from "../../composables/useWindowSurface";
 const { ownerWindow, ownerDocument } = useWindowSurface();
 import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, useSlots, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
-import { FileText, Layers, LoaderCircle, MessageSquare, X } from "lucide";
+import { FileText, Layers, LoaderCircle, MessageSquare, TextQuote, X } from "lucide";
 import { registerScreenshotInput } from "../../services/screenshots";
 import { t } from "../../i18n";
 import {
@@ -14,6 +14,7 @@ import {
 import { knowledgeQuery } from "../../services/knowledge";
 import { viewList } from "../../services/view";
 import { searchSessionTitles } from "../../services/session";
+import { gitBranches } from "../../services/git";
 import {
   appendSessionReferences, extractSessionReferences, normalizeSessionReferences,
   sessionIdFromReference, sessionReferenceUrl, type SessionReferenceAttachment,
@@ -57,6 +58,7 @@ import {
   type UserMessageDraft,
   type UserMessageDraftKnowledgeQuote,
 } from "../../composables/chatMessageDraft";
+import type { LiveSelectionQuote } from "../../composables/documentSelection";
 import {
   readSharedComposerDraft,
   updateSharedComposerDraftText,
@@ -104,6 +106,7 @@ import {
 import { mapWorkspaceMentionResults } from "./mentionWorkspaceSearch";
 import { mapViewMentionResult } from "./mentionViewSearch";
 import { mapSessionMentionResult } from "./mentionSessionSearch";
+import { mapGitBranchMentionResults } from "./mentionBranchSearch";
 import { mentionResultKey, rankMentionSearchResults } from "./mentionSearchRanking";
 import { createMentionSearchQueue } from "./mentionSearchQueue";
 import { useMentionWorkspaceCandidates, type MentionSearchResult } from "./useMentionWorkspaceCandidates";
@@ -182,6 +185,8 @@ const props = withDefaults(defineProps<{
   workspaceRoot?: string;
   planModeActive?: boolean;
   draftStateKey?: string;
+  /** Current document selection offered as context; it is not part of the saved draft. */
+  liveSelectionQuote?: LiveSelectionQuote | null;
 }>(), {
   skills: () => [],
   placeholder: "",
@@ -207,6 +212,7 @@ const props = withDefaults(defineProps<{
   workspaceRoot: "",
   planModeActive: false,
   draftStateKey: "",
+  liveSelectionQuote: null,
 });
 
 const emit = defineEmits<{
@@ -288,6 +294,16 @@ onUnmounted(() => screenshotInput.dispose());
 const assetRefAttachments = ref<AssetRefAttachment[]>([]);
 const showAssetRefDetails = ref(false);
 const knowledgeQuoteAttachments = ref<KnowledgeQuoteAttachment[]>([]);
+// A removed or sent selection stays hidden until the document reports a new one.
+const dismissedLiveSelectionId = ref<string | null>(null);
+const liveSelectionAttachment = computed(() => {
+  const quote = props.liveSelectionQuote;
+  return quote && quote.id !== dismissedLiveSelectionId.value && quote.content.trim() ? quote : null;
+});
+const liveSelectionTitle = computed(() => {
+  const content = liveSelectionAttachment.value?.content ?? "";
+  return content.length > 600 ? `${content.slice(0, 600)}…` : content;
+});
 const consoleTextAttachments = ref<ConsoleTextAttachment[]>([]);
 const showConsoleTextDetails = ref(false);
 const unityConsoleCommandPending = ref(false);
@@ -350,6 +366,10 @@ const localMentionCandidates = useMentionWorkspaceCandidates(
   computed(() => props.workspaceRef ?? null),
   computed(() => props.workspaceRoot),
 );
+// Branches are listed once per popup and then ranked locally per keystroke.
+const mentionBranchCandidates = shallowRef<MentionSearchResult[]>([]);
+let mentionBranchRequestSeq = 0;
+let mentionBranchRequested = false;
 function createMentionProviderQueues() {
   return {
     assets: createMentionSearchQueue(),
@@ -399,6 +419,7 @@ const hasTopAttachments = computed(() =>
   imageAttachments.value.length > 0
   || assetRefAttachments.value.length > 0
   || knowledgeQuoteAttachments.value.length > 0
+  || !!liveSelectionAttachment.value
   || consoleTextAttachments.value.length > 0
   || localFileAttachments.value.length > 0
   || sessionRefAttachments.value.length > 0
@@ -590,7 +611,7 @@ function mapSceneObjectSearchResult(result: WorkspaceSceneObjectSearchResult): M
 
 const rankedMentionSearchResults = computed(() =>
   rankMentionSearchResults(
-    [...localMentionCandidates.value, ...mentionSearchResults.value]
+    [...localMentionCandidates.value, ...mentionSearchResults.value, ...mentionBranchCandidates.value]
       .filter((entry) => !excludedMentionPaths.value.has(mentionResultKey(entry))),
     mentionQuery.value,
   ),
@@ -655,12 +676,19 @@ const mentionDisplayList = computed<MentionDisplayEntry[]>(() => {
     mentionBrowseFilter.value,
     mentionSubPath.value ? 120 : 24,
   ).map((entry) => ({ ...entry, canNavigate: entry.isDir && !entry.localFile }));
+  // A slash switches to folder browsing, but `feature/x` and `origin/main` are
+  // also branch names: match branches against the whole query. Without any
+  // matching folder content the query most likely names a branch, so those
+  // lead the folder itself.
+  const branchEntries = mentionSubPath.value
+    ? rankMentionSearchResults(mentionBranchCandidates.value, mentionQuery.value, 24)
+    : [];
+  const currentFolder = mentionCurrentFolderEntry.value ? [mentionCurrentFolderEntry.value] : [];
+  const contents = [...localEntries, ...entries];
   const unique = new Map<string, MentionDisplayEntry>();
-  for (const entry of [
-    ...(mentionCurrentFolderEntry.value ? [mentionCurrentFolderEntry.value] : []),
-    ...localEntries,
-    ...entries,
-  ]) {
+  for (const entry of contents.length === 0
+    ? [...branchEntries, ...currentFolder]
+    : [...currentFolder, ...contents, ...branchEntries]) {
     const key = mentionResultKey(entry);
     if (!unique.has(key)) unique.set(key, entry);
   }
@@ -1009,9 +1037,25 @@ async function searchAssets(query: string) {
   }
 }
 
+function loadMentionBranches() {
+  if (mentionBranchRequested) return;
+  const workspaceRef = captureWorkspaceRef();
+  if (!workspaceRef) return;
+  mentionBranchRequested = true;
+  const requestSeq = ++mentionBranchRequestSeq;
+  // Not a git repository or git unavailable: branches are simply absent.
+  void Promise.resolve().then(() => gitBranches(workspaceRef)).then((result) => {
+    if (requestSeq !== mentionBranchRequestSeq || !isCurrentWorkspaceRef(workspaceRef)) return;
+    mentionBranchCandidates.value = mapGitBranchMentionResults(result);
+  }, () => {});
+}
+
 function closeMentionPopup() {
   clearMentionDebounce();
   invalidateMentionRequests();
+  mentionBranchRequestSeq += 1;
+  mentionBranchRequested = false;
+  mentionBranchCandidates.value = [];
   showMentionPopup.value = false;
   mentionAnchor.value = -1;
   mentionTokenEnd.value = -1;
@@ -1052,6 +1096,8 @@ function checkMentionTrigger(operator: ActiveOperator, preserveSelection = false
   }
   if (!preserveSelection) mentionHighlightedKey.value = null;
   showMentionPopup.value = true;
+  // A bare `@` browses the workspace root; branches join once a name is typed.
+  if (operator.query) loadMentionBranches();
 
   if (browseSubPath !== null) {
     const modeChanged = mentionMode.value !== "browse";
@@ -1349,7 +1395,8 @@ async function selectMentionEntry(entry: MentionDisplayEntry) {
     ) return;
   }
 
-  const attachment = buildMentionAttachment(entry);
+  // A branch is written inline as its ref name, e.g. `origin/main`.
+  const attachment = entry.entryKind === "branch" ? null : buildMentionAttachment(entry);
   if (attachment) {
     const nextText = removeTextRange(props.modelValue, mentionAnchor.value, mentionTokenEnd.value);
     const cursor = Math.max(0, Math.min(mentionAnchor.value, nextText.length));
@@ -1663,13 +1710,16 @@ function clearAssetRefs() {
 function normalizeKnowledgeQuoteAttachment(
   quote: UserMessageDraftKnowledgeQuote,
 ): KnowledgeQuoteAttachment | null {
-  const path = quote.path.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const file = quote.source === "file";
+  // File quotes keep absolute paths; knowledge paths are type-prefixed relative paths.
+  const path = quote.path.trim().replace(/\\/g, "/").replace(file ? /\/+$/ : /^\/+|\/+$/g, "");
   if (!path || !quote.content.trim()) return null;
   return {
     id: `knowledge-quote-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
     path,
     name: quote.name?.trim() || undefined,
     content: quote.content,
+    ...(file ? { source: "file" as const } : {}),
   };
 }
 
@@ -1693,6 +1743,15 @@ function addKnowledgeQuoteAttachments(quotes: UserMessageDraftKnowledgeQuote[]) 
 
 function removeKnowledgeQuoteAttachment(index: number) {
   knowledgeQuoteAttachments.value.splice(index, 1);
+}
+
+function dismissLiveSelectionAttachment() {
+  const quote = liveSelectionAttachment.value;
+  if (quote) dismissedLiveSelectionId.value = quote.id;
+}
+
+function knowledgeQuoteSelectionLabel(quote: UserMessageDraftKnowledgeQuote) {
+  return quote.source === "file" ? t("chat.documentSelection.label") : t("chat.knowledgeQuote.selection");
 }
 
 function knowledgeQuoteDisplayName(quote: UserMessageDraftKnowledgeQuote) {
@@ -1973,10 +2032,14 @@ function buildKnowledgeQuotePromptBlock(items: KnowledgeQuoteAttachment[]) {
     const metadata = encodeURIComponent(JSON.stringify({
       path: item.path,
       name: item.name ?? "",
+      ...(item.source === "file" ? { source: "file" } : {}),
     }));
     return `<locus-knowledge-quote data="${metadata}">\n${item.content}\n</locus-knowledge-quote>`;
   });
-  return `<locus-knowledge-quotes>\nUse these exact excerpts from project knowledge as quoted context.\n\n${entries.join("\n\n")}\n</locus-knowledge-quotes>`;
+  const intro = items.some((item) => item.source === "file")
+    ? "Use these exact excerpts selected by the user as quoted context. Each starts with its source file path and line range."
+    : "Use these exact excerpts from project knowledge as quoted context.";
+  return `<locus-knowledge-quotes>\n${intro}\n\n${entries.join("\n\n")}\n</locus-knowledge-quotes>`;
 }
 
 function appendKnowledgeQuotePromptBlock(text: string, items: KnowledgeQuoteAttachment[]) {
@@ -1986,7 +2049,7 @@ function appendKnowledgeQuotePromptBlock(text: string, items: KnowledgeQuoteAtta
 }
 
 function knowledgeQuoteAssetRefs(items: KnowledgeQuoteAttachment[]): AssetRefAttachment[] {
-  return items.map((item) => ({
+  return items.filter((item) => item.source !== "file").map((item) => ({
     kind: "knowledge",
     path: item.path,
     name: item.name,
@@ -2422,7 +2485,7 @@ async function handleSend() {
     : [];
   const explicitAssetRefs = dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);
   const quotes = [...knowledgeQuoteAttachments.value];
-  const assetRefs = dedupeAssetRefs([
+  let assetRefs = dedupeAssetRefs([
     ...explicitAssetRefs,
     ...knowledgeQuoteAssetRefs(quotes),
   ]);
@@ -2445,6 +2508,19 @@ async function handleSend() {
       showUserIntentMissingInputNotice();
     }
     return;
+  }
+
+  // The live selection is context for a message, never a message by itself.
+  const liveSelection = liveSelectionAttachment.value;
+  const liveSelectionQuote = liveSelection
+    ? normalizeKnowledgeQuoteAttachment(liveSelection)
+    : null;
+  if (liveSelectionQuote && !quotes.some((quote) => (
+    quote.path.toLowerCase() === liveSelectionQuote.path.toLowerCase()
+    && quote.content === liveSelectionQuote.content
+  ))) {
+    quotes.push(liveSelectionQuote);
+    assetRefs = dedupeAssetRefs([...assetRefs, ...knowledgeQuoteAssetRefs([liveSelectionQuote])]);
   }
 
   const text = appendSessionReferences(
@@ -2480,6 +2556,7 @@ async function handleSend() {
       sendPending.value = false;
     }
   }
+  if (liveSelection) dismissedLiveSelectionId.value = liveSelection.id;
   resetDraft();
   emit("send", payload);
 }
@@ -3430,6 +3507,25 @@ defineExpose({
             </button>
           </div>
           <div
+            v-if="liveSelectionAttachment"
+            :key="liveSelectionAttachment.id"
+            class="local-file-chip knowledge-quote-chip live-selection-chip"
+            :title="liveSelectionTitle"
+          >
+            <LucideIcon class="local-file-chip-icon" :icon="TextQuote" :size="14" />
+            <span class="local-file-chip-name">{{ liveSelectionAttachment.location }}</span>
+            <span class="local-file-chip-meta">{{ t("chat.documentSelection.label") }}</span>
+            <button
+              type="button"
+              class="local-file-chip-remove ui-select-none"
+              :aria-label="t('chat.documentSelection.remove')"
+              :title="t('chat.documentSelection.remove')"
+              @click.stop="dismissLiveSelectionAttachment"
+            >
+              <LucideIcon :icon="X" :size="13" />
+            </button>
+          </div>
+          <div
             v-for="(quote, index) in knowledgeQuoteAttachments"
             :key="quote.id"
             class="local-file-chip knowledge-quote-chip"
@@ -3437,7 +3533,7 @@ defineExpose({
           >
             <LucideIcon class="local-file-chip-icon" :icon="FileText" :size="14" />
             <span class="local-file-chip-name">{{ knowledgeQuoteDisplayName(quote) }}</span>
-            <span class="local-file-chip-meta">{{ t("chat.knowledgeQuote.selection") }}</span>
+            <span class="local-file-chip-meta">{{ knowledgeQuoteSelectionLabel(quote) }}</span>
             <button
               type="button"
               class="local-file-chip-remove ui-select-none"
