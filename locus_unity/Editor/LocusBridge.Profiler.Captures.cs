@@ -89,14 +89,19 @@ namespace Locus
             /// <summary>Request timings; Unity usually makes the data available several frames later.</summary>
             public bool CaptureFrameTimings()
             {
+#if UNITY_2022_1_OR_NEWER
                 if (!FrameTimingManager.IsFeatureEnabled()) return false;
                 FrameTimingManager.CaptureFrameTimings();
                 return true;
+#else
+                return false;
+#endif
             }
 
             public ProfilerFrameTimings GetFrameTimings(int count = 1)
             {
                 if (count < 1 || count > 128) throw new ArgumentOutOfRangeException(nameof(count));
+#if UNITY_2022_1_OR_NEWER
                 var result = new ProfilerFrameTimings { Enabled = FrameTimingManager.IsFeatureEnabled(), Error = "",
                     Frames = Array.Empty<ProfilerFrameTiming>() };
                 if (!result.Enabled) { result.Error = "Frame Timing Stats is disabled or unsupported on this platform."; return result; }
@@ -114,6 +119,12 @@ namespace Locus
                 result.Frames = frames.ToArray();
                 if (frames.Count == 0) result.Error = "No completed frame timings; request a capture and wait several rendered frames.";
                 return result;
+#else
+                // FrameTimingManager.IsFeatureEnabled and the per-thread FrameTiming
+                // fields this API reports were added in Unity 2022.1.
+                return new ProfilerFrameTimings { Enabled = false, Frames = Array.Empty<ProfilerFrameTiming>(),
+                    Error = "Frame timings require Unity 2022.1 or newer." };
+#endif
             }
 
             public ProfilerThreadInfo[] GetProfilerThreads(int profilerFrameIndex)

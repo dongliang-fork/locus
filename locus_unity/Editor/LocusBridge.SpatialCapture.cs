@@ -19,6 +19,14 @@ namespace Locus
         private static long spatialCaptureExpiry;
         private static bool spatialCapturePausedByUs;
         private static Action spatialCaptureRestoreView;
+        // ObjectIdRequest exists in Unity 2022.3.11+ and 2023.2+, not in 2023.1.
+        // LOCUS_HAS_OBJECT_ID_REQUEST comes from Locus.Editor.asmdef versionDefines.
+#if UNITY_2023_2_OR_NEWER || LOCUS_HAS_OBJECT_ID_REQUEST
+        private static readonly bool SpatialCaptureSupported = true;
+#else
+        private static readonly bool SpatialCaptureSupported = false;
+#endif
+        private const string SpatialCaptureUnsupportedMessage = "Spatial capture requires Unity 2022.3.11+ or 2023.2+";
 
         private static void ReleaseSpatialCaptureLease()
         {
@@ -97,7 +105,7 @@ namespace Locus
                         await SpatialCaptureNextUpdate();
                         await SpatialCaptureNextUpdate();
                     }
-                    if (SystemInfo.supportsAsyncGPUReadback
+                    if (SpatialCaptureSupported && SystemInfo.supportsAsyncGPUReadback
                         && (SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12))
                     {
                         foreach (string target in new[] { "scene", "game" })
@@ -144,6 +152,12 @@ namespace Locus
             while (t != null) { names.Add(t.name); t = t.parent; }
             names.Reverse(); return string.Join("/", names.ToArray());
         }
+#if !(UNITY_2023_2_OR_NEWER || LOCUS_HAS_OBJECT_ID_REQUEST)
+        private static Task<SpatialCaptureWire> CaptureSpatialCamera(Camera source, string target, RectInt rect)
+        {
+            return Task.FromException<SpatialCaptureWire>(new NotSupportedException(SpatialCaptureUnsupportedMessage));
+        }
+#else
         private static async Task<SpatialCaptureWire> CaptureSpatialCamera(Camera source, string target, RectInt rect)
         {
             int width, height;
@@ -226,6 +240,7 @@ namespace Locus
                 if (material != null) UnityEngine.Object.DestroyImmediate(material);
             }
         }
+#endif
         private static string CompressSpatialCapture(uint[] indexes, float[] depths) {
                 var raw = new byte[indexes.Length * 8];
                 Buffer.BlockCopy(indexes, 0, raw, 0, indexes.Length * 4);

@@ -156,8 +156,89 @@ namespace Locus
             var element = property.GetArrayElementAtIndex(index);
             if (element.propertyType == SerializedPropertyType.ManagedReference) element.managedReferenceValue = null;
             else if (element.isArray && element.propertyType == SerializedPropertyType.Generic) element.arraySize = 0;
+#if UNITY_2022_1_OR_NEWER
             else element.boxedValue = initial;
+#else
+            else
+            {
+                // Batched writes apply the shared SerializedObject; never leave a
+                // half-initialized element behind when a field type is unsupported.
+                try { WriteInitialSerializedValue(element, initial); }
+                catch { property.DeleteArrayElementAtIndex(index); throw; }
+            }
+#endif
         }
+
+#if !UNITY_2022_1_OR_NEWER
+        // SerializedProperty.boxedValue is Unity 2022.1+. Write the fresh element
+        // field by field so it does not keep the neighbour that
+        // InsertArrayElementAtIndex copied. A null value writes the type default.
+        private static void WriteInitialSerializedValue(SerializedProperty property, object value)
+        {
+            if (property.isFixedBuffer)
+            {
+                var items = value as IList;
+                for (int i = 0; i < property.fixedBufferSize; i++)
+                    WriteInitialSerializedValue(property.GetFixedBufferElementAtIndex(i), items != null && i < items.Count ? items[i] : null);
+                return;
+            }
+            switch (property.propertyType)
+            {
+                case SerializedPropertyType.ManagedReference: property.managedReferenceValue = value; return;
+                case SerializedPropertyType.ObjectReference: property.objectReferenceValue = value as UnityEngine.Object; return;
+                case SerializedPropertyType.ExposedReference: property.exposedReferenceValue = value as UnityEngine.Object; return;
+                case SerializedPropertyType.Boolean: property.boolValue = value is bool flag && flag; return;
+                case SerializedPropertyType.Float: property.doubleValue = value == null ? 0 : Convert.ToDouble(value, CultureInfo.InvariantCulture); return;
+                case SerializedPropertyType.String: property.stringValue = value as string ?? ""; return;
+                case SerializedPropertyType.Character: property.intValue = value is char character ? character : 0; return;
+                case SerializedPropertyType.LayerMask: property.intValue = value is UnityEngine.LayerMask mask ? mask.value : 0; return;
+                case SerializedPropertyType.Integer:
+                case SerializedPropertyType.Enum:
+                    if (value == null) property.longValue = 0;
+                    else if (value is ulong || (value is Enum && Enum.GetUnderlyingType(value.GetType()) == typeof(ulong)))
+                        SetSerializedUInt64(property, Convert.ToUInt64(value, CultureInfo.InvariantCulture));
+                    else property.longValue = Convert.ToInt64(value, CultureInfo.InvariantCulture);
+                    return;
+                case SerializedPropertyType.Color:
+                    property.colorValue = value is UnityEngine.Color32 color32 ? (UnityEngine.Color)color32
+                        : value is UnityEngine.Color color ? color : default(UnityEngine.Color);
+                    return;
+                case SerializedPropertyType.Vector2: property.vector2Value = value is UnityEngine.Vector2 vector2 ? vector2 : default(UnityEngine.Vector2); return;
+                case SerializedPropertyType.Vector3: property.vector3Value = value is UnityEngine.Vector3 vector3 ? vector3 : default(UnityEngine.Vector3); return;
+                case SerializedPropertyType.Vector4: property.vector4Value = value is UnityEngine.Vector4 vector4 ? vector4 : default(UnityEngine.Vector4); return;
+                case SerializedPropertyType.Quaternion: property.quaternionValue = value is UnityEngine.Quaternion rotation ? rotation : default(UnityEngine.Quaternion); return;
+                case SerializedPropertyType.Rect: property.rectValue = value is UnityEngine.Rect rect ? rect : default(UnityEngine.Rect); return;
+                case SerializedPropertyType.Bounds: property.boundsValue = value is UnityEngine.Bounds bounds ? bounds : default(UnityEngine.Bounds); return;
+                case SerializedPropertyType.Vector2Int: property.vector2IntValue = value is UnityEngine.Vector2Int vector2Int ? vector2Int : default(UnityEngine.Vector2Int); return;
+                case SerializedPropertyType.Vector3Int: property.vector3IntValue = value is UnityEngine.Vector3Int vector3Int ? vector3Int : default(UnityEngine.Vector3Int); return;
+                case SerializedPropertyType.RectInt: property.rectIntValue = value is UnityEngine.RectInt rectInt ? rectInt : default(UnityEngine.RectInt); return;
+                case SerializedPropertyType.BoundsInt: property.boundsIntValue = value is UnityEngine.BoundsInt boundsInt ? boundsInt : default(UnityEngine.BoundsInt); return;
+                case SerializedPropertyType.Hash128: property.hash128Value = value is UnityEngine.Hash128 hash ? hash : default(UnityEngine.Hash128); return;
+                case SerializedPropertyType.AnimationCurve: property.animationCurveValue = value as UnityEngine.AnimationCurve ?? new UnityEngine.AnimationCurve(); return;
+                case SerializedPropertyType.Generic:
+                    if (property.isArray)
+                    {
+                        var items = value as IList;
+                        property.arraySize = items != null ? items.Count : 0;
+                        for (int i = 0; i < property.arraySize; i++)
+                            WriteInitialSerializedValue(property.GetArrayElementAtIndex(i), items[i]);
+                        return;
+                    }
+                    SerializedProperty child = property.Copy(), end = child.GetEndProperty();
+                    bool enter = true;
+                    while (child.Next(enter) && !SerializedProperty.EqualContents(child, end))
+                    {
+                        enter = false;
+                        FieldInfo field = value == null ? null : SerializedMemberField(value.GetType(), child.name);
+                        WriteInitialSerializedValue(child.Copy(), field != null ? field.GetValue(value) : null);
+                    }
+                    return;
+                default:
+                    // Gradient has no public setter before 2022.1.
+                    throw new NotSupportedException("Initializing " + property.propertyType + " list elements requires Unity 2022.1 or newer.");
+            }
+        }
+#endif
 
         private static void InsertListReferences(SerializedProperty property, int index, string[] paths)
         {

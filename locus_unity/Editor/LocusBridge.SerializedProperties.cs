@@ -393,6 +393,26 @@ namespace Locus
             }
         }
 
+        // SerializedProperty.ulongValue exists from Unity 2022.1. Older editors
+        // store the same 64 bits behind longValue; the cast is lossless.
+        internal static ulong GetSerializedUInt64(SerializedProperty prop)
+        {
+#if UNITY_2022_1_OR_NEWER
+            return prop.ulongValue;
+#else
+            return unchecked((ulong)prop.longValue);
+#endif
+        }
+
+        internal static void SetSerializedUInt64(SerializedProperty prop, ulong value)
+        {
+#if UNITY_2022_1_OR_NEWER
+            prop.ulongValue = value;
+#else
+            prop.longValue = unchecked((long)value);
+#endif
+        }
+
         public static object SerializedPropertyValue(SerializedProperty prop, bool resolveSchema = true)
         {
             if (prop == null)
@@ -403,7 +423,7 @@ namespace Locus
                 case SerializedPropertyType.Integer:
                 case SerializedPropertyType.ArraySize:
                 case SerializedPropertyType.LayerMask:
-                    if (prop.type == "ulong") return prop.ulongValue.ToString(CultureInfo.InvariantCulture);
+                    if (prop.type == "ulong") return GetSerializedUInt64(prop).ToString(CultureInfo.InvariantCulture);
                     if (prop.type == "long") return prop.longValue.ToString(CultureInfo.InvariantCulture);
                     return prop.longValue;
                 case SerializedPropertyType.Boolean:

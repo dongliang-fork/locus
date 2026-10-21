@@ -131,7 +131,10 @@ namespace Locus
                     case ObjectChangeKind.DestroyGameObjectHierarchy:
                     case ObjectChangeKind.ChangeGameObjectStructureHierarchy:
                     case ObjectChangeKind.ChangeGameObjectParent:
+#if UNITY_2022_2_OR_NEWER
+                    // Older editors report sibling reorders only via hierarchyChanged.
                     case ObjectChangeKind.ChangeChildrenOrder:
+#endif
                     case ObjectChangeKind.UpdatePrefabInstances:
                         Invalidate(); return;
                     case ObjectChangeKind.ChangeGameObjectOrComponentProperties:

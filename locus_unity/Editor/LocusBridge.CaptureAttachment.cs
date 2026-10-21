@@ -77,7 +77,7 @@ namespace Locus
                     };
                     var colorTask = ReadAttachmentColor(window, target);
                     SpatialCaptureWire spatial = null;
-                    if (camera != null && SystemInfo.supportsAsyncGPUReadback &&
+                    if (camera != null && SpatialCaptureSupported && SystemInfo.supportsAsyncGPUReadback &&
                         (SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12)) {
                         try { spatial = await CaptureSpatialCamera(camera, target, new RectInt(0, 0, camera.pixelWidth, camera.pixelHeight)); }
                         catch (Exception ex) {
@@ -86,6 +86,7 @@ namespace Locus
                         }
                     }
                     else context.spatialError = camera == null ? "No unambiguous camera for this view"
+                        : !SpatialCaptureSupported ? SpatialCaptureUnsupportedMessage
                         : !SystemInfo.supportsAsyncGPUReadback ? "GPU readback unavailable" : "Unsupported graphics API";
                     var color = await colorTask;
                     if (spatialCaptureLease != request.id) throw new InvalidOperationException("Screenshot capture timed out");
