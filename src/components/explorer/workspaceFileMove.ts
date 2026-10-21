@@ -34,18 +34,33 @@ export function workspaceMovedPath(path: string, source: string, target: string,
 }
 
 export function resolveWorkspaceFileMove(data: WorkbenchReferenceDragData, target: WorkspaceFileDropScope) {
-  if (!data.fileSystemMove || data.entries.length !== 1 || data.origin.projectId !== target.projectId) return null;
+  if (!data.fileSystemMove || data.entries.length === 0 || data.origin.projectId !== target.projectId) return null;
   const from = data.origin.workspaceRef;
   const to = target.workspaceRef;
   if (from.checkoutId !== to.checkoutId || from.expectedGeneration !== to.expectedGeneration
     || from.expectedMaterializationEpoch !== to.expectedMaterializationEpoch) return null;
-  const entry = data.entries[0];
-  if (entry?.kind !== "file") return null;
-  const sourcePath = workspaceRelativeEntryPath(data.origin.workspaceRoot, entry.path);
   const directory = workspaceRelativeEntryPath(target.root, target.directory);
-  if (!sourcePath || directory === null) return null;
+  if (directory === null) return null;
   const fold = (path: string) => /^[a-z]:[/\\]/i.test(target.root) ? path.toLowerCase() : path;
-  if (fold(workspaceFileParent(sourcePath)) === fold(directory || ".")) return null;
-  if (entry.isDir && (fold(directory) === fold(sourcePath) || fold(directory).startsWith(`${fold(sourcePath)}/`))) return null;
-  return { sourcePath, targetDirectory: directory || ".", workspaceRef: { ...to } };
+  const sources: string[] = [];
+  for (const entry of data.entries) {
+    if (entry?.kind !== "file") return null;
+    const sourcePath = workspaceRelativeEntryPath(data.origin.workspaceRoot, entry.path);
+    if (!sourcePath) return null;
+    // One folder dropped into itself or a descendant rejects the whole selection.
+    if (entry.isDir && (fold(directory) === fold(sourcePath) || fold(directory).startsWith(`${fold(sourcePath)}/`))) return null;
+    sources.push(sourcePath);
+  }
+  const selected = new Set(sources.map(fold));
+  const seen = new Set<string>();
+  const sourcePaths = sources.filter((path) => {
+    const key = fold(path);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    // A descendant of another dragged folder already moves with that folder.
+    const parts = key.split("/");
+    if (parts.slice(0, -1).some((_, index) => selected.has(parts.slice(0, index + 1).join("/")))) return false;
+    return fold(workspaceFileParent(path)) !== fold(directory || ".");
+  });
+  return sourcePaths.length ? { sourcePaths, targetDirectory: directory || ".", workspaceRef: { ...to } } : null;
 }

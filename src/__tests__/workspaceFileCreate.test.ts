@@ -23,6 +23,7 @@ function fixture() {
   const input = { focus: vi.fn(), select: vi.fn() };
   const state = { entries: [] as any[], toggle: vi.fn(), refresh: vi.fn().mockResolvedValue(undefined) };
   const create = vi.fn().mockImplementation(async (_ref, directory, name) => directory === "." ? name : `${directory}/${name}`);
+  const createFolder = vi.fn().mockImplementation(async (_ref, directory, name) => directory === "." ? name : `${directory}/${name}`);
   const open = vi.fn().mockResolvedValue(undefined), notice = vi.fn();
   let api: any;
   const deps = {
@@ -31,17 +32,18 @@ function fixture() {
     workspaceNavigation: { getMode: () => mode.value }, checkoutWorkspaceRef: () => ({ ...workspaceRef }),
     contextCreateTarget: computed(() => contextMenu.value ? api.treeFileCreateTarget(contextMenu.value.item) : null),
     expanded: ref(new Set()), workspaceFileStates: { worktree: state }, inlineCreateInput: ref(input),
-    treeItems: ref([]), workspaceTreeRef: ref(null), workspaceCreateDocument: create,
+    treeItems: ref([]), workspaceTreeRef: ref(null), workspaceCreateDocument: create, workspaceCreateFolder: createFolder,
     openWorkbenchResourceFromWorkspaceTree: open, notificationStore: { addNotice: notice },
     normalizeAppError: (error: Error) => error, t: (key: string) => key, explorerStore: { applyOperations: vi.fn() },
     activeResource: ref({ projectId: "p" }), workspaceContextStore: {}, visibleProjects: ref([]), resetSessionMultiSelection: vi.fn(),
+    resetFileMultiSelection: vi.fn(),
   };
   api = new Function(...Object.keys(deps), `${code}\nreturn { ${names.join(", ")} };`)(...Object.values(deps));
   const item = (path?: string, folder = false) => ({ key: path ?? "root", treeRow: { depth: 0, expanded: true }, meta: {
     kind: path ? "workspaceFile" : "project", projectId: "p", checkoutId: path ? "worktree" : undefined,
     workspaceFile: path ? { node: { path, kind: folder ? "folder" : "file" } } : undefined,
   } });
-  return { api, deps, mode, item, inlineCreate, contextMenu, state, create, open, notice, workspaceRef };
+  return { api, deps, mode, item, inlineCreate, contextMenu, state, create, createFolder, open, notice, workspaceRef };
 }
 
 describe("workspace file creation", () => {
@@ -86,6 +88,37 @@ describe("workspace file creation", () => {
       expect(f.inlineCreate.value).toBeNull();
     },
   );
+
+  it("creates a folder inside the clicked folder, refreshes the list and opens nothing", async () => {
+    const f = fixture();
+    f.contextMenu.value = { item: f.item("Docs/a.md") };
+    await f.api.beginCreateWorkspaceDocument("folder");
+    expect(f.inlineCreate.value).toMatchObject({ kind: "folder", fileTarget: { directory: "Docs" } });
+    f.inlineCreate.value.name = "Sub.md";
+    await Promise.all([f.api.submitInlineCreate(), f.api.submitInlineCreate()]);
+    expect(f.createFolder).toHaveBeenCalledExactlyOnceWith(f.workspaceRef, "Docs", "Sub.md");
+    expect(f.create).not.toHaveBeenCalled();
+    expect(f.state.refresh).toHaveBeenCalledWith("Docs/Sub.md", "upsert");
+    expect(f.open).not.toHaveBeenCalled();
+    expect(f.deps.explorerStore.applyOperations).not.toHaveBeenCalled();
+    expect(f.inlineCreate.value).toBeNull();
+  });
+
+  it("keeps the folder name after a failed create but not after a failed refresh", async () => {
+    const f = fixture();
+    f.contextMenu.value = { item: f.item() };
+    await f.api.beginCreateWorkspaceDocument("folder");
+    f.inlineCreate.value.name = "Art";
+    f.createFolder.mockRejectedValueOnce(new Error("already exists"));
+    await f.api.submitInlineCreate();
+    expect(f.inlineCreate.value).toMatchObject({ kind: "folder", name: "Art" });
+    expect(f.notice).toHaveBeenCalledWith("error", "already exists");
+    f.state.refresh.mockRejectedValueOnce(new Error("refresh failed"));
+    await f.api.submitInlineCreate();
+    expect(f.inlineCreate.value).toBeNull();
+    expect(f.createFolder).toHaveBeenCalledTimes(2);
+    expect(f.notice).toHaveBeenCalledWith("error", "refresh failed");
+  });
 
   it("places the naming row inside the requested folder and only in its checkout", async () => {
     const f = fixture();

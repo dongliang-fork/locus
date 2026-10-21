@@ -13,6 +13,7 @@ import { useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay
 import { knowledgeResourceManagedHint } from "../knowledge/knowledgeResourceActions";
 import { resourceName, resourceRelativePath, validResourceName, type ExplorerResourceAction, type ExplorerResourceRename, type ExplorerResourceTarget } from "./explorerResourceActions";
 import type { FileHistoryTarget } from "../../services/fileHistory";
+import { workspaceMovedPath } from "./workspaceFileMove";
 
 const emit = defineEmits<{
   changed: [target: ExplorerResourceTarget, newPath: string | null];
@@ -27,8 +28,13 @@ function cancel(current = draft.value) {
 }
 
 async function mutate(target: ExplorerResourceTarget, name: string | null) {
+  if (target.document && knowledgeResourceManagedHint(target.document)) return;
+  await apply(target, name);
+  await refresh(target.projectId, !!target.document);
+}
+
+async function apply(target: ExplorerResourceTarget, name: string | null) {
   const document = target.document;
-  if (document && knowledgeResourceManagedHint(document)) return;
   let nextPath: string | null = null;
   if (document) {
     if (!target.workspaceRef) throw new Error(t("development.workspaceUnavailable"));
@@ -49,16 +55,49 @@ async function mutate(target: ExplorerResourceTarget, name: string | null) {
     if (nextPath) movePathPreference(target.path, nextPath);
   }
   emit("changed", target, nextPath);
+}
+
+async function refresh(projectId: string, knowledge: boolean) {
   // A refresh failure must not present an already completed rename as a failed
   // mutation or invite a retry against the old path.
   try {
-    if (document) await explorerStore.refreshProjectKnowledge(target.projectId);
-    else await explorerStore.loadProject(target.projectId, true);
-    const mounts = explorerStore.snapshots[target.projectId]?.nodes.filter((node) => node.nodeKind === "folder" && node.sourcePath) ?? [];
-    const results = await Promise.allSettled(mounts.map((node) => explorerStore.loadMount(target.projectId, node.nodeId, true)));
+    if (knowledge) await explorerStore.refreshProjectKnowledge(projectId);
+    else await explorerStore.loadProject(projectId, true);
+    const mounts = explorerStore.snapshots[projectId]?.nodes.filter((node) => node.nodeKind === "folder" && node.sourcePath) ?? [];
+    const results = await Promise.allSettled(mounts.map((node) => explorerStore.loadMount(projectId, node.nodeId, true)));
     const failure = results.find((result) => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
   } catch (error) { notificationStore.addNotice("warning", normalizeAppError(error).message); }
+}
+
+/** Batch copy/delete for a multi-selection; a single target keeps the regular action flow. */
+async function runMany(action: "copy" | "delete", targets: ExplorerResourceTarget[]) {
+  if (targets.length === 1) return run(action, targets[0]!);
+  const managed = (target: ExplorerResourceTarget) => !!target.document && !!knowledgeResourceManagedHint(target.document);
+  // Entries inside a selected folder go with it; deleting them first would only fail.
+  const folders = action === "delete" ? targets.filter((target) => target.isDirectory && !managed(target)) : [];
+  const eligible = targets.filter((target) => !managed(target) && !folders.some((folder) => folder !== target
+    && workspaceMovedPath(target.path, folder.path, folder.path, true) !== null));
+  if (eligible.length === 1) return run(action, eligible[0]!);
+  if (eligible.length === 0) return;
+  try {
+    if (action === "copy") {
+      await navigator.clipboard.writeText(eligible.map(resourceRelativePath).join("\n"));
+      notificationStore.addNotice("success", t("knowledge.explorer.relativePathCopied"));
+      return;
+    }
+    const approved = await confirm(t("knowledge.explorer.deleteManyConfirm", eligible.length), {
+      title: t("common.confirmDelete"), kind: "warning", okLabel: t("common.delete"), cancelLabel: t("common.cancel"),
+    });
+    if (!approved) return;
+    // Continue past one failed entry so the rest of the selection is still deleted.
+    for (const target of eligible) {
+      try { await apply(target, null); }
+      catch (error) { notificationStore.addNotice("error", normalizeAppError(error).message); }
+    }
+    const refreshes = new Set(eligible.map((target) => `${target.document ? "k" : "f"}:${target.projectId}`));
+    for (const key of refreshes) await refresh(key.slice(2), key.startsWith("k:"));
+  } catch (error) { notificationStore.addNotice("error", normalizeAppError(error).message); }
 }
 
 async function commit(current: ExplorerResourceRename) {
@@ -99,7 +138,9 @@ async function run(action: ExplorerResourceAction, target: ExplorerResourceTarge
       draft.value = current;
     } else if (action === "delete") {
       const packageRoot = target.document && isSkillPackageRootDocument(target.document);
-      const approved = await confirm(t(packageRoot ? "knowledge.explorer.deletePackageConfirm" : "knowledge.explorer.deleteDocumentConfirm", resourceName(target)), {
+      const message = packageRoot ? "knowledge.explorer.deletePackageConfirm"
+        : target.isDirectory ? "knowledge.explorer.deleteFolderConfirm" : "knowledge.explorer.deleteDocumentConfirm";
+      const approved = await confirm(t(message, resourceName(target)), {
         title: t("common.confirmDelete"), kind: "warning", okLabel: t("common.delete"), cancelLabel: t("common.cancel"),
       });
       if (approved) await mutate(target, null);
@@ -117,7 +158,7 @@ async function run(action: ExplorerResourceAction, target: ExplorerResourceTarge
     }
   } catch (error) { notificationStore.addNotice("error", normalizeAppError(error).message); }
 }
-defineExpose({ run, draft, cancel });
+defineExpose({ run, runMany, draft, cancel });
 </script>
 
 <template></template>

@@ -38,20 +38,22 @@ export function assetWorkspaceReferenceEntry(
 
 export function assetWorkspaceReferenceDragData(
   context: AssetWorkspaceDragContext,
-  entry: AssetWorkspaceDragEntry,
+  entry: AssetWorkspaceDragEntry | AssetWorkspaceDragEntry[],
 ): WorkbenchReferenceDragData | null {
   const normalizedProjectId = context.projectId.trim();
   const normalizedRoot = context.workspaceRoot.trim();
-  const reference = assetWorkspaceReferenceEntry(entry);
-  if (!normalizedProjectId || !normalizedRoot || !reference) return null;
+  const entries = Array.isArray(entry) ? entry : [entry];
+  const references = entries.map(assetWorkspaceReferenceEntry);
+  if (!normalizedProjectId || !normalizedRoot || references.length === 0
+    || references.some((reference) => !reference)) return null;
   return {
     version: 1,
-    fileSystemMove: !("isSubAsset" in entry && entry.isSubAsset),
+    fileSystemMove: entries.every((candidate) => !("isSubAsset" in candidate && candidate.isSubAsset)),
     origin: {
       projectId: normalizedProjectId,
       workspaceRef: context.workspaceRef,
       workspaceRoot: normalizedRoot,
     },
-    entries: [reference],
+    entries: references as WorkbenchReferenceDragEntry[],
   };
 }

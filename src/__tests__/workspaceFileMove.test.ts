@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { assetWorkspaceReferenceDragData } from "../components/asset/assetWorkspaceDrag";
+import type { AssetExplorerNode } from "../composables/useAssetState";
 import { workbenchReferenceInternalDragSource } from "../components/workbench/workbenchReferenceDrag";
 import { resolveWorkspaceFileMove, workspaceMovedPath, workspaceRelativeEntryPath } from "../components/explorer/workspaceFileMove";
 
@@ -10,7 +11,7 @@ const data = assetWorkspaceReferenceDragData(context, { kind: "file", name: "Mai
 
 describe("workspace file moves", () => {
   it("moves filesystem drags while keeping ordinary reference drags copy-only", () => {
-    expect(resolveWorkspaceFileMove(data, target)).toEqual({ sourcePath: "Assets/Main.cs", targetDirectory: "Target", workspaceRef });
+    expect(resolveWorkspaceFileMove(data, target)).toEqual({ sourcePaths: ["Assets/Main.cs"], targetDirectory: "Target", workspaceRef });
     expect(workbenchReferenceInternalDragSource(data).allowedOperations).toContain("move");
     expect(resolveWorkspaceFileMove({ ...data, fileSystemMove: undefined }, target)).toBeNull();
     expect(workbenchReferenceInternalDragSource({ ...data, fileSystemMove: undefined }).allowedOperations).toEqual(["copy"]);
@@ -33,6 +34,20 @@ describe("workspace file moves", () => {
     expect(workspaceRelativeEntryPath("F:/Game", "../other")).toBeNull();
     expect(workspaceRelativeEntryPath("F:/Game", "F:/Elsewhere/a")).toBeNull();
     expect(workspaceRelativeEntryPath("F:/Game", "f:\\game\\Assets\\a.cs")).toBe("Assets/a.cs");
+  });
+  it("moves a multi-selection once per outermost entry outside the target", () => {
+    const many = assetWorkspaceReferenceDragData(context, [
+      { kind: "folder", name: "Foo", path: "Assets/Foo", depth: 1 } as AssetExplorerNode,
+      { kind: "file", name: "a.cs", path: "Assets/Foo/a.cs", depth: 2 },
+      { kind: "file", name: "b.cs", path: "Target/b.cs", depth: 1 },
+      { kind: "file", name: "main.cs", path: "assets/main.cs", depth: 1 },
+      { kind: "file", name: "Main.cs", path: "Assets/Main.cs", depth: 1 },
+    ])!;
+    expect(many.entries).toHaveLength(5);
+    expect(workbenchReferenceInternalDragSource(many).preview.count).toBe(5);
+    expect(resolveWorkspaceFileMove(many, target)?.sourcePaths).toEqual(["Assets/Foo", "assets/main.cs"]);
+    expect(resolveWorkspaceFileMove({ ...many, entries: many.entries.slice(2, 3) }, target)).toBeNull();
+    expect(resolveWorkspaceFileMove(many, { ...target, directory: "Assets/Foo/Bar" })).toBeNull();
   });
   it("rebases opened descendants of moved folders without matching neighboring names", () => {
     expect(workspaceMovedPath("F:/Game/Assets/Foo/a.cs", "F:/Game/Assets/Foo", "F:/Game/Target/Foo", true))

@@ -11,6 +11,8 @@ const props = defineProps<{ target: ExplorerResourceTarget }>();
 const emit = defineEmits<{ action: [action: ExplorerResourceAction]; close: [] }>();
 const hint = computed(() => props.target.document && knowledgeResourceManagedHint(props.target.document));
 const isPackage = computed(() => !!props.target.document && isSkillPackageRootDocument(props.target.document));
+// Workspace folders are deleted through the checkout; mounted folders are not.
+const canDelete = computed(() => !props.target.isDirectory || !props.target.mounted);
 </script>
 
 <template>
@@ -25,8 +27,8 @@ const isPackage = computed(() => !!props.target.document && isSkillPackageRootDo
   <button type="button" @click="emit('action', 'reveal')"><LucideIcon :icon="FolderOpen" :size="13" />{{ t('knowledge.explorer.openInFileSystem') }}</button>
   <button type="button" @click="emit('action', 'copy')"><LucideIcon :icon="Copy" :size="13" />{{ t('knowledge.explorer.copyRelativePath') }}</button>
   <ResourcePathMenuItem :path-key="resourcePathKey(target)" @select="emit('close')" />
-  <div v-if="!target.isDirectory" class="base-context-menu-separator" role="separator" />
-  <button v-if="!target.isDirectory" type="button" class="danger" :disabled="!!hint" :title="hint ? t(hint) : undefined" @click="emit('action', 'delete')">
+  <div v-if="canDelete" class="base-context-menu-separator" role="separator" />
+  <button v-if="canDelete" type="button" class="danger" :disabled="!!hint" :title="hint ? t(hint) : undefined" @click="emit('action', 'delete')">
     <LucideIcon :icon="Trash2" :size="13" />{{ t(isPackage ? 'knowledge.explorer.deletePackage' : 'knowledge.explorer.delete') }}
   </button>
 </template>

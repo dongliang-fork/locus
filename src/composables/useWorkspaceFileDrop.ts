@@ -41,10 +41,13 @@ export function useWorkspaceFileDrop(options: {
     drop: async ({ decision }) => {
       busy.value = true;
       try {
-        const { workspaceRef, sourcePath, targetDirectory } = decision.intent.move;
-        await moveWorkspaceFile(workspaceRef, sourcePath, targetDirectory);
-      } catch (error) { notifications.addNotice("error", normalizeAppError(error).message); }
-      finally { busy.value = false; }
+        const { workspaceRef, sourcePaths, targetDirectory } = decision.intent.move;
+        // Move sequentially so one failed entry does not cancel the rest of a multi-selection.
+        for (const sourcePath of sourcePaths) {
+          try { await moveWorkspaceFile(workspaceRef, sourcePath, targetDirectory); }
+          catch (error) { notifications.addNotice("error", normalizeAppError(error).message); }
+        }
+      } finally { busy.value = false; }
     },
   });
 }

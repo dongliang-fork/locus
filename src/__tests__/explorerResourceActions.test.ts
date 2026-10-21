@@ -50,6 +50,9 @@ function mount(component: Component, props: Record<string, unknown> = {}) {
       expose({ run: async (...args: Parameters<InstanceType<typeof ExplorerResourceActions>["run"]>) => {
         await actions.value!.run(...args);
         await nextTick();
+      }, runMany: async (...args: Parameters<InstanceType<typeof ExplorerResourceActions>["runMany"]>) => {
+        await actions.value!.runMany(...args);
+        await nextTick();
       } });
       return () => h("div", [
         h(WorkspaceTree, { resourceRename: actions.value?.draft, rowTabIndex: 0,
@@ -115,7 +118,7 @@ describe("explorer resource menus", () => {
     expect(dragged).not.toHaveBeenCalled();
   });
 
-  it("offers directory path actions without passing directories to file-only mutations", () => {
+  it("offers directory path and delete actions without directory rename", () => {
     const action = vi.fn();
     const menu = mount(ResourceFileMenuItems, { target: { ...file, path: "F:/Project/docs", isDirectory: true }, onAction: action });
     button(menu.host, t("knowledge.explorer.openInFileSystem")).click();
@@ -123,7 +126,10 @@ describe("explorer resource menus", () => {
     button(menu.host, t("knowledge.explorer.copyRelativePath")).click();
     expect(action).toHaveBeenLastCalledWith("copy");
     expect([...menu.host.querySelectorAll("button")].some(item => item.textContent?.trim() === t("knowledge.explorer.rename"))).toBe(false);
-    expect(menu.host.querySelector("button.danger")).toBeNull();
+    button(menu.host, t("knowledge.explorer.delete")).click();
+    expect(action).toHaveBeenLastCalledWith("delete");
+    const mounted = mount(ResourceFileMenuItems, { target: { ...file, path: "G:/shared/docs", isDirectory: true, mounted: true }, onAction: action });
+    expect(mounted.host.querySelector("button.danger")).toBeNull();
   });
   it("changes only the rendered file label, preserving the file used by list actions", async () => {
     const selected = vi.fn();
@@ -330,6 +336,34 @@ describe("explorer resource menus", () => {
     expect(target.path).toBe(path);
     expect(mocks.load).toHaveBeenCalledWith(file.projectId, true);
     expect(mocks.knowledgeDelete).not.toHaveBeenCalled();
+    expect(mocks.notice).not.toHaveBeenCalled();
+  });
+
+  it("deletes workspace folders after a folder confirmation", async () => {
+    mocks.confirm.mockResolvedValue(true);
+    mocks.fileAction.mockResolvedValueOnce(null);
+    const actions = mount(ExplorerResourceActions);
+
+    await actions.instance.run("delete", { ...file, path: "F:/Project/docs", isDirectory: true });
+
+    expect(mocks.confirm.mock.calls[0]![0]).toBe(t("knowledge.explorer.deleteFolderConfirm", "docs"));
+    expect(mocks.fileAction).toHaveBeenCalledExactlyOnceWith(file.projectId, "docs", null, workspaceRef);
+  });
+
+  it("deletes a selected folder once together with entries selected inside it", async () => {
+    mocks.confirm.mockResolvedValue(true);
+    mocks.fileAction.mockResolvedValue(null);
+    const actions = mount(ExplorerResourceActions);
+
+    await actions.instance.runMany("delete", [
+      { ...file, path: "F:/Project/docs", isDirectory: true },
+      file,
+      { ...file, path: "F:/Project/docs/sub", isDirectory: true },
+      { ...file, path: "F:/Project/docs-old/readme.md" },
+    ]);
+
+    expect(mocks.confirm.mock.calls[0]![0]).toBe(t("knowledge.explorer.deleteManyConfirm", 2));
+    expect(mocks.fileAction.mock.calls.map(call => call[1])).toEqual(["docs", "docs-old/readme.md"]);
     expect(mocks.notice).not.toHaveBeenCalled();
   });
 

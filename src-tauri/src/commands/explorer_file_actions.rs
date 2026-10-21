@@ -130,6 +130,16 @@ pub async fn explorer_file_action(
 ) -> Result<Option<String>, AppError> {
     let (project_id, root) =
         resolve_project(registry.inner().as_ref(), project_id, "explorerFileAction")?;
+    if let (None, Some(reference)) = (new_name.as_deref(), workspace_ref.as_ref()) {
+        let scope = workspace_file_scope(reference, registry.inner().as_ref())?;
+        if let Some(directory) = workspace_directory(scope.runtime().root(), &path)? {
+            if scope.runtime().project_id() != &project_id {
+                return Err(action_error("Workspace does not belong to the project"));
+            }
+            delete_workspace_directory(&project_id, &root, reference, scope, directory, registry, app_handle).await?;
+            return Ok(None);
+        }
+    }
     let snapshot =
         crate::workspace_tree::snapshot(&root, project_id.as_str()).map_err(action_error)?;
     let (scope, source) = if let Some(workspace_ref) = workspace_ref.as_ref() {
@@ -280,6 +290,129 @@ pub async fn explorer_file_action(
     Ok(target.map(|path| path.to_string_lossy().into_owned()))
 }
 
+/// A real folder inside the checkout, or `None` when `path` names something else
+/// so the regular file flow reports its own errors.
+fn workspace_directory(root: &Path, path: &str) -> Result<Option<PathBuf>, AppError> {
+    let relative = super::super::workspace::normalize_workspace_sub_path(path)?;
+    if relative.is_empty() {
+        return Err(action_error("Cannot delete the workspace root"));
+    }
+    let candidate = root.join(&relative);
+    let Ok(metadata) = std::fs::symlink_metadata(&candidate) else { return Ok(None) };
+    if metadata.file_type().is_symlink() {
+        return if candidate.is_dir() { Err(action_error("Linked folders cannot be deleted")) } else { Ok(None) };
+    }
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    let root = dunce::canonicalize(root).map_err(action_error)?;
+    let directory = dunce::canonicalize(&candidate).map_err(action_error)?;
+    if directory == root || !directory.starts_with(&root) {
+        return Err(action_error("Folders outside the workspace cannot be deleted"));
+    }
+    let protected = relative.to_ascii_lowercase();
+    if [".git", ".locus", "locus", "locus/knowledge"].contains(&protected.as_str())
+        || protected.starts_with(".git/")
+        || protected.starts_with(".locus/")
+        || protected.starts_with("locus/workspace-trees")
+    {
+        return Err(action_error("This workspace configuration folder cannot be deleted"));
+    }
+    Ok(Some(directory))
+}
+
+/// Deletes a folder: knowledge folders go through the knowledge store; other
+/// folders are staged with their Unity `.meta` beside them, unlinked from the
+/// layout, then removed.
+async fn delete_workspace_directory(
+    project_id: &ProjectId,
+    layout_root: &Path,
+    reference: &WorkspaceRef,
+    scope: ResolvedWorkspaceScope,
+    source: PathBuf,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_handle: AppHandle,
+) -> Result<(), AppError> {
+    let action_root = scope.runtime().root().to_path_buf();
+    let app_knowledge_dir: State<'_, crate::commands::knowledge::AppKnowledgeDir> = app_handle.state();
+    let sources = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+        &action_root.to_string_lossy(),
+        app_knowledge_dir.0.as_ref().as_ref(),
+    );
+    // Source roots (knowledge types, skill packages, mounts) are deleted only
+    // through their own management flows, never as part of a parent folder.
+    if sources.sources().iter().any(|knowledge| {
+        crate::knowledge_source_registry::path_is_within(&knowledge.physical_root, &source)
+    }) {
+        return Err(action_error("This folder contains a knowledge source and cannot be deleted here"));
+    }
+    if let Some(knowledge) = sources.classify_path(&source) {
+        use crate::knowledge_source_registry::KnowledgeSourceKind;
+        if knowledge.kind != KnowledgeSourceKind::WorkspaceKnowledge
+            || !knowledge.mutability.is_writable()
+            || knowledge.logical_path.is_empty()
+        {
+            return Err(action_error("This knowledge source is managed or read-only"));
+        }
+        let registry_handle = Arc::clone(registry.inner());
+        crate::commands::knowledge_delete(
+            reference.clone(),
+            crate::knowledge_store::KnowledgeDeleteRequest {
+                kind: crate::knowledge_store::KnowledgeTargetKind::Directory,
+                doc_type: Some(knowledge.doc_type),
+                path: knowledge.logical_path,
+            },
+            app_handle.clone(),
+            registry,
+        )
+        .await?;
+        return reconcile_knowledge_file_action(
+            registry_handle.as_ref(),
+            &app_handle,
+            project_id,
+            &action_root.to_string_lossy(),
+            &source,
+            None,
+        );
+    }
+    let _document_guard = super::super::view_documents::DOCUMENT_WRITE_LOCK.lock().map_err(action_error)?;
+    let _guard = CSV_FILE_WRITE_LOCK.lock().map_err(action_error)?;
+    let staged = source.with_file_name(format!(".locus-delete-{}", uuid::Uuid::new_v4()));
+    // Renaming first fails while files inside are locked, before anything is lost.
+    let moved = super::workspace_file_move::relocate_entry(&source, &staged)?;
+    let updated = match crate::workspace_tree::relocate_file_references(layout_root, project_id.as_str(), &source, None) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            super::workspace_file_move::rollback_moves(&moved)?;
+            return Err(action_error(error));
+        }
+    };
+    for (index, (_, path)) in moved.iter().enumerate() {
+        let removed = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+        if let Err(error) = removed {
+            // Put back whatever is left of the folder so it stays visible for a retry.
+            if index == 0 {
+                if let Err(rollback) = super::workspace_file_move::rollback_moves(&moved) {
+                    tracing::warn!(error = %rollback.message, "folder delete rollback failed");
+                }
+            }
+            return Err(action_error(error));
+        }
+    }
+    crate::workspace_file_order::relocate(&action_root, &source, None).map_err(action_error)?;
+    app_handle
+        .emit(
+            "explorer-file-action",
+            serde_json::json!({
+                "projectId": project_id.as_str(), "root": action_root, "path": source,
+                "newPath": null, "isDirectory": true,
+            }),
+        )
+        .map_err(action_error)?;
+    drop(scope);
+    emit_changed(&app_handle, &updated, format!("file-action:{}", uuid::Uuid::new_v4()))
+}
+
 fn emit_file_action(
     app: &AppHandle,
     project_id: &str,
@@ -340,6 +473,21 @@ mod tests {
         assert!(relocate_files(&source, &target).is_err());
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "source");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "target");
+    }
+    #[test]
+    fn folder_delete_targets_only_ordinary_workspace_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        for folder in ["docs/sub", ".git/objects", "Locus/knowledge/design", "Locus/workspace-trees"] {
+            std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+        }
+        std::fs::write(dir.path().join("docs/a.md"), "a").unwrap();
+        let expected = dunce::canonicalize(dir.path().join("docs/sub")).unwrap();
+        assert_eq!(workspace_directory(dir.path(), "docs/sub").unwrap(), Some(expected));
+        assert_eq!(workspace_directory(dir.path(), "docs/a.md").unwrap(), None);
+        assert_eq!(workspace_directory(dir.path(), "docs/missing").unwrap(), None);
+        for protected in ["", ".", ".git", ".git/objects", "Locus", "locus/knowledge", "Locus/workspace-trees", "../x"] {
+            assert!(workspace_directory(dir.path(), protected).is_err(), "{protected}");
+        }
     }
     #[test]
     fn csv_rename_and_rollback_preserve_companions() {

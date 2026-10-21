@@ -39,7 +39,7 @@ fn move_paths(root: &Path, source: &str, directory: &str) -> Result<(PathBuf, Pa
     Ok((source, target))
 }
 
-fn relocate_entry(source: &Path, target: &Path) -> Result<Vec<(PathBuf, PathBuf)>, AppError> {
+pub(super) fn relocate_entry(source: &Path, target: &Path) -> Result<Vec<(PathBuf, PathBuf)>, AppError> {
     let paths = if source.is_file() { companion_files(source)? } else {
         if !source.is_dir() { return Err(move_error("Only files and folders can be moved")); }
         let mut paths = vec![source.to_path_buf()];
@@ -85,7 +85,7 @@ fn rename_without_replace(from: &Path, to: &Path) -> Result<(), AppError> {
     { std::fs::rename(from, to).map_err(move_error) }
 }
 
-fn rollback_moves(moves: &[(PathBuf, PathBuf)]) -> Result<(), AppError> {
+pub(super) fn rollback_moves(moves: &[(PathBuf, PathBuf)]) -> Result<(), AppError> {
     for (from, to) in moves.iter().rev() { rename_without_replace(to, from)?; }
     Ok(())
 }

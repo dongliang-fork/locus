@@ -53,6 +53,10 @@ export function workspaceCreateDocument(workspaceRef: WorkspaceRef, directory: s
   return ipcInvoke("workspace_create_document", { workspaceRef, directory, name });
 }
 
+export function workspaceCreateFolder(workspaceRef: WorkspaceRef, directory: string, name: string): Promise<string> {
+  return ipcInvoke("workspace_create_folder", { workspaceRef, directory, name });
+}
+
 export interface WorkspaceFileChangedPayload {
   seq: number;
   generation: number;
