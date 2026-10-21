@@ -3,12 +3,19 @@ import { createApp, h, nextTick, reactive, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import BackgroundTasksIndicator from "../components/chat/BackgroundTasksIndicator.vue";
 import { resetBackgroundTaskActivityForTests } from "../components/chat/backgroundTaskActivity";
+import { resetAppTaskActivityForTests } from "../components/chat/appTaskActivity";
+import type { AppTaskInfo } from "../services/appTasks";
 import type { BackgroundTaskInfo } from "../services/asyncTasks";
 import type { AsyncTaskUpdatedEvent } from "../types";
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(), cancel: vi.fn(), enabled: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn(),
   subscribeUpdates: vi.fn(), unsubscribeUpdates: vi.fn(),
+  listApp: vi.fn(), subscribeApp: vi.fn(), unsubscribeApp: vi.fn(),
+}));
+vi.mock("../services/appTasks", () => ({
+  listAppTasks: mocks.listApp,
+  subscribeAppTaskUpdates: mocks.subscribeApp,
 }));
 vi.mock("../services/asyncTasks", () => ({
   listBackgroundTasks: mocks.list,
@@ -25,6 +32,7 @@ let app: App | undefined;
 let host: HTMLElement;
 let updateEnabled: (value: boolean) => void;
 let publishUpdate: ((update: AsyncTaskUpdatedEvent) => void) | undefined;
+let publishAppTask: ((task: AppTaskInfo) => void) | undefined;
 
 function task(overrides: Partial<BackgroundTaskInfo> = {}): BackgroundTaskInfo {
   return {
@@ -32,6 +40,19 @@ function task(overrides: Partial<BackgroundTaskInfo> = {}): BackgroundTaskInfo {
     description: "Build project", status: "running", progress: "Compiling scripts",
     createdAt: Date.now() - 65_000, startedAt: Date.now() - 65_000, ...overrides,
   };
+}
+
+function appTask(overrides: Partial<AppTaskInfo> = {}): AppTaskInfo {
+  return {
+    taskId: "app-1", kind: "worktree", title: "feat/x", detail: "F:/repo", status: "running",
+    progress: { phase: "creating", completed: 45, total: 100 }, error: null,
+    startedAt: Date.now() - 12_000, ...overrides,
+  };
+}
+
+async function emitApp(overrides: Partial<AppTaskInfo> = {}) {
+  publishAppTask!(appTask(overrides));
+  await flush();
 }
 
 async function emit(overrides: Partial<AsyncTaskUpdatedEvent> = {}) {
@@ -85,6 +106,11 @@ beforeEach(() => {
     publishUpdate = listener;
     return mocks.unsubscribeUpdates;
   });
+  mocks.listApp.mockResolvedValue([]);
+  mocks.subscribeApp.mockImplementation(async (handler) => {
+    publishAppTask = handler;
+    return mocks.unsubscribeApp;
+  });
 });
 
 afterEach(() => {
@@ -92,7 +118,9 @@ afterEach(() => {
   app = undefined;
   host?.remove();
   resetBackgroundTaskActivityForTests();
+  resetAppTaskActivityForTests();
   publishUpdate = undefined;
+  publishAppTask = undefined;
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -438,5 +466,81 @@ describe("background task trigger", () => {
     // Resuming the task under the same id makes the failure stale.
     await emit({ taskId: "lint", status: "queued" });
     expect(failureDot()).toBeNull();
+  });
+
+  it("is green when idle and blue while session or process tasks run", async () => {
+    mocks.list.mockResolvedValue([]);
+    await mount();
+    expect(trigger().className).toContain("tone-idle");
+    await emitApp();
+    expect(trigger().className).toContain("tone-running");
+    expect(countBadge()).toBe("1");
+    await emitApp({ status: "completed" });
+    expect(trigger().className).toContain("tone-idle");
+    expect(countBadge()).toBeNull();
+  });
+
+  it("shows process tasks without a session or the session setting and hides once they finish", async () => {
+    mocks.enabled.mockResolvedValue(false);
+    mocks.listApp.mockResolvedValue([appTask()]);
+    await mount(null);
+    expect(trigger().className).toContain("tone-running");
+    expect(countBadge()).toBe("1");
+    await open();
+    const text = () => panel()!.textContent!;
+    expect(text()).toContain("chat.backgroundTasks.appGroup");
+    expect(text()).toContain("chat.backgroundTasks.app.worktree feat/x");
+    expect(text()).toContain("worktrees.progress.creating");
+    expect(text()).toContain("45% · 45/100");
+    expect(text()).toContain("0:12");
+    expect(text()).not.toContain("chat.backgroundTasks.empty");
+    expect(panel()!.querySelector(".background-task-stop")).toBeNull();
+    expect(panel()!.querySelector<HTMLProgressElement>("progress")!.value).toBe(45);
+    expect(mocks.list).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(text()).toContain("0:14");
+    await emitApp({ progress: { phase: "finalizing", completed: 0, total: null } });
+    expect(text()).toContain("worktrees.progress.finalizing");
+    expect(text()).not.toContain("45%");
+    await emitApp({ status: "completed" });
+    expect(panel()).toBeNull();
+    expect(trigger()).toBeNull();
+  });
+
+  it("lists process tasks next to the session's and reports their failures once", async () => {
+    await mount();
+    await emitApp();
+    await open();
+    expect(panel()!.querySelectorAll(".background-task-row")).toHaveLength(1);
+    expect(panel()!.querySelectorAll(".background-task-app")).toHaveLength(1);
+    expect(panel()!.textContent).toContain("chat.backgroundTasks.activeGroup");
+    await emitApp({ status: "failed", error: "git worktree failed: disk full" });
+    expect(panel()!.querySelectorAll(".background-task-app")).toHaveLength(0);
+    const failure = panel()!.querySelector(".background-task-failure")!;
+    expect(failure.textContent).toContain("chat.backgroundTasks.app.worktree feat/x");
+    expect(failure.textContent).toContain("git worktree failed: disk full");
+    expect(failure.querySelector(".background-task-id")).toBeNull();
+    trigger().click();
+    await flush();
+    expect(failureDot()).toBeNull();
+    await emitApp({ taskId: "app-2", status: "failed", error: "WORKTREE_NEW_PROJECT_REQUIRED" });
+    expect(failureDot()).not.toBeNull();
+    await open();
+    expect(panel()!.textContent).toContain("worktrees.budget.retry");
+  });
+
+  it("does not let an older process snapshot revive a task that finished meanwhile", async () => {
+    const snapshot = deferred<AppTaskInfo[]>();
+    mocks.listApp.mockReturnValue(snapshot.promise);
+    mocks.list.mockResolvedValue([]);
+    await mount();
+    await emitApp({ status: "completed" });
+    await emitApp({ taskId: "app-2", title: "feat/y" });
+    snapshot.resolve([appTask({ progress: { phase: "creating", completed: 90, total: 100 } })]);
+    await flush();
+    expect(countBadge()).toBe("1");
+    await open();
+    expect(panel()!.textContent).toContain("feat/y");
+    expect(panel()!.textContent).not.toContain("feat/x");
   });
 });

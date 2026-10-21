@@ -1,8 +1,15 @@
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 
+use crate::app_tasks::{AppTaskInfo, AppTaskRegistry};
 use crate::async_tasks::{emit_task_updated, AsyncTaskManager, BackgroundTaskInfo};
 use crate::error::AppError;
+
+/// Process-level tasks, shown next to the session's tasks in every window.
+#[tauri::command]
+pub(crate) fn list_app_tasks(tasks: State<'_, Arc<AppTaskRegistry>>) -> Vec<AppTaskInfo> {
+    tasks.list()
+}
 
 #[tauri::command]
 pub(crate) fn list_background_tasks(

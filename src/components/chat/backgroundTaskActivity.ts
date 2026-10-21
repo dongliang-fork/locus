@@ -10,6 +10,8 @@ export interface BackgroundTaskFailure {
   description: string | null;
   detail: string;
   failedAt: number;
+  /** Process-level task, which has no session-local id to show. */
+  source?: "app";
 }
 
 type UpdateListener = (update: AsyncTaskUpdatedEvent) => void;

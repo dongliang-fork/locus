@@ -7,11 +7,13 @@ import {
   listBackgroundTasks,
   type BackgroundTaskInfo,
 } from "../../services/asyncTasks";
+import type { AppTaskInfo } from "../../services/appTasks";
 import { normalizeAppError } from "../../services/errors";
 import { useAsyncTasksEnabled } from "../../composables/useAsyncTasksEnabled";
 import type { AsyncTaskStatus, AsyncTaskUpdatedEvent } from "../../types";
 import LucideIcon from "../icons/LucideIcon.vue";
 import BaseButton from "../ui/BaseButton.vue";
+import { takeAppTaskFailures, useAppTasks } from "./appTaskActivity";
 import {
   isTerminalTaskStatus,
   rememberTaskDescriptions,
@@ -27,6 +29,10 @@ const PANEL_WIDTH = 360;
 
 const props = defineProps<{ sessionId: string | null }>();
 const enabled = useAsyncTasksEnabled();
+// Process-level tasks belong to no session and are shown in every surface,
+// independent of the session async-task setting.
+const { tasks: appTasks, failureCount: appFailureCount } = useAppTasks();
+const visible = computed(() => enabled.value || appTasks.value.length > 0 || appFailureCount.value > 0);
 const open = ref(false);
 const root = ref<HTMLElement | null>(null);
 const panel = ref<HTMLElement | null>(null);
@@ -42,19 +48,23 @@ const cancelling = ref(new Set<string>());
 const expanded = ref(new Set<string>());
 const now = ref(Date.now());
 const error = computed(() => actionError.value || loadError.value);
+// With process tasks listed, an empty session list adds nothing.
+const showSessionGroup = computed(() => enabled.value && (loading.value || tasks.value.length > 0 || !appTasks.value.length));
 let generation = 0;
 let mutation = 0;
 let timer: ReturnType<typeof setTimeout> | undefined;
+let clock: ReturnType<typeof setInterval> | undefined;
 
 // Trigger state is kept while the panel is closed: seeded by one list call,
 // then driven by task update events, with a slow reconcile only while tasks
 // are active. Keys are session-local ids, which is what update events carry.
 const activeStatuses = ref(new Map<string, AsyncTaskStatus>());
 const shownFailures = ref<BackgroundTaskFailure[]>([]);
-const activeCount = computed(() => activeStatuses.value.size);
-const failureCount = computed(() => unseenFailureCount(props.sessionId));
+const activeCount = computed(() => activeStatuses.value.size + appTasks.value.length);
+const failureCount = computed(() => unseenFailureCount(props.sessionId) + appFailureCount.value);
 const tone = computed<"idle" | "running" | "cancelling">(() => {
   if (!activeCount.value) return "idle";
+  if (appTasks.value.length) return "running";
   return [...activeStatuses.value.values()].every((status) => status === "cancelling") ? "cancelling" : "running";
 });
 const countLabel = computed(() => (activeCount.value > 9 ? "9+" : String(activeCount.value)));
@@ -150,8 +160,38 @@ function resetActivity() {
   shownFailures.value = [];
 }
 
-function showFailures(sessionId: string) {
-  const failures = takeUnseenFailures(sessionId);
+function appTaskTitle(task: AppTaskInfo) {
+  return task.kind === "worktree" ? t("chat.backgroundTasks.app.worktree", task.title) : task.title;
+}
+
+function appTaskPhase(task: AppTaskInfo) {
+  return task.kind === "worktree" && task.progress
+    ? t(`worktrees.progress.${task.progress.phase}`)
+    : t("chat.backgroundTasks.status.running");
+}
+
+function appTaskPercent(task: AppTaskInfo): number | null {
+  const progress = task.progress;
+  return progress?.total ? Math.min(100, Math.floor((progress.completed / progress.total) * 100)) : null;
+}
+
+function appFailure(task: AppTaskInfo): BackgroundTaskFailure {
+  const error = task.error ?? "";
+  return {
+    taskId: task.taskId,
+    toolName: t("chat.backgroundTasks.appGroup"),
+    description: appTaskTitle(task),
+    detail: error.includes("WORKTREE_NEW_PROJECT_REQUIRED") ? t("worktrees.budget.retry") : error,
+    failedAt: Date.now(),
+    source: "app",
+  };
+}
+
+function showFailures(sessionId: string | null) {
+  const failures = [
+    ...(sessionId ? takeUnseenFailures(sessionId) : []),
+    ...takeAppTaskFailures().map(appFailure),
+  ];
   if (!failures.length) return;
   const ids = new Set(failures.map((failure) => failure.taskId));
   shownFailures.value = [...shownFailures.value.filter((failure) => !ids.has(failure.taskId)), ...failures];
@@ -193,7 +233,11 @@ function rowTone(task: BackgroundTaskInfo) {
 }
 
 function elapsed(task: BackgroundTaskInfo) {
-  const seconds = Math.max(0, Math.floor((now.value - (task.startedAt ?? task.createdAt)) / 1000));
+  return elapsedSince(task.startedAt ?? task.createdAt);
+}
+
+function elapsedSince(startedAt: number) {
+  const seconds = Math.max(0, Math.floor((now.value - startedAt) / 1000));
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   return hours
@@ -304,6 +348,7 @@ watch([() => props.sessionId, enabled], ([sessionId, isEnabled], previous) => {
 watch(open, (value) => {
   generation += 1;
   clearTimeout(timer);
+  clearInterval(clock);
   tasks.value = [];
   cancelling.value.clear();
   expanded.value.clear();
@@ -316,12 +361,18 @@ watch(open, (value) => {
     return;
   }
   clearReconcile();
-  if (props.sessionId) {
-    showFailures(props.sessionId);
+  showFailures(props.sessionId);
+  // Session rows refresh with each poll; process rows tick on their own.
+  now.value = Date.now();
+  clock = setInterval(() => { now.value = Date.now(); }, 1000);
+  if (props.sessionId && enabled.value) {
     loading.value = true;
     void refresh(generation, props.sessionId);
   }
 }, { flush: "sync" });
+watch(appFailureCount, (count) => { if (count && open.value) showFailures(props.sessionId); });
+// The last process task can hide the trigger while the panel is open.
+watch(visible, (value) => { if (!value) close(); });
 
 watch(open, (value) => {
   if (!value) return;
@@ -342,6 +393,7 @@ onUnmounted(() => {
   generation += 1;
   activityGeneration += 1;
   clearTimeout(timer);
+  clearInterval(clock);
   clearReconcile();
   recorders.clear();
   window.removeEventListener("focus", handleWindowFocus);
@@ -354,7 +406,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div v-if="enabled" ref="root" class="background-tasks-indicator">
+  <div v-if="visible" ref="root" class="background-tasks-indicator">
     <BaseButton
       class="background-tasks-icon"
       :class="[`tone-${tone}`, { active: open }]"
@@ -384,7 +436,7 @@ onUnmounted(() => {
         <header class="background-tasks-header">
           <LucideIcon class="background-tasks-header-icon" :icon="ListTodo" :size="14" />
           <span class="background-tasks-title">{{ t('chat.backgroundTasks.title') }}</span>
-          <span v-if="tasks.length" class="background-tasks-header-count">{{ tasks.length }}</span>
+          <span v-if="tasks.length + appTasks.length" class="background-tasks-header-count">{{ tasks.length + appTasks.length }}</span>
           <BaseButton class="background-tasks-close" :aria-label="t('common.close')" @click="close(true)">
             <LucideIcon :icon="X" :size="14" />
           </BaseButton>
@@ -409,7 +461,7 @@ onUnmounted(() => {
                   <span class="background-task-meta">
                     <span class="background-task-status">{{ t('chat.backgroundTasks.status.failed') }}</span>
                     <span v-if="failure.description" class="background-task-tool">{{ failure.toolName }}</span>
-                    <span class="background-task-id" :title="`${failure.toolName} · ${failure.taskId}`">{{ failure.taskId }}</span>
+                    <span v-if="failure.source !== 'app'" class="background-task-id" :title="`${failure.toolName} · ${failure.taskId}`">{{ failure.taskId }}</span>
                   </span>
                 </div>
                 <p v-if="failure.detail" class="background-task-detail is-clamped" :title="failure.detail">
@@ -418,8 +470,8 @@ onUnmounted(() => {
               </li>
             </ul>
           </section>
-          <section class="background-tasks-group">
-            <h3 v-if="shownFailures.length" class="background-tasks-group-label">
+          <section v-if="showSessionGroup" class="background-tasks-group">
+            <h3 v-if="tasks.length && (shownFailures.length || appTasks.length)" class="background-tasks-group-label">
               {{ t('chat.backgroundTasks.activeGroup') }}
             </h3>
             <p v-if="loading" class="background-tasks-empty is-loading">{{ t('common.loading') }}</p>
@@ -476,6 +528,39 @@ onUnmounted(() => {
               </li>
             </ul>
           </section>
+          <section v-if="appTasks.length" class="background-tasks-group">
+            <h3 class="background-tasks-group-label">{{ t('chat.backgroundTasks.appGroup') }}</h3>
+            <ul class="background-tasks-list">
+              <li
+                v-for="task in appTasks"
+                :key="task.taskId"
+                class="background-task-item background-task-app is-running"
+              >
+                <span class="background-task-dot" aria-hidden="true" />
+                <div class="background-task-summary">
+                  <span class="background-task-name" :title="task.detail ? `${appTaskTitle(task)} · ${task.detail}` : appTaskTitle(task)">
+                    {{ appTaskTitle(task) }}
+                  </span>
+                  <span class="background-task-meta">
+                    <span class="background-task-status">{{ appTaskPhase(task) }}</span>
+                    <span class="background-task-time" :title="t('chat.backgroundTasks.elapsed')">
+                      <LucideIcon class="background-task-time-icon" :icon="Timer" :size="11" />
+                      {{ elapsedSince(task.startedAt) }}
+                    </span>
+                    <span v-if="appTaskPercent(task) !== null" class="background-task-percent">
+                      {{ appTaskPercent(task) }}% · {{ task.progress!.completed.toLocaleString() }}/{{ task.progress!.total!.toLocaleString() }}
+                    </span>
+                  </span>
+                </div>
+                <progress
+                  class="background-task-progress"
+                  :value="appTaskPercent(task) ?? undefined"
+                  max="100"
+                  :aria-label="appTaskPhase(task)"
+                />
+              </li>
+            </ul>
+          </section>
         </div>
       </section>
     </Teleport>
@@ -510,10 +595,11 @@ onUnmounted(() => {
   border-color: color-mix(in srgb, currentColor 22%, transparent);
 }
 
-.background-tasks-icon.base-button.tone-idle:hover:not(:disabled),
-.background-tasks-icon.base-button.tone-idle.active,
-.background-tasks-icon.base-button.tone-idle:focus-visible {
-  color: var(--text-color);
+/* Ready reads as healthy like the neighbouring status icons; only work in
+   progress switches to the accent colour. */
+.background-tasks-icon.base-button.tone-idle,
+.background-tasks-icon.base-button.tone-idle:hover:not(:disabled) {
+  color: var(--status-good-fg);
 }
 
 .background-tasks-icon.base-button.tone-running,
@@ -713,10 +799,24 @@ onUnmounted(() => {
   transition: background 0.12s ease;
 }
 
-.background-task-failure {
+.background-task-failure,
+.background-task-app {
   grid-template-areas:
     "dot summary summary"
     ". detail detail";
+}
+
+.background-task-percent {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.background-task-progress {
+  grid-area: detail;
+  width: 100%;
+  height: 3px;
+  margin-top: 6px;
+  accent-color: var(--accent-color);
 }
 
 .background-task-item:hover {
