@@ -222,6 +222,8 @@ pub struct WorkspaceRuntimeDescriptor {
     pub lease_count: usize,
     pub detected_services: Vec<String>,
     pub knowledge_enabled: bool,
+    /// Locus-managed worktree of the project's source checkout.
+    pub managed_worktree: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,17 +236,26 @@ pub struct WorkspaceCheckoutDescriptor {
     pub last_opened_at: i64,
     pub available: bool,
     pub knowledge_enabled: bool,
+    /// Locus-managed worktree of the project's source checkout.
+    pub managed_worktree: bool,
     pub runtime: Option<WorkspaceRuntimeDescriptor>,
 }
 
 // Inspect before registering: registration opens checkout-owned data and runs
 // persistence hooks, which must never run against a replacement project.
-fn checkout_root_available(checkout: &crate::session::models::WorkspaceCheckoutRecord) -> bool {
+fn resolve_checkout_identity(
+    checkout: &crate::session::models::WorkspaceCheckoutRecord,
+) -> Option<crate::workspace_service::identity::ResolvedWorkspaceIdentity> {
     crate::workspace_service::identity::ProjectIdResolver::resolve(&checkout.root_path)
-        .is_ok_and(|identity| {
+        .ok()
+        .filter(|identity| {
             identity.checkout_id.as_str() == checkout.checkout_id
                 && identity.project_id.as_str() == checkout.project_id
         })
+}
+
+fn checkout_root_available(checkout: &crate::session::models::WorkspaceCheckoutRecord) -> bool {
+    resolve_checkout_identity(checkout).is_some()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -344,6 +355,7 @@ fn runtime_descriptor(runtime: &WorkspaceRuntime) -> WorkspaceRuntimeDescriptor 
         lease_count: runtime.lease_count(),
         detected_services,
         knowledge_enabled: crate::workspace::knowledge_enabled(&runtime.root().to_string_lossy()),
+        managed_worktree: runtime.is_managed_worktree(),
     }
 }
 
@@ -378,7 +390,6 @@ pub async fn set_workspace_service_resource_limits(
     let snapshot = resource_policy
         .update(limits)
         .map_err(policy_update_error)?;
-    registry.notify_policy_changed();
     registry.converge_resource_policy().await;
     Ok(snapshot)
 }
@@ -437,7 +448,9 @@ pub fn list_project_contexts(
     let mut projects =
         std::collections::BTreeMap::<String, Vec<WorkspaceCheckoutDescriptor>>::new();
     for checkout in persisted {
-        let available = checkout_root_available(&checkout);
+        let identity = resolve_checkout_identity(&checkout);
+        let available = identity.is_some();
+        let managed_worktree = identity.is_some_and(|identity| identity.managed_worktree);
         let runtime = CheckoutId::new(checkout.checkout_id.clone())
             .ok()
             .filter(|_| available)
@@ -454,6 +467,7 @@ pub fn list_project_contexts(
                 normalized_root: checkout.normalized_root,
                 last_opened_at: checkout.last_opened_at,
                 available,
+                managed_worktree,
                 runtime,
             });
     }
@@ -917,6 +931,7 @@ mod tests {
             normalized_root: unity_root.display().to_string(),
             last_opened_at: 1,
             available: true,
+            managed_worktree: false,
             runtime: None,
         }];
 

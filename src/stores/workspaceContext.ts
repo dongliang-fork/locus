@@ -217,6 +217,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
       normalizedRoot: existing?.normalizedRoot ?? runtime.root,
       lastOpenedAt: existing?.lastOpenedAt ?? Date.now(),
       available: true,
+      managedWorktree: runtime.managedWorktree ?? existing?.managedWorktree,
       runtime,
     };
     upsertProjectCheckout(checkout);

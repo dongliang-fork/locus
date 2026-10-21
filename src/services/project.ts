@@ -38,6 +38,8 @@ export interface WorkspaceRuntimeDescriptor {
   materializationEpoch?: number;
   leaseCount: number;
   detectedServices: string[];
+  /** Locus-managed worktree; entered through its project's source checkout. */
+  managedWorktree?: boolean;
 }
 
 export interface ServiceBindingSnapshot {
@@ -90,7 +92,31 @@ export interface WorkspaceCheckoutDescriptor {
   normalizedRoot: string;
   lastOpenedAt: number;
   available?: boolean;
+  /** Locus-managed worktree; entered through its project's source checkout. */
+  managedWorktree?: boolean;
   runtime?: WorkspaceRuntimeDescriptor | null;
+}
+
+export function isManagedWorktreeCheckout(checkout: WorkspaceCheckoutDescriptor): boolean {
+  return checkout.managedWorktree ?? checkout.runtime?.managedWorktree ?? false;
+}
+
+/**
+ * The checkout a project is presented and entered through. Managed worktrees
+ * are reached from their source checkout, so they never stand in for the
+ * project in workspace pickers or labels unless no source checkout is known.
+ */
+export function projectEntryCheckout(
+  project: ProjectContextDescriptor | null | undefined,
+  checkout: WorkspaceCheckoutDescriptor | null | undefined,
+): WorkspaceCheckoutDescriptor | null {
+  if (checkout && !isManagedWorktreeCheckout(checkout)) return checkout;
+  const sources = project?.checkouts.filter((candidate) => !isManagedWorktreeCheckout(candidate)) ?? [];
+  return sources.find((candidate) => candidate.available !== false)
+    ?? sources[0]
+    ?? checkout
+    ?? project?.checkouts[0]
+    ?? null;
 }
 
 export interface ProjectContextDescriptor {

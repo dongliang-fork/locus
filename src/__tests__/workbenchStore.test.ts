@@ -533,6 +533,28 @@ describe("workbench store", () => {
     ))).toEqual(["checkout-a"]);
   });
 
+  it("keeps a session that runs in a worktree inside its workspace layout across restarts", () => {
+    const store = useWorkbenchStore();
+    store.switchWorkspaceScope("main", "checkout-a");
+    const input = sessionEditor("session-worktree", { preview: false });
+    input.sessionCheckout = { checkoutId: "worktree-b", expectedGeneration: 9, expectedMaterializationEpoch: 3 };
+    const editor = store.openEditor("main", input);
+    expect(store.workspaceScope("main")).toBe("checkout-a");
+    store.updateEditor("main", "main", editor.editorId, { sessionCheckout: null });
+    store.updateEditor("main", "main", editor.editorId, {
+      sessionCheckout: { checkoutId: "worktree-c", expectedGeneration: 4, expectedMaterializationEpoch: 1 },
+    });
+    const persisted = JSON.parse(localStorage.getItem("locus:workbench-window:main:workspace:checkout-a")!);
+    expect(persisted.groups.main.tabs[0].sessionCheckout).toEqual({ checkoutId: "worktree-c", expectedMaterializationEpoch: 1 });
+
+    setActivePinia(createPinia());
+    const restored = useWorkbenchStore();
+    const state = restored.switchWorkspaceScope("main", "checkout-a");
+    const tab = state.groups.main!.tabs[0]!;
+    expect(tab.checkoutBinding?.checkoutId).toBe("checkout-a");
+    expect(tab.sessionCheckout).toEqual({ checkoutId: "worktree-c", expectedMaterializationEpoch: 1 });
+  });
+
   it("isolates layouts between full workspace windows, including when both open the same checkout", () => {
     const source = useWorkbenchStore();
     source.switchWorkspaceScope("main", "checkout-a");

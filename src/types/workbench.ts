@@ -203,6 +203,12 @@ export interface WorkbenchEditorInput {
   dirty: boolean;
   capabilities: EditorCapabilities;
   checkoutBinding?: EditorCheckoutBinding | null;
+  /**
+   * Session tabs only: the checkout the conversation runs in when it differs
+   * from `checkoutBinding`. A worktree is a per-session choice, so the tab
+   * stays in its workspace layout and never changes the workbench scope.
+   */
+  sessionCheckout?: EditorCheckoutBinding | null;
   /** Resolved locator for local-file and mounted-file adapters. */
   sourcePath?: string | null;
   availability: WorkbenchEditorAvailability;

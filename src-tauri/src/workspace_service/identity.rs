@@ -101,6 +101,10 @@ pub struct ResolvedWorkspaceIdentity {
     pub normalized_root: String,
     pub project_id_source: ProjectIdSource,
     pub git_common_dir: Option<PathBuf>,
+    /// Locus created this checkout (a worktree or project-pool slot). An
+    /// imported checkout keeps its journal project identity but is not one;
+    /// selecting the source branch in the picker imports the source itself.
+    pub managed_worktree: bool,
 }
 
 #[derive(Debug)]
@@ -165,8 +169,10 @@ impl ProjectIdResolver {
         let checkout_id = CheckoutId::from_normalized_root(&root);
         let git_common_dir = resolve_git_common_dir(root.path());
 
+        let mut managed_worktree = false;
         let (project_id, project_id_source) =
             if let Some(record) = super::worktrees::record_for_root(root.path()).ok().flatten() {
+                managed_worktree = record.managed || record.pool_slot;
                 (ProjectId::new(record.project_id)?, ProjectIdSource::ManagedWorktree)
             } else if let Some(workspace_id) = read_existing_workspace_id(root.path()) {
                 (
@@ -198,6 +204,7 @@ impl ProjectIdResolver {
             normalized_root: root.key().to_string(),
             project_id_source,
             git_common_dir,
+            managed_worktree,
         })
     }
 }

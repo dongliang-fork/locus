@@ -38,7 +38,10 @@ export function rememberWorkspaceGitHead(
 export function workspaceGitHead(workspaceRef: WorkspaceRef): GitHeadState | undefined {
   const observed = heads.get(workspaceRef.checkoutId);
   if (!observed) return undefined;
+  // Project snapshots also report checkouts that are not open; such a HEAD is
+  // read from the directory and holds for whichever runtime opens it.
   if (workspaceRef.expectedGeneration != null
+    && observed.workspaceRef.expectedGeneration != null
     && workspaceRef.expectedGeneration !== observed.workspaceRef.expectedGeneration) return undefined;
   if (workspaceRef.expectedMaterializationEpoch != null
     && observed.workspaceRef.expectedMaterializationEpoch != null

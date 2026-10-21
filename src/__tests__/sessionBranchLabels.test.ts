@@ -121,4 +121,10 @@ describe("workspace HEAD reuse", () => {
     expect(workspaceGitHead({ ...workspace, expectedGeneration: 3 })).toBeUndefined();
     expect(workspaceGitHead({ ...workspace, expectedMaterializationEpoch: 2 })).toBeUndefined();
   });
+
+  it("applies a HEAD read from an unopened checkout to whichever runtime opens it", () => {
+    rememberWorkspaceGitHead({ checkoutId: workspace.checkoutId }, feature, beginWorkspaceGitHeadObservation());
+    expect(workspaceGitHead(workspace)).toEqual(feature);
+    expect(workspaceGitHead({ ...workspace, expectedGeneration: 5 })).toEqual(feature);
+  });
 });

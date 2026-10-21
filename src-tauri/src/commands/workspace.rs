@@ -129,11 +129,22 @@ fn write_recent_dirs(data_dir: &std::path::Path, dirs: &[String]) -> Result<(), 
 
 fn existing_recent_dirs(dirs: Vec<String>) -> Vec<String> {
     dirs.into_iter()
-        .filter(|d| std::path::Path::new(d).is_dir())
+        .filter(|d| std::path::Path::new(d).is_dir() && !is_managed_worktree_root(d))
         .collect()
 }
 
+/// Managed worktrees are entered through their source workspace, so they are
+/// never listed as standalone recent workspaces.
+fn is_managed_worktree_root(dir: &str) -> bool {
+    // Imported records (including the source checkout itself) stay listed.
+    crate::workspace_service::worktrees::record_for_root(std::path::Path::new(dir))
+        .is_ok_and(|record| record.is_some_and(|record| record.managed || record.pool_slot))
+}
+
 fn save_recent_dir(data_dir: &std::path::Path, dir: &str) {
+    if is_managed_worktree_root(dir) {
+        return;
+    }
     let mut dirs = read_recent_dirs(data_dir);
 
     dirs.retain(|d| d != dir);
@@ -595,6 +606,10 @@ pub enum CustomReasoningParamFormat {
 pub struct CustomEndpointServerTools {
     #[serde(default)]
     pub web_search: bool,
+    /// `openrouter:web_search` engine for OpenRouter endpoints; None or
+    /// `auto` keeps OpenRouter's default. Ignored by other endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_engine: Option<String>,
 }
 
 fn default_supports_tool_lazy_loading() -> bool {
@@ -3990,5 +4005,100 @@ mod tests {
             "openrouter/claude-fable-5",
             &valid
         ));
+    }
+
+    #[test]
+    fn managed_worktrees_are_not_recent_workspaces() {
+        use crate::workspace_service::identity::{
+            normalize_existing_workspace_root, resolve_git_common_dir, CheckoutId,
+        };
+        use crate::workspace_service::worktrees::{ManagedWorktree, WorktreeState};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        let source = temp.path().join("source");
+        let worktree = temp.path().join("source.worktrees").join("slot");
+        let linked_git_dir = source.join(".git").join("worktrees").join("slot");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        std::fs::create_dir_all(&linked_git_dir).expect("linked git dir");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        std::fs::write(linked_git_dir.join("commondir"), "../..\n").expect("commondir");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", linked_git_dir.display()),
+        )
+        .expect("worktree .git file");
+
+        let common_dir = resolve_git_common_dir(&worktree).expect("common dir");
+        let checkout_id = CheckoutId::from_normalized_root(
+            &normalize_existing_workspace_root(&worktree).expect("worktree root"),
+        )
+        .to_string();
+        let mut state = WorktreeState::default();
+        state.records.insert(
+            checkout_id.clone(),
+            ManagedWorktree {
+                checkout_id,
+                project_id: "project".into(),
+                root: worktree.display().to_string(),
+                repo_root: worktree.display().to_string(),
+                project_relative_path: String::new(),
+                branch: Some("feature".into()),
+                head_oid: "abc".into(),
+                materialization_epoch: 1,
+                managed: true,
+                lifecycle: "active".into(),
+                dirty: false,
+                pool_slot: false,
+                assignment_id: None,
+                editor_version: None,
+                last_error: None,
+            },
+        );
+        // Selecting the source branch in the picker imports the source checkout.
+        let source_checkout_id = CheckoutId::from_normalized_root(
+            &normalize_existing_workspace_root(&source).expect("source root"),
+        )
+        .to_string();
+        state.records.insert(
+            source_checkout_id.clone(),
+            ManagedWorktree {
+                checkout_id: source_checkout_id,
+                project_id: "project".into(),
+                root: source.display().to_string(),
+                repo_root: source.display().to_string(),
+                project_relative_path: String::new(),
+                branch: Some("master".into()),
+                head_oid: "abc".into(),
+                materialization_epoch: 1,
+                managed: false,
+                lifecycle: "active".into(),
+                dirty: false,
+                pool_slot: false,
+                assignment_id: None,
+                editor_version: None,
+                last_error: None,
+            },
+        );
+        std::fs::create_dir_all(common_dir.join("locus-worktrees")).expect("journal dir");
+        std::fs::write(
+            common_dir.join("locus-worktrees/state.json"),
+            serde_json::to_vec(&state).expect("journal"),
+        )
+        .expect("write journal");
+
+        let source_path = source.display().to_string();
+        let worktree_path = worktree.display().to_string();
+        super::save_recent_dir(&data_dir, &source_path);
+        super::save_recent_dir(&data_dir, &worktree_path);
+        assert_eq!(super::read_recent_dirs(&data_dir), vec![source_path.clone()]);
+
+        // Entries written before worktrees were filtered stay hidden.
+        super::write_recent_dirs(&data_dir, &[worktree_path, source_path.clone()])
+            .expect("legacy recent dirs");
+        assert_eq!(
+            super::existing_recent_dirs(super::read_recent_dirs(&data_dir)),
+            vec![source_path]
+        );
     }
 }

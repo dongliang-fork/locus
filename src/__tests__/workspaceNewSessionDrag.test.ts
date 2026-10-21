@@ -120,6 +120,7 @@ async function fixture(checkoutScoped = false, initialCheckout = "checkout", dro
     workspaceSecondarySection, workbenchSplitDirectionAtPoint, workbenchTabInsertionIndexAtPoint,
     t: (key: string) => key,
     usesCheckoutScopedWorkbench: () => checkoutScoped,
+    descriptorLayoutCheckoutId: (descriptor: { checkoutId?: string | null }) => descriptor.checkoutId?.trim() || null,
     activateCheckoutScopedWorkbench: vi.fn(async () => { currentCheckout = "checkout"; return true; }),
     workbenchStore: { ...store, workspaceScope: () => currentCheckout },
     createEditorForResource: (resource: WorkbenchResourceRef, options: { title: string; checkoutId: string; preview?: boolean; pinned?: boolean }) => (

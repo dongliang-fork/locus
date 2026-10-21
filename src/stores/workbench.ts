@@ -2,6 +2,7 @@ import { computed, ref } from "vue";
 import { defineStore } from "pinia";
 import { recordWorkbenchLayout, forgetWorkWindow, savedWindowState } from "../services/workState";
 import type {
+  EditorCheckoutBinding,
   WorkbenchDropDirection,
   WorkbenchEditorGroup,
   WorkbenchEditorInput,
@@ -113,10 +114,18 @@ export function createWorkbenchEditorInput(
       duplicate: true,
     },
     checkoutBinding: options.checkoutBinding ?? null,
+    ...(options.sessionCheckout ? { sessionCheckout: options.sessionCheckout } : {}),
     sourcePath: options.sourcePath ?? null,
     availability: options.availability ?? "available",
     unavailableReason: options.unavailableReason ?? null,
   };
+}
+
+/** Runtime generations are process-local; only the durable identity is stored. */
+function durableBinding(binding: EditorCheckoutBinding | null | undefined): EditorCheckoutBinding | null {
+  return binding?.checkoutId
+    ? { checkoutId: binding.checkoutId, expectedMaterializationEpoch: binding.expectedMaterializationEpoch }
+    : null;
 }
 
 export function shouldShowWorkbenchTabStrip(
@@ -341,6 +350,7 @@ function serializableEditor(editor: WorkbenchEditorInput): WorkbenchEditorInput 
     checkoutBinding: editor.checkoutBinding
       ? { checkoutId: editor.checkoutBinding.checkoutId, expectedMaterializationEpoch: editor.checkoutBinding.expectedMaterializationEpoch }
       : null,
+    ...(editor.sessionCheckout ? { sessionCheckout: durableBinding(editor.sessionCheckout) } : {}),
   };
 }
 
@@ -443,6 +453,9 @@ function normalizeRestoredWindow(state: WorkbenchWindowState): WorkbenchWindowSt
       checkoutBinding: editor.checkoutBinding?.checkoutId || legacyCheckoutId
         ? { checkoutId: editor.checkoutBinding?.checkoutId ?? legacyCheckoutId!, expectedMaterializationEpoch: editor.checkoutBinding?.expectedMaterializationEpoch }
         : null,
+      sessionCheckout: editor.resource.kind === "session" || editor.resource.kind === "newSession"
+        ? durableBinding(editor.sessionCheckout) ?? undefined
+        : undefined,
       sourcePath: editor.sourcePath ?? legacyResource.path ?? null,
       availability: editor.availability === "unavailable"
         ? "unavailable" as const

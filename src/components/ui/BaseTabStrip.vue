@@ -12,6 +12,8 @@ import LucideIcon from "../icons/LucideIcon.vue";
 export interface BaseTabStripItem {
   id: string;
   title: string;
+  /** Secondary text after the title, such as the owning workspace. */
+  detail?: string | null;
   icon?: IconNode | null;
   dirty?: boolean;
   preview?: boolean;
@@ -211,6 +213,7 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
         preview: tab.preview,
         unavailable: tab.unavailable,
         running: tab.running,
+        'has-detail': !!tab.detail,
         'drop-before': activeDropIndex() === index,
       }"
       data-locus-tab-shell
@@ -227,7 +230,7 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
         :data-locus-tab-id="tab.id"
         :aria-selected="activeId === tab.id"
         :tabindex="activeId === tab.id ? 0 : -1"
-        :title="tab.title"
+        :title="tab.detail ? `${tab.title}\n${tab.detail}` : tab.title"
         @click="emit('activate', tab.id)"
         @dblclick="handleDoubleClick($event, tab)"
         @auxclick="handleAuxClick($event, tab)"
@@ -238,6 +241,7 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
           <LucideIcon :icon="tab.icon" :size="12" :stroke-width="2" />
         </span>
         <span class="base-tab-title">{{ tab.title }}</span>
+        <span v-if="tab.detail" class="base-tab-detail">{{ tab.detail }}</span>
         <span v-if="tab.dirty" class="base-tab-dirty" aria-hidden="true" />
       </button>
       <button
@@ -292,6 +296,11 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
   max-width: 240px;
   border-right: 1px solid var(--border-color);
   color: var(--text-secondary);
+}
+
+.base-tab-shell.has-detail {
+  flex-basis: 230px;
+  max-width: 300px;
 }
 
 .base-tab-shell.drop-before::before,
@@ -355,6 +364,18 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
 .base-tab-title {
   min-width: 0;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Keeps the detail readable when a long title is truncated. */
+.base-tab-detail {
+  flex: 0 0 auto;
+  max-width: 50%;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 400;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
