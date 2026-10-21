@@ -29,6 +29,9 @@ pub(super) fn enable_wal(conn: &Connection) -> Result<(), String> {
 struct WriterState {
     conn: Connection,
     unhealthy: bool,
+    /// The connection intentionally holds one read transaction for its whole
+    /// lifetime; leases must not roll it back.
+    pinned_read_snapshot: bool,
 }
 
 pub(super) struct SessionWriter {
@@ -42,16 +45,41 @@ impl SessionWriter {
             state: Mutex::new(WriterState {
                 conn,
                 unhealthy: false,
+                pinned_read_snapshot: false,
             }),
             path,
         }
+    }
+
+    /// Opens a query-only connection whose WAL read transaction freezes the
+    /// committed database state until the connection is dropped. This gives
+    /// export/fork a consistent view without copying the database, whose size
+    /// grows with all sessions rather than the one being read.
+    pub(super) fn pinned_read_snapshot(path: &Path) -> Result<Self, String> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("Failed to open session database for export snapshot: {e}"))?;
+        conn.busy_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("Failed to configure export snapshot timeout: {e}"))?;
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON; BEGIN DEFERRED;")
+            .map_err(|e| format!("Failed to begin session export snapshot: {e}"))?;
+        // A deferred transaction takes its WAL snapshot at the first read.
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .map_err(|e| format!("Failed to pin session export snapshot: {e}"))?;
+        Ok(Self {
+            state: Mutex::new(WriterState {
+                conn,
+                unhealthy: false,
+                pinned_read_snapshot: true,
+            }),
+            path: PathBuf::new(),
+        })
     }
 
     fn lease<'a>(&self, mut state: MutexGuard<'a, WriterState>) -> Result<WriterLease<'a>, String> {
         if state.unhealthy {
             if self.path.as_os_str().is_empty() {
                 return Err(
-                    "The in-memory session snapshot connection could not be recovered".into(),
+                    "The session snapshot connection could not be recovered".into(),
                 );
             }
             // Close the quarantined handle (and its locks) before reopening.
@@ -99,6 +127,14 @@ impl DerefMut for WriterLease<'_> {
 }
 impl Drop for WriterLease<'_> {
     fn drop(&mut self) {
+        if self.state.pinned_read_snapshot {
+            // Ending the transaction would silently move the snapshot forward.
+            if self.state.conn.is_autocommit() {
+                self.state.unhealthy = true;
+                eprintln!("[SessionStore] export snapshot transaction ended; connection quarantined");
+            }
+            return;
+        }
         if !self.state.conn.is_autocommit() {
             eprintln!("[SessionStore] rolling back an unfinished writer transaction before releasing the connection");
             if let Err(error) = self.state.conn.execute_batch("ROLLBACK") {

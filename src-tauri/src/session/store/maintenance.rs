@@ -1,7 +1,82 @@
 use super::SessionStore;
-use crate::sqlite_maint::GarbageCollectionResult;
+use crate::sqlite_maint::{GarbageCollectionResult, VacuumOutcome, VacuumProgress};
+
+/// Captures parked by the v53 migration until the background purge deletes
+/// them. Renaming is O(1); deleting tens of GB inline blocked startup.
+pub(crate) const LEGACY_CONTEXT_ATTEMPTS_TABLE: &str = "session_context_attempts_legacy";
+/// Each batch frees ~10 MB of captures, so the writer is held only briefly.
+const PURGE_BATCH_ROWS: i64 = 64;
 
 impl SessionStore {
+    /// Deletes the parked legacy captures in short writer transactions and
+    /// drops the table. Returns the number of purged rows, or `None` when
+    /// there was nothing to purge.
+    pub(crate) fn purge_legacy_context_attempts(
+        &self,
+        on_progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<Option<u64>, String> {
+        let total = {
+            let conn = self.conn.lock()?;
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [LEGACY_CONTEXT_ATTEMPTS_TABLE],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to inspect legacy captures: {e}"))?;
+            if !exists {
+                return Ok(None);
+            }
+            // Freeing must not overwrite each deleted page in the WAL.
+            conn.execute_batch("PRAGMA secure_delete=OFF;")
+                .map_err(|e| format!("Failed to configure capture purge: {e}"))?;
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {LEGACY_CONTEXT_ATTEMPTS_TABLE}"),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("Failed to count legacy captures: {e}"))? as u64
+        };
+        let delete_batch = format!(
+            "DELETE FROM {LEGACY_CONTEXT_ATTEMPTS_TABLE} WHERE rowid IN
+             (SELECT rowid FROM {LEGACY_CONTEXT_ATTEMPTS_TABLE} LIMIT ?1)"
+        );
+        let mut done = 0u64;
+        on_progress(done, total);
+        loop {
+            let deleted = self
+                .conn
+                .lock()?
+                .execute(&delete_batch, [PURGE_BATCH_ROWS])
+                .map_err(|e| format!("Failed to purge legacy captures: {e}"))?;
+            if deleted == 0 {
+                break;
+            }
+            done += deleted as u64;
+            on_progress(done, total.max(done));
+            // Let queued session writes take the writer between batches.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        self.conn
+            .lock()?
+            .execute_batch(&format!("DROP TABLE IF EXISTS {LEGACY_CONTEXT_ATTEMPTS_TABLE}"))
+            .map_err(|e| format!("Failed to drop legacy captures: {e}"))?;
+        Ok(Some(done))
+    }
+
+    pub(crate) fn vacuum_if_fragmented_with_progress(
+        &self,
+        on_progress: &(dyn Fn(VacuumProgress) + Sync),
+    ) -> Result<VacuumOutcome, String> {
+        let conn = self.conn.lock()?;
+        crate::sqlite_maint::vacuum_if_fragmented_with_progress(
+            &conn,
+            crate::sqlite_maint::VACUUM_MIN_FREE_BYTES,
+            crate::sqlite_maint::VACUUM_MIN_FREE_RATIO,
+            on_progress,
+        )
+    }
+
     pub(crate) fn garbage_collect(&self) -> Result<GarbageCollectionResult, String> {
         let conn = self.conn.try_lock().map_err(|_| {
             "Session database is busy; retry when current operations finish.".to_string()

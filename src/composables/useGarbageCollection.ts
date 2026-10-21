@@ -8,7 +8,7 @@ import { useNotificationStore } from "../stores/notification";
 const pending = ref(false);
 const operation = "garbageCollection";
 
-function formatSize(bytes: number): string {
+export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KiB", "MiB", "GiB", "TiB"];
   let value = bytes / 1024;

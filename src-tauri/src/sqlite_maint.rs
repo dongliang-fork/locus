@@ -128,6 +128,61 @@ pub(crate) fn vacuum_if_fragmented(
     min_free_bytes: u64,
     min_free_ratio: f64,
 ) -> Result<Option<u64>, String> {
+    match vacuum_if_fragmented_with_progress(conn, min_free_bytes, min_free_ratio, &|_| {})? {
+        VacuumOutcome::NotNeeded => Ok(None),
+        VacuumOutcome::Reclaimed(bytes) => Ok(Some(bytes)),
+        VacuumOutcome::InsufficientSpace(shortfall) => Err(shortfall.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VacuumSpaceShortfall {
+    pub reclaimable_bytes: u64,
+    pub database_required_bytes: u64,
+    pub database_available_bytes: u64,
+    pub temp_required_bytes: u64,
+    pub temp_available_bytes: u64,
+}
+
+impl std::fmt::Display for VacuumSpaceShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Skipped VACUUM for lack of disk space: need {} MB beside the database ({} MB free) and {} MB in the temp directory ({} MB free).",
+            self.database_required_bytes >> 20,
+            self.database_available_bytes >> 20,
+            self.temp_required_bytes >> 20,
+            self.temp_available_bytes >> 20
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VacuumOutcome {
+    NotNeeded,
+    Reclaimed(u64),
+    InsufficientSpace(VacuumSpaceShortfall),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacuumProgress {
+    /// Writing the compacted image: first into SQLite's temporary database,
+    /// then into the WAL. `written_bytes` counts both; the temp image is only
+    /// observable on Windows, elsewhere progress starts at the WAL half.
+    Rewriting { written_bytes: u64, total_bytes: u64 },
+    /// Folding the WAL back into the database file and truncating both.
+    Checkpointing,
+}
+
+/// [`vacuum_if_fragmented`] reporting progress while the single `VACUUM`
+/// statement runs; `on_progress` is called from a monitor thread.
+pub(crate) fn vacuum_if_fragmented_with_progress(
+    conn: &Connection,
+    min_free_bytes: u64,
+    min_free_ratio: f64,
+    on_progress: &(dyn Fn(VacuumProgress) + Sync),
+) -> Result<VacuumOutcome, String> {
     let read_pragma = |name: &str| -> Result<i64, String> {
         conn.query_row(&format!("PRAGMA {}", name), [], |row| row.get(0))
             .map_err(|e| format!("Failed to read {}: {}", name, e))
@@ -137,14 +192,47 @@ pub(crate) fn vacuum_if_fragmented(
     let page_count = read_pragma("page_count")?;
     let freelist_count = read_pragma("freelist_count")?;
     if page_size <= 0 || page_count <= 0 || freelist_count <= 0 {
-        return Ok(None);
+        return Ok(VacuumOutcome::NotNeeded);
     }
 
     let free_bytes = (freelist_count as u64).saturating_mul(page_size as u64);
     let free_ratio = freelist_count as f64 / page_count as f64;
     if free_bytes < min_free_bytes || free_ratio < min_free_ratio {
-        return Ok(None);
+        return Ok(VacuumOutcome::NotNeeded);
     }
+    let live_bytes =
+        ((page_count - freelist_count).max(0) as u64).saturating_mul(page_size as u64);
+
+    // Fail before rewriting instead of filling the disk midway while the
+    // caller holds its connection mutex; a later startup retries.
+    let db_path = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from);
+    if let Some(path) = db_path.as_deref() {
+        let db_dir = path.parent().unwrap_or(path);
+        let temp_dir = std::env::temp_dir();
+        let db_available = fs4::available_space(db_dir)
+            .map_err(|e| format!("Failed to check database disk space: {}", e))?;
+        let temp_available = fs4::available_space(&temp_dir)
+            .map_err(|e| format!("Failed to check temporary disk space: {}", e))?;
+        if let Some(shortfall) = vacuum_space_shortfall(
+            live_bytes,
+            free_bytes,
+            db_available,
+            temp_available,
+            same_volume(db_dir, &temp_dir),
+        ) {
+            return Ok(VacuumOutcome::InsufficientSpace(shortfall));
+        }
+    }
+    // Start from an empty WAL so its growth measures the rewrite.
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()));
+    let wal_path = db_path.as_deref().map(|path| {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        std::path::PathBuf::from(wal)
+    });
 
     // VACUUM materializes the compacted copy in a temporary database first;
     // with temp_store=MEMORY that copy would be built in RAM, so force
@@ -154,9 +242,41 @@ pub(crate) fn vacuum_if_fragmented(
         conn.execute_batch("PRAGMA temp_store=FILE;")
             .map_err(|e| format!("Failed to switch temp_store for VACUUM: {}", e))?;
     }
-    let vacuum_result = conn
-        .execute_batch("VACUUM")
-        .map_err(|e| format!("Failed to VACUUM: {}", e));
+    let total_bytes = live_bytes.saturating_mul(2).max(1);
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let vacuum_result = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let started = std::time::SystemTime::now();
+            let wal_base = wal_path.as_deref().map(file_len).unwrap_or(0);
+            let mut temp_peak = 0u64;
+            let mut last = None;
+            loop {
+                temp_peak = temp_peak.max(sqlite_temp_image_bytes(started));
+                let wal = wal_path
+                    .as_deref()
+                    .map(file_len)
+                    .unwrap_or(0)
+                    .saturating_sub(wal_base);
+                let written = temp_peak.saturating_add(wal).min(total_bytes);
+                if last != Some(written) {
+                    last = Some(written);
+                    on_progress(VacuumProgress::Rewriting {
+                        written_bytes: written,
+                        total_bytes,
+                    });
+                }
+                match stopped.recv_timeout(std::time::Duration::from_millis(400)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
+            }
+        });
+        let result = conn
+            .execute_batch("VACUUM")
+            .map_err(|e| format!("Failed to VACUUM: {}", e));
+        let _ = stop.send(());
+        result
+    });
     if temp_store == 2 {
         let _ = conn.execute_batch("PRAGMA temp_store=MEMORY;");
     }
@@ -165,11 +285,96 @@ pub(crate) fn vacuum_if_fragmented(
     // In WAL mode the rewritten image lands in the -wal file, which has its
     // own high-water mark; truncate it now that everything is checkpointed.
     // Returns a status row (and is a no-op) on non-WAL databases.
+    on_progress(VacuumProgress::Checkpointing);
     let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()));
 
     let page_count_after = read_pragma("page_count").unwrap_or(page_count);
     let freed_pages = (page_count - page_count_after).max(0) as u64;
-    Ok(Some(freed_pages.saturating_mul(page_size as u64)))
+    Ok(VacuumOutcome::Reclaimed(
+        freed_pages.saturating_mul(page_size as u64),
+    ))
+}
+
+fn file_len(path: &std::path::Path) -> u64 {
+    // Opening the file reports the live size; NTFS directory entries of
+    // files still being written can lag behind.
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+/// SQLite names its temporary databases `etilqs_*` in the temp directory.
+/// Windows keeps them visible while open (delete-on-close); Unix unlinks
+/// them immediately, so this reports 0 there.
+fn sqlite_temp_image_bytes(since: std::time::SystemTime) -> u64 {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("etilqs_"))
+        .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+        .filter(|meta| meta.modified().map_or(false, |modified| modified >= since))
+        .map(|meta| meta.len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// VACUUM writes the compacted image (the live pages) twice: into the
+/// temporary database and into the WAL/journal beside the database.
+fn vacuum_space_shortfall(
+    live_bytes: u64,
+    reclaimable_bytes: u64,
+    db_available: u64,
+    temp_available: u64,
+    same_volume: bool,
+) -> Option<VacuumSpaceShortfall> {
+    let image = live_bytes.saturating_add(live_bytes / 20);
+    let (db_required, temp_required) = if same_volume {
+        (image.saturating_mul(2), 0)
+    } else {
+        (image, image)
+    };
+    (db_available < db_required || temp_available < temp_required).then_some(
+        VacuumSpaceShortfall {
+            reclaimable_bytes,
+            database_required_bytes: db_required,
+            database_available_bytes: db_available,
+            temp_required_bytes: temp_required,
+            temp_available_bytes: temp_available,
+        },
+    )
+}
+
+/// Unknown volumes count as shared, which demands the larger reserve.
+fn same_volume(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Component;
+        let root = |path: &std::path::Path| {
+            std::fs::canonicalize(path).ok().and_then(|path| match path.components().next() {
+                Some(Component::Prefix(prefix)) => {
+                    Some(prefix.as_os_str().to_string_lossy().to_ascii_uppercase())
+                }
+                _ => None,
+            })
+        };
+        match (root(a), root(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev(),
+            _ => true,
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (a, b);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -382,5 +587,39 @@ mod tests {
             .query_row("PRAGMA temp_store", [], |row| row.get(0))
             .expect("read temp_store");
         assert_eq!(temp_store, 2, "temp_store=MEMORY must be restored");
+    }
+
+    #[test]
+    fn vacuum_space_check_reserves_temp_image_and_wal() {
+        let gb = 1u64 << 30;
+        // Shared volume: temp image and WAL both land beside the database.
+        assert!(vacuum_space_shortfall(7 * gb, gb, 15 * gb, 15 * gb, true).is_none());
+        assert!(vacuum_space_shortfall(7 * gb, gb, 13 * gb, 13 * gb, true).is_some());
+        // Separate volumes: each needs one image.
+        assert!(vacuum_space_shortfall(7 * gb, gb, 8 * gb, 8 * gb, false).is_none());
+        let shortfall = vacuum_space_shortfall(7 * gb, 17 * gb, 24 * gb, 4 * gb, false)
+            .expect("temp volume too small");
+        assert_eq!(shortfall.reclaimable_bytes, 17 * gb);
+        assert_eq!(shortfall.temp_available_bytes, 4 * gb);
+        assert!(shortfall.temp_required_bytes > 7 * gb);
+        assert!(vacuum_space_shortfall(7 * gb, gb, 6 * gb, 100 * gb, false).is_some());
+    }
+
+    #[test]
+    fn vacuum_reports_rewrite_and_checkpoint_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        seed_and_delete(&conn);
+        let seen = std::sync::Mutex::new(Vec::new());
+        let outcome = vacuum_if_fragmented_with_progress(&conn, 1024, 0.01, &|progress| {
+            seen.lock().unwrap().push(progress);
+        })
+        .expect("vacuum");
+        assert!(matches!(outcome, VacuumOutcome::Reclaimed(bytes) if bytes > 0));
+        let seen = seen.into_inner().unwrap();
+        assert!(matches!(seen.first(), Some(VacuumProgress::Rewriting { .. })));
+        assert_eq!(seen.last(), Some(&VacuumProgress::Checkpointing));
     }
 }

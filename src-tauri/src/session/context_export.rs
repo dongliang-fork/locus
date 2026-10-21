@@ -466,7 +466,7 @@ fn export_context_yaml(
             MissingField {
                 field: "sessions[].contextAttempts".to_string(),
                 value: EMPTY,
-                reason: "session predates persisted context-attempt capture".to_string(),
+                reason: "provider attempts are captured only in debug mode; some of this session's attempts ran without capture or predate it".to_string(),
             },
             MissingField {
                 field: "historicalSystemPrompt".to_string(),
@@ -552,7 +552,7 @@ fn export_context_yaml(
             redactions: Vec::new(),
             consistency: ExportConsistency {
                 database_copy: if store.export_snapshot_created_at().is_some() {
-                    "sqlite_online_backup"
+                    "sqlite_read_transaction"
                 } else {
                     "direct_read"
                 },
@@ -1402,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_online_backup_with_separately_timestamped_live_runtime() {
+    fn exports_read_snapshot_with_separately_timestamped_live_runtime() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("create store");
         let session_id = store
@@ -1413,7 +1413,7 @@ mod tests {
             .expect("add snapshot message");
         let snapshot = store
             .create_export_snapshot()
-            .expect("create online backup");
+            .expect("create read snapshot");
         store
             .add_message(&session_id, MessageRole::Assistant, "after snapshot")
             .expect("add live-only message");
@@ -1431,6 +1431,7 @@ mod tests {
             active_tool_calls: Vec::new(),
             streaming_text: "live answer".to_string(),
             streaming_thinking: "live reasoning".to_string(),
+            claude_code_phase: None,
             live_render_parts: Vec::new(),
             stream_sequence: 4,
             streaming_text_order: 2,
@@ -1460,7 +1461,7 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse runtime export");
         assert_eq!(
             yaml["export"]["consistency"]["database_copy"].as_str(),
-            Some("sqlite_online_backup")
+            Some("sqlite_read_transaction")
         );
         assert_ne!(
             yaml["export"]["consistency"]["database_snapshot_at"].as_str(),

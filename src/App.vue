@@ -22,6 +22,7 @@ import { useChatStore } from "./stores/chat";
 import { useNotificationStore } from "./stores/notification";
 import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
+import { watchSessionMaintenance } from "./composables/useSessionMaintenanceNotice";
 import { bootstrapWorkspaceWindow } from "./composables/bootstrapWorkspaceWindow";
 import { isWorkspaceWindowLabel, workspaceWindowQuery } from "./services/workspaceWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -237,6 +238,7 @@ let appCloseRequestUnlisten: UnlistenFn | null = null;
 let unityNativeEmbedRelease: (() => void) | null = null;
 let extraWorkdirsUpdatedUnlisten: UnlistenFn | null = null;
 let workspacePageResetOnboardingUnlisten: UnlistenFn | null = null;
+let sessionMaintenanceRelease: (() => void) | null = null;
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
@@ -757,6 +759,11 @@ onMounted(async () => {
     WORKSPACE_PAGE_RESET_ONBOARDING_EVENT,
     onResetOnboarding,
   );
+  if (!isWorkspaceWindow) {
+    void watchSessionMaintenance().then((release) => {
+      sessionMaintenanceRelease = release;
+    });
+  }
   markStartupPhase("main_dom_listeners_ready");
   markStartupPhase("main_bootstrap_critical_start");
   try {
@@ -811,6 +818,8 @@ onUnmounted(() => {
   extraWorkdirsUpdatedUnlisten = null;
   workspacePageResetOnboardingUnlisten?.();
   workspacePageResetOnboardingUnlisten = null;
+  sessionMaintenanceRelease?.();
+  sessionMaintenanceRelease = null;
   notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
   clearKnowledgeRuntimeStatusTimer();
   cleanup();
