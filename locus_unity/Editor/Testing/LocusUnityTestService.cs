@@ -111,6 +111,7 @@ namespace Locus.UnityTesting
         public int failed;
         public int skipped;
         public int inconclusive;
+        public UnityTestFilterRequest run_filter = new UnityTestFilterRequest();
         public List<UnityTestResultDto> failures = new List<UnityTestResultDto>();
         public List<UnityTestResultDto> results = new List<UnityTestResultDto>();
 
@@ -123,8 +124,16 @@ namespace Locus.UnityTesting
             string editorSessionId,
             string modeValue,
             string resultDetail,
+            UnityTestFilterRequest filter,
             string requestedRunId = null)
         {
+            run_filter = new UnityTestFilterRequest
+            {
+                assemblies = filter?.assemblies,
+                tests = filter?.tests,
+                groups = filter?.groups,
+                categories = filter?.categories
+            };
             active = true;
             editor_session_id = editorSessionId;
             run_id = string.IsNullOrWhiteSpace(requestedRunId)
@@ -161,7 +170,7 @@ namespace Locus.UnityTesting
             if (!state.active)
                 return;
             state.status = state.cancellation_requested ? "cancelling" : "running";
-            state.total = testsToRun != null ? testsToRun.TestCaseCount : 0;
+            state.total = LocusUnityTestService.CountTestsToRun(testsToRun, state.run_filter);
             state.Persist();
         }
 
@@ -333,7 +342,7 @@ namespace Locus.UnityTesting
                 throw new InvalidOperationException("A Unity Test run is already active.");
 
             SaveDirtyScenesBeforeRun();
-            state.Begin(EditorSessionId(), modeName, resultDetail, request.run_id);
+            state.Begin(EditorSessionId(), modeName, resultDetail, request, request.run_id);
             try
             {
                 Filter filter = BuildFilter(request, mode);
@@ -683,6 +692,43 @@ namespace Locus.UnityTesting
                     request,
                     response,
                     maxResults);
+        }
+
+        // UTF prunes the RunStarted tree with the run filter, but every node keeps the
+        // unfiltered NUnit TestCaseCount, so the root reports all loaded tests. Count the
+        // remaining test cases instead; when a UTF version hands over the unpruned tree,
+        // apply the request filter the same way unity_test_list does.
+        internal static int CountTestsToRun(ITestAdaptor root, UnityTestFilterRequest filter)
+        {
+            if (root == null)
+                return 0;
+            int remaining = CountTestCases(root, "", 0, null);
+            if (remaining < root.TestCaseCount || filter == null)
+                return remaining;
+            return CountTestCases(root, "", 0, filter);
+        }
+
+        private static int CountTestCases(
+            ITestAdaptor node,
+            string assemblyName,
+            int depth,
+            UnityTestFilterRequest filter)
+        {
+            if (node == null)
+                return 0;
+            if (IsAssemblySuite(node, depth))
+                assemblyName = TrimAssemblyExtension(node.Name);
+            if (!node.IsSuite)
+                return filter == null ||
+                       Matches(node, ResolveTestAssemblyName(node, assemblyName), filter)
+                    ? 1
+                    : 0;
+            if (!node.HasChildren || node.Children == null)
+                return 0;
+            int count = 0;
+            foreach (ITestAdaptor child in node.Children)
+                count += CountTestCases(child, assemblyName, depth + 1, filter);
+            return count;
         }
 
         // NUnit replaces an assembly's TestAssembly suite with its global-namespace
