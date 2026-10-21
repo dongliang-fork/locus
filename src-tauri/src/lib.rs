@@ -19,6 +19,7 @@ use tauri::webview::PageLoadEvent;
 use tauri::{Emitter, Manager, WindowEvent};
 
 mod agent;
+mod app_tasks;
 pub mod asset_db;
 mod async_tasks;
 mod auth;
@@ -69,6 +70,7 @@ mod unity_embed_webview;
 mod skill_runtime_context;
 mod sqlite_maint;
 mod tool;
+mod user_question;
 pub mod unity_bridge;
 pub mod unity_csharp;
 mod unity_docs;
@@ -84,6 +86,8 @@ pub mod unity_asset_core;
 pub mod unity_assets;
 pub mod vcs;
 pub mod view;
+#[cfg(target_os = "windows")]
+mod webview_drop_target;
 #[cfg(target_os = "windows")]
 mod windows_resize_sync;
 #[cfg(target_os = "windows")]
@@ -328,6 +332,7 @@ pub type ProviderKeysState = Arc<tokio::sync::RwLock<std::collections::HashMap<S
 pub struct PendingQuestionResponse {
     pub session_id: String,
     pub run_id: String,
+    pub form: Option<user_question::QuestionForm>,
     pub tx: tokio::sync::oneshot::Sender<String>,
 }
 
@@ -366,6 +371,41 @@ mod state_type_tests {
             TypeId::of::<ProviderKeysState>()
         );
     }
+}
+
+fn report_storage_startup_failure(
+    app_handle: &tauri::AppHandle,
+    log_store: &logging::AppLogStore,
+    error: runtime_data_lock::RuntimeDataDirLockError,
+    is_cli_driver: bool,
+) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+
+    tracing::error!(target: "startup", "Failed to initialize app storage: {error}");
+    if let Some(sink) = log_store.file_sink() {
+        let _ = sink.flush_blocking(std::time::Duration::from_secs(1));
+    }
+    if is_cli_driver {
+        std::process::exit(1);
+    }
+
+    let is_zh = sys_locale::get_locale()
+        .map(|locale| locale.to_ascii_lowercase().starts_with("zh"))
+        .unwrap_or(false);
+    // Setup runs on the UI thread before the main window exists. A blocking
+    // plugin dialog can deadlock here; keep the event loop alive until dismissal.
+    app_handle
+        .dialog()
+        .message(error.user_message(is_zh))
+        .title(if is_zh {
+            "Locus 启动失败"
+        } else {
+            "Locus failed to start"
+        })
+        .kind(MessageDialogKind::Error)
+        // This happens before backend initialization. The log is flushed above;
+        // exit directly because this Wry version discards AppHandle::exit's code.
+        .show(|_| std::process::exit(1));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -437,6 +477,7 @@ pub fn run() {
                 if let Err(error) = windows_resize_sync::sync_after_page_load(webview) {
                     eprintln!("[Locus] warning: failed to sync WebView2 after page load: {error}");
                 }
+                webview_drop_target::ensure(&webview.window());
             }
         })
         .register_uri_scheme_protocol("locus-binary", move |_ctx, request| {
@@ -493,6 +534,8 @@ pub fn run() {
                 }
             }
             commands::handle_locus_window_event(window, event);
+            #[cfg(target_os = "windows")]
+            webview_drop_target::handle_window_event(window, event);
             commands::handle_sub_window_event(window, event);
             // Process exit destroys every native window. Preserve the last
             // durable pane projection so the next process can restore all
@@ -581,10 +624,26 @@ pub fn run() {
                     error
                 );
             }
-            let data_dir = commands::prepare_runtime_storage_dir(&app.handle().clone())
-                .map_err(|e| format!("Failed to prepare app storage dir: {}", e))?;
-            let runtime_data_lock = runtime_data_lock::RuntimeDataDirLock::acquire(&data_dir)
-                .map_err(|e| format!("Failed to acquire app storage lock: {}", e))?;
+            let storage = commands::prepare_runtime_storage_dir(&app.handle().clone())
+                .map_err(runtime_data_lock::RuntimeDataDirLockError::from)
+                .and_then(|data_dir| {
+                    runtime_data_lock::RuntimeDataDirLock::acquire(&data_dir)
+                        .map(|lock| (data_dir, lock))
+                });
+            let (data_dir, runtime_data_lock) = match storage {
+                Ok(storage) => storage,
+                Err(error) => {
+                    report_storage_startup_failure(
+                        app.handle(),
+                        &log_store_for_setup,
+                        error,
+                        cli_driver_for_setup.is_some(),
+                    );
+                    // Returning Err from Tauri's setup hook panics. Stop setup
+                    // successfully and exit after the failure dialog is closed.
+                    return Ok(());
+                }
+            };
             println!(
                 "[Locus] runtime data lock acquired: {}",
                 runtime_data_lock.path().display()
@@ -618,7 +677,6 @@ pub fn run() {
                 resource_policy::ResourcePolicyStore::from_config(config.clone())
                     .map_err(|error| format!("Invalid workspace resource policy: {error}"))?,
             );
-            resource_policy::install_application_policy(resource_policy.clone());
             let workspace_service_factories: Vec<
                 Arc<dyn workspace_service::service::WorkspaceServiceFactory>,
             > = vec![Arc::new(
@@ -650,7 +708,6 @@ pub fn run() {
                 config.unity_sidecar_compiler_enabled(),
                 config.unity_non_public_access_enabled(),
                 app.handle().clone(),
-                resource_policy.clone(),
             );
             csharp_compile::set_in_process_fallback(
                 config.unity_in_process_compile_fallback_enabled(),
@@ -693,10 +750,12 @@ pub fn run() {
                 .attach_session_store(&store)
                 .map_err(|error| format!("Failed to attach project session catalog: {error}"))?;
             startup_for_setup.mark("setup_session_store_ready");
-            // Deleted sessions leave locus.db at its high-water mark (SQLite
-            // never returns freelist pages to the OS on its own); reclaim in
-            // the background when most of the file is dead space.
-            store.clone().spawn_vacuum_if_fragmented();
+            // Purge captures parked by migrations and reclaim file space when
+            // most of locus.db is dead freelist pages (SQLite never returns
+            // them on its own). Runs in the background and reports progress
+            // to the frontend instead of delaying the window.
+            app.manage(Arc::new(session::maintenance::SessionMaintenanceState::default()));
+            session::maintenance::spawn(app.handle().clone(), store.clone(), true);
 
             let watcher_tuning = Arc::new(crate::asset_db::watcher::WatcherTuning::new());
             // Runtime registration is the single initialization boundary for
@@ -991,6 +1050,13 @@ pub fn run() {
                 session::pending_inputs::PendingInputQueue::default(),
             ));
             let async_task_manager = Arc::new(async_tasks::AsyncTaskManager::new(store.clone())?);
+            let app_task_registry = {
+                let app_handle = app.handle().clone();
+                Arc::new(app_tasks::AppTaskRegistry::new(move |info| {
+                    use tauri::Emitter;
+                    let _ = app_handle.emit(app_tasks::APP_TASK_UPDATED_EVENT, info);
+                }))
+            };
 
             let question_store: QuestionStore = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let knowledge_proposal_drafts: KnowledgeProposalDraftStore =
@@ -1080,6 +1146,7 @@ pub fn run() {
             app.manage(active_tasks);
             app.manage(pending_input_queue);
             app.manage(async_task_manager);
+            app.manage(app_task_registry);
             app.manage(crate::asset_db::watcher::WatcherTuningState(Arc::clone(
                 &watcher_tuning,
             )));
@@ -1350,6 +1417,7 @@ pub fn run() {
             commands::get_session_context_usage_report,
             commands::get_model_usage_stats,
             commands::garbage_collection,
+            session::maintenance::get_session_maintenance_status,
             commands::get_session_active_run,
             commands::get_session_resume_available,
             commands::list_session_events,
@@ -1386,6 +1454,9 @@ pub fn run() {
             commands::import_worktree,
             commands::remove_managed_worktree,
             commands::get_worktree_operations,
+            commands::get_worktree_root_settings,
+            commands::set_worktree_root_setting,
+            commands::get_worktree_defaults,
             commands::bind_session_worktree,
             commands::acquire_unity_project_slot,
             commands::release_unity_project_slot,
@@ -1584,6 +1655,7 @@ pub fn run() {
             commands::workspace_file_revision,
             commands::workspace_file_write,
             commands::workspace_create_document,
+            commands::workspace_create_folder,
             commands::explorer_file_action,
             commands::file_history,
             commands::file_history_preview,
@@ -1770,6 +1842,7 @@ pub fn run() {
             commands::set_async_tasks_enabled,
             commands::list_background_tasks,
             commands::cancel_background_task,
+            commands::list_app_tasks,
             commands::get_unity_multi_agent_editor_enabled,
             commands::set_unity_multi_agent_editor_enabled,
             commands::get_claude_code_cli_enabled,
