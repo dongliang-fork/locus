@@ -504,6 +504,73 @@ describe("workspace file editor", () => {
     app.unmount();
   });
 
+  async function mountSavingMarkdown(diskRevision: () => ProjectExplorerFilePreview["revision"]) {
+    const before = markdownPreview("# Version 4\n", "hash-v4");
+    const saved = markdownPreview("# Edited\n", "hash-saved");
+    workspaceExplorerMocks.workspacePreview.mockResolvedValueOnce(before);
+    workspaceExplorerMocks.workspaceRevision.mockImplementation(async () => diskRevision());
+    let resolveWrite!: (preview: ProjectExplorerFilePreview) => void;
+    workspaceExplorerMocks.workspaceWrite.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveWrite = resolve;
+    }));
+    const editorRef = ref<{ saveFile(): Promise<boolean> } | null>(null);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      setup() {
+        return () => h(WorkspaceFilePreview, {
+          ref: editorRef,
+          path: "Assets/Docs/combat.md",
+          workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 7 },
+          active: true,
+        });
+      },
+    });
+    app.mount(host);
+    await flush();
+    host.querySelector<HTMLButtonElement>(".workspace-file-editor-test-change")?.click();
+    await nextTick();
+    const save = editorRef.value!.saveFile();
+    await flush();
+    expect(workspaceExplorerMocks.workspaceWrite).toHaveBeenCalledTimes(1);
+
+    // The watcher reports the in-flight write before its IPC response arrives.
+    emitWorkspaceFileChange("Assets/Docs/combat.md");
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    await flush();
+    expect(workspaceExplorerMocks.workspaceRevision).toHaveBeenCalledTimes(1);
+    expect(host.querySelector(".workspace-file-preview-conflict")).toBeNull();
+
+    resolveWrite(saved);
+    await expect(save).resolves.toBe(true);
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    await flush();
+    return { app, host };
+  }
+
+  it("does not flash the disk conflict bar for its own in-flight save", async () => {
+    const savedRevision = markdownPreview("# Edited\n", "hash-saved").revision;
+    const mounted = await mountSavingMarkdown(() => savedRevision);
+    expect(workspaceExplorerMocks.workspaceRevision).toHaveBeenCalledTimes(2);
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(1);
+    expect(mounted.host.querySelector(".workspace-file-preview-conflict")).toBeNull();
+    mounted.app.unmount();
+  });
+
+  it("still detects an external change that overlapped its own save", async () => {
+    const external = markdownPreview("# External\n", "hash-external");
+    workspaceExplorerMocks.workspacePreview.mockResolvedValue(external);
+    const mounted = await mountSavingMarkdown(() => external.revision);
+    expect(workspaceExplorerMocks.workspaceRevision).toHaveBeenCalledTimes(2);
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(2);
+    expect(mounted.host.querySelector(".workspace-file-preview-conflict")).toBeNull();
+    expect(
+      mounted.host.querySelector<HTMLElement>(".workspace-file-editor-test-change")?.dataset.modelValue,
+    ).toBe("# External\n");
+    mounted.app.unmount();
+  });
+
   it("keeps dirty edits visible and exposes an explicit disk conflict choice", async () => {
     const before = markdownPreview("# Version 4\n", "hash-v4");
     const after = markdownPreview("# Version 5\n", "hash-v5");

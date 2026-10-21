@@ -3,14 +3,21 @@ use super::*;
 use crate::csv_document::view_path as csv_view_path;
 use crate::csv_document::{read_view_file as read_csv_view_file, CsvViewFile};
 
+/// `allow_external` admits absolute paths outside the workspace for editor
+/// content commands; relocation keeps its source inside the workspace.
 fn resolve_csv_file(
     file_path: &str,
     workspace_ref: Option<&WorkspaceRef>,
     project_id: Option<String>,
     registry: &ProjectRegistry,
+    allow_external: bool,
 ) -> Result<(Option<ResolvedWorkspaceScope>, PathBuf, PathBuf), AppError> {
     let (scope, path, root) = if let Some(reference) = workspace_ref {
-        let (scope, _, path) = resolve_workspace_file(reference, file_path, registry)?;
+        let (scope, _, path) = if allow_external {
+            resolve_openable_workspace_file(reference, file_path, registry)?
+        } else {
+            resolve_workspace_file(reference, file_path, registry)?
+        };
         {
             let root = scope.runtime().root().to_path_buf();
             (Some(scope), path, root)
@@ -51,6 +58,7 @@ pub async fn csv_view_read(
         workspace_ref.as_ref(),
         project_id,
         registry.inner().as_ref(),
+        true,
     )?;
     read_csv_view_file(&csv)
 }
@@ -71,6 +79,7 @@ pub async fn csv_view_write(
         workspace_ref.as_ref(),
         project_id,
         registry.inner().as_ref(),
+        true,
     )?;
     crate::csv_document::ensure_write_allowed(
         &root,
@@ -180,6 +189,7 @@ pub async fn csv_file_relocate(
         workspace_ref.as_ref(),
         project_id,
         registry.inner().as_ref(),
+        false,
     )?;
     let requested = Path::new(target_path.trim());
     let candidate = if requested.is_absolute() {

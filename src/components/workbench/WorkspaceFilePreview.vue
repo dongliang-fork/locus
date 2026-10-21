@@ -45,9 +45,17 @@ import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import WorkspaceCsvEditor from "../csv/WorkspaceCsvEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
+import type { MarkdownEditorSelection } from "../ui/markdown-editor/markdownEditorSelection";
 import type { MarkdownEditorViewMode } from "../ui/markdownEditorViewMode";
+import {
+  fileSelectionReference,
+  normalizeSelectionFilePath,
+  selectionLocationLabel,
+  useDocumentSelectionReporter,
+} from "../../composables/documentSelection";
 import { validResourceName } from "../explorer/explorerResourceActions";
 import { WORKSPACE_FILE_PREVIEW_CACHE } from "./workspaceFilePreviewCache";
+import { isExternalWorkspaceFilePath } from "./workbenchExternalFile";
 
 const props = defineProps<{
   projectId?: string;
@@ -162,10 +170,37 @@ const isMarkdownDocument = computed(() => (
 const documentTitle = computed(() => preview.value?.name.replace(/\.(?:md|markdown)$/iu, "") ?? "");
 const titleDraft = ref("");
 const titleError = ref("");
-const canRename = computed(() => !!props.projectId && isMarkdownDocument.value);
+// Workspace-scoped rename stays inside the workspace; files opened from
+// outside it keep a read-only title. Mounted project files are unaffected.
+const canRename = computed(() => !!props.projectId && isMarkdownDocument.value
+  && !(props.workspaceRef && isExternalWorkspaceFilePath(filePath.value)));
 const titleDirty = computed(() => canRename.value
   && titleDraft.value.trim().replace(/\.(?:md|markdown)$/iu, "") !== documentTitle.value);
 watch(documentTitle, (title) => { titleDraft.value = title; }, { immediate: true });
+
+const selectionReporter = useDocumentSelectionReporter("file");
+watch(resourceKey, () => selectionReporter.clear());
+
+function onEditorSelectionChange(selection: MarkdownEditorSelection | null): void {
+  if (!selectionReporter.enabled) return;
+  const current = preview.value;
+  if (!selection?.ranges.length || !current || !isMarkdownDocument.value) {
+    void selectionReporter.update(null);
+    return;
+  }
+  // The editor holds the whole file, so its line numbers are physical lines.
+  const path = normalizeSelectionFilePath(current.path);
+  const content = fileSelectionReference(path, selection, {
+    draftLabel: dirty.value ? t("editor.quoteDraft") : undefined,
+  });
+  void selectionReporter.update(() => ({
+    checkoutId: props.workspaceRef?.checkoutId ?? null,
+    filePath: path,
+    name: current.name,
+    location: selectionLocationLabel(path, content),
+    content,
+  }));
+}
 
 async function renameDocument(): Promise<void> {
   if (!canRename.value || renaming.value || !preview.value) return;
@@ -306,19 +341,31 @@ async function probeFileRevision(): Promise<ProjectExplorerFileRevision> {
     : await projectExplorerFileRevision(props.projectId ?? "", filePath.value);
 }
 
-const { checkNow: refreshIfChanged } = useFileChangeRevalidation({
+// A probe that overlaps our own write cannot tell it apart from an external
+// change. Its result is checked again once the save settles, so autosave never
+// flashes the disk conflict bar.
+let probeOverlappedSave = false;
+let recheckAfterSave = false;
+
+const { checkNow: refreshIfChanged, scheduleCheck: scheduleFileCheck } = useFileChangeRevalidation({
   active: () => props.active !== false && !isCsv.value && !renaming.value,
   currentRevision: () => observedDiskRevision.value ?? preview.value?.revision ?? null,
-  probe: probeFileRevision,
+  probe: async () => {
+    const document = fileSession.document.value;
+    const revision = await probeFileRevision();
+    probeOverlappedSave = saving.value || fileSession.document.value !== document;
+    return revision;
+  },
   workspaceRef: () => props.workspaceRef,
   workspacePath: () => props.workspaceRef ? filePath.value : null,
   onChanged: async (revision) => {
     previewCache?.delete(resourceKey.value);
-    observedDiskRevision.value = revision;
-    if (saving.value) {
-      diskChanged.value = true;
+    if (probeOverlappedSave) {
+      if (saving.value) recheckAfterSave = true;
+      else scheduleFileCheck("event");
       return;
     }
+    observedDiskRevision.value = revision;
     await loadPreview({ keepCurrent: true, mergeDraft: true });
   },
 });
@@ -449,7 +496,11 @@ async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot, 
 
 watch(() => dirty.value || titleDirty.value || renaming.value, (value) => emit("dirtyChange", value));
 watch(saving, (value, previous) => {
-  if (!value && previous && diskChanged.value) void loadPreview({ keepCurrent: true, mergeDraft: true });
+  if (value || !previous) return;
+  const recheck = recheckAfterSave;
+  recheckAfterSave = false;
+  if (diskChanged.value) void loadPreview({ keepCurrent: true, mergeDraft: true });
+  else if (recheck) scheduleFileCheck("event");
 });
 watch(fileSession.document, (document) => {
   if (document) previewCache?.set(resourceKey.value, document.preview);
@@ -584,7 +635,7 @@ defineExpose({
                     v-model="titleDraft"
                     class="document-title-input"
                     type="text"
-                    :disabled="renaming"
+                    :readonly="renaming"
                     :placeholder="t('knowledge.preview.titlePlaceholder')"
                     :aria-label="t('knowledge.preview.titleLabel')"
                     :aria-invalid="!!titleError"
@@ -610,6 +661,7 @@ defineExpose({
                   auto-grow
                   :min-height="360"
                   transaction-model
+                  @selection-change="onEditorSelectionChange"
                   @document-change="onEditorDocumentChange"
                   @shortcut-save="saveFile"
                   @external-change="!renaming && refreshIfChanged()"

@@ -920,12 +920,11 @@ pub async fn project_explorer_file_revision(
     file_revision(&candidate)
 }
 
-fn resolve_workspace_file(
+fn workspace_file_scope(
     workspace_ref: &WorkspaceRef,
-    path: &str,
     registry: &ProjectRegistry,
-) -> Result<(ResolvedWorkspaceScope, ProjectId, PathBuf), AppError> {
-    let resolved = registry
+) -> Result<ResolvedWorkspaceScope, AppError> {
+    registry
         .resolve_workspace_ref(workspace_ref)
         .map_err(|error| {
             AppError::new(
@@ -933,11 +932,91 @@ fn resolve_workspace_file(
                 "The requested workspace is unavailable.",
             )
             .detail(error.to_string())
-        })?;
+        })
+}
+
+fn resolve_workspace_file(
+    workspace_ref: &WorkspaceRef,
+    path: &str,
+    registry: &ProjectRegistry,
+) -> Result<(ResolvedWorkspaceScope, ProjectId, PathBuf), AppError> {
+    let resolved = workspace_file_scope(workspace_ref, registry)?;
     let runtime = resolved.runtime();
     let project_id = runtime.project_id().clone();
     let (canonical, _) = super::asset::resolve_workspace_path(runtime.root(), path)?;
     Ok((resolved, project_id, canonical))
+}
+
+/// Canonical form of an absolute path that may not exist yet.
+fn absolute_file_candidate(requested: &Path) -> Result<PathBuf, AppError> {
+    if requested.exists() {
+        return dunce::canonicalize(requested).map_err(|error| {
+            AppError::new(
+                "workspace.explorer_file_metadata_failed",
+                "The selected file could not be inspected.",
+            )
+            .detail(error.to_string())
+        });
+    }
+    Ok(requested
+        .parent()
+        .and_then(|parent| dunce::canonicalize(parent).ok())
+        .and_then(|parent| requested.file_name().map(|name| parent.join(name)))
+        .unwrap_or_else(|| requested.to_path_buf()))
+}
+
+/// Existing regular file addressed by an absolute path, wherever it lives.
+fn absolute_existing_file(requested: &Path, display: &str) -> Result<PathBuf, AppError> {
+    let canonical = dunce::canonicalize(requested).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::new("asset.preview.not_found", format!("File not found: {display}"))
+        } else {
+            AppError::new(
+                "workspace.explorer_file_metadata_failed",
+                "The selected file could not be inspected.",
+            )
+            .detail(error.to_string())
+        }
+    })?;
+    if !canonical.is_file() {
+        return Err(AppError::new(
+            "asset.preview.not_file",
+            format!("Path is not a regular file: {display}"),
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Editor tabs open any local file by absolute path, like chat file
+/// references do. Only content commands (preview, revision, text and CSV
+/// layout writes) use this; rename, move, history and CSV relocation stay
+/// limited to the workspace through `resolve_workspace_file`.
+fn resolve_openable_workspace_file(
+    workspace_ref: &WorkspaceRef,
+    path: &str,
+    registry: &ProjectRegistry,
+) -> Result<(ResolvedWorkspaceScope, ProjectId, PathBuf), AppError> {
+    let requested = Path::new(path.trim());
+    if !requested.is_absolute() {
+        return resolve_workspace_file(workspace_ref, path, registry);
+    }
+    let resolved = workspace_file_scope(workspace_ref, registry)?;
+    let project_id = resolved.runtime().project_id().clone();
+    let canonical = absolute_existing_file(requested, path)?;
+    Ok((resolved, project_id, canonical))
+}
+
+fn resolve_openable_workspace_file_candidate(
+    workspace_ref: &WorkspaceRef,
+    path: &str,
+    registry: &ProjectRegistry,
+) -> Result<(ResolvedWorkspaceScope, PathBuf), AppError> {
+    let requested = Path::new(path.trim());
+    if !requested.is_absolute() {
+        return resolve_workspace_file_candidate(workspace_ref, path, registry);
+    }
+    let resolved = workspace_file_scope(workspace_ref, registry)?;
+    Ok((resolved, absolute_file_candidate(requested)?))
 }
 
 fn resolve_workspace_file_candidate(
@@ -945,32 +1024,10 @@ fn resolve_workspace_file_candidate(
     path: &str,
     registry: &ProjectRegistry,
 ) -> Result<(ResolvedWorkspaceScope, PathBuf), AppError> {
-    let resolved = registry
-        .resolve_workspace_ref(workspace_ref)
-        .map_err(|error| {
-            AppError::new(
-                "workspace.file_scope_unavailable",
-                "The requested workspace is unavailable.",
-            )
-            .detail(error.to_string())
-        })?;
+    let resolved = workspace_file_scope(workspace_ref, registry)?;
     let requested = Path::new(path.trim());
     if requested.is_absolute() {
-        let candidate = if requested.exists() {
-            dunce::canonicalize(requested).map_err(|error| {
-                AppError::new(
-                    "workspace.explorer_file_metadata_failed",
-                    "The selected file could not be inspected.",
-                )
-                .detail(error.to_string())
-            })?
-        } else {
-            requested
-                .parent()
-                .and_then(|parent| dunce::canonicalize(parent).ok())
-                .and_then(|parent| requested.file_name().map(|name| parent.join(name)))
-                .unwrap_or_else(|| requested.to_path_buf())
-        };
+        let candidate = absolute_file_candidate(requested)?;
         let canonical_root = dunce::canonicalize(resolved.runtime().root())
             .unwrap_or_else(|_| resolved.runtime().root().to_path_buf());
         if !candidate.starts_with(&canonical_root) {
@@ -1016,7 +1073,7 @@ pub async fn workspace_file_preview(
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerFilePreview, AppError> {
     let (_scope, project_id, canonical) =
-        resolve_workspace_file(&workspace_ref, &file_path, registry.inner().as_ref())?;
+        resolve_openable_workspace_file(&workspace_ref, &file_path, registry.inner().as_ref())?;
     build_file_preview(registry.inner().as_ref(), &project_id, &canonical)
 }
 
@@ -1026,8 +1083,11 @@ pub async fn workspace_file_revision(
     workspace_ref: WorkspaceRef,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerFileRevision, AppError> {
-    let (_scope, candidate) =
-        resolve_workspace_file_candidate(&workspace_ref, &file_path, registry.inner().as_ref())?;
+    let (_scope, candidate) = resolve_openable_workspace_file_candidate(
+        &workspace_ref,
+        &file_path,
+        registry.inner().as_ref(),
+    )?;
     file_revision(&candidate)
 }
 
@@ -1173,7 +1233,7 @@ pub async fn workspace_file_write(
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerFilePreview, AppError> {
     let (_scope, project_id, canonical) =
-        resolve_workspace_file(&workspace_ref, &file_path, registry.inner().as_ref())?;
+        resolve_openable_workspace_file(&workspace_ref, &file_path, registry.inner().as_ref())?;
     write_text_file(
         registry.inner().as_ref(),
         &project_id,
@@ -1255,5 +1315,47 @@ mod file_write_tests {
         assert!(after.exists);
         assert_ne!(before.key, after.key);
         assert_ne!(before.size, after.size);
+    }
+}
+
+#[cfg(test)]
+mod openable_file_tests {
+    use super::{absolute_existing_file, absolute_file_candidate};
+
+    #[test]
+    fn absolute_files_outside_any_workspace_are_openable() {
+        let external = tempfile::tempdir().expect("temp dir");
+        let path = external.path().join("diagonal_cut.py");
+        std::fs::write(&path, "print('cut')\n").expect("write file");
+        let display = path.to_string_lossy().replace('\\', "/");
+
+        let resolved = absolute_existing_file(std::path::Path::new(&display), &display)
+            .expect("external file resolves");
+
+        assert_eq!(resolved, dunce::canonicalize(&path).unwrap());
+    }
+
+    #[test]
+    fn absolute_open_rejects_missing_files_and_directories() {
+        let external = tempfile::tempdir().expect("temp dir");
+        let missing = external.path().join("missing.py");
+        let missing_error = absolute_existing_file(&missing, "missing.py").unwrap_err();
+        assert_eq!(missing_error.code, "asset.preview.not_found");
+
+        let directory_error = absolute_existing_file(external.path(), "dir").unwrap_err();
+        assert_eq!(directory_error.code, "asset.preview.not_file");
+    }
+
+    #[test]
+    fn absolute_revision_candidate_keeps_missing_file_name() {
+        let external = tempfile::tempdir().expect("temp dir");
+        let missing = external.path().join("removed.py");
+
+        let candidate = absolute_file_candidate(&missing).expect("candidate");
+
+        assert_eq!(
+            candidate,
+            dunce::canonicalize(external.path()).unwrap().join("removed.py")
+        );
     }
 }

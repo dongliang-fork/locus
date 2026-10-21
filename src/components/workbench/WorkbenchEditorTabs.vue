@@ -12,6 +12,7 @@ import {
 import { useChatStore } from "../../stores/chat";
 import { shouldShowWorkbenchTabStrip } from "../../stores/workbench";
 import { isDocumentPreview } from "./workbenchDocumentPreview";
+import { isExternalWorkspaceFileEditor } from "./workbenchExternalFile";
 import type { WorkbenchEditorGroup, WorkbenchEditorInput } from "../../types/workbench";
 import LucideIcon from "../icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "../icons/locusViewIcons";
@@ -37,6 +38,7 @@ const props = defineProps<{
   dropActive?: boolean;
   dropIndex?: number;
   viewIcon?: (editor: WorkbenchEditorInput) => string | null | undefined;
+  workspaceLabel?: (editor: WorkbenchEditorInput) => string | null | undefined;
 }>();
 
 const emit = defineEmits<{
@@ -94,6 +96,8 @@ function editorIcon(editor: WorkbenchEditorInput) {
 function showDirtyIndicator(editor: WorkbenchEditorInput): boolean {
   if (!editor.dirty) return false;
   const resource = editor.resource;
+  // Knowledge tabs are titled with the file name; only CSV saves manually.
+  if (resource.kind === "knowledge") return /\.csv$/i.test(editor.title);
   const path = resource.kind === "workspaceFile" || resource.kind === "asset"
     ? resource.path
     : resource.kind === "localFile" ? editor.sourcePath : null;
@@ -104,6 +108,8 @@ function showDirtyIndicator(editor: WorkbenchEditorInput): boolean {
 const tabItems = computed<BaseTabStripItem[]>(() => props.group.tabs.map((editor) => ({
   id: editor.editorId,
   title: editor.title,
+  detail: props.workspaceLabel?.(editor)
+    ?? (isExternalWorkspaceFileEditor(editor) ? t("workbench.tabs.outsideWorkspace") : null),
   icon: editorIcon(editor),
   dirty: showDirtyIndicator(editor),
   preview: editor.preview && !editor.pinned,
