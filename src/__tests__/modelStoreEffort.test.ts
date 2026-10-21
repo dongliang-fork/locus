@@ -210,47 +210,32 @@ describe("useModelStore OpenAI effort mapping", () => {
     expect(modelStore.effortSupported).toBe(true);
   });
 
-  it("includes current Anthropic models with context windows", () => {
+  it("uses the current Claude subscription catalog in the same order as Claude CLI", async () => {
     const authStore = useAuthStore();
     authStore.isAuthenticated = true;
     const modelStore = useModelStore();
+    const models = modelStore.availableModels.filter((model) => model.provider === "anthropic");
 
-    expect(
-      modelStore.availableModels
-        .map((model) => model.id)
-        .filter((id) => id.startsWith("claude-")),
-    ).toEqual(["claude-fable-5", "claude-opus-4.8", "claude-sonnet-5", "claude-opus-4.6"]);
-    expect(modelStore.availableModels).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          id: "claude-fable-5",
-          name: "Claude Fable 5[1m]",
-          contextWindow: 1_000_000,
-        }),
-        expect.objectContaining({
-          id: "claude-opus-4.8",
-          name: "Claude Opus 4.8[1m]",
-          contextWindow: 1_000_000,
-        }),
-        expect.objectContaining({
-          id: "claude-sonnet-5",
-          name: "Claude Sonnet 5[1m]",
-          contextWindow: 1_000_000,
-        }),
-        expect.objectContaining({
-          id: "claude-opus-4.6",
-          name: "Claude Opus 4.6[1m]",
-          contextWindow: 1_000_000,
-        }),
-      ]),
+    expect(models.map(({ id, name }) => ({ id, name }))).toEqual([
+      { id: "claude-opus-5-5", name: "Claude Opus 5.5" },
+      { id: "claude-fable-5-1", name: "Claude Fable 5.1" },
+      { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
+      { id: "claude-haiku-5-5", name: "Claude Haiku 5.5" },
+    ]);
+    expect(models.filter((model) => model.isDefault).map((model) => model.id)).toEqual(["claude-opus-5-5"]);
+    expect(models[1].contextWindow).toBe(1_000_000);
+    expect(models[2].contextWindow).toBe(1_000_000);
+    // Do not infer unverified context limits from a newer model name.
+    expect(models[0].contextWindow).toBeUndefined();
+    expect(models[3].contextWindow).toBeUndefined();
+
+    await setClaudeCodeCliEnabled(true);
+    const cliModels = modelStore.allModels.filter((model) => model.provider === "claude_code");
+    expect(models.map(({ id, name, supportedEfforts }) => ({ id, name, supportedEfforts }))).toEqual(
+      cliModels.map(({ id, name, supportedEfforts }) => ({ id: id.slice(12), name, supportedEfforts })),
     );
-    expect(modelStore.availableModels.some((model) => model.id === "claude-sonnet-4.6")).toBe(
-      false,
-    );
-    expect(modelStore.availableModels.some((model) => model.id === "claude-haiku-4.5")).toBe(
-      false,
-    );
-    expect(modelStore.availableModels.some((model) => model.id === "claude-opus-4.7")).toBe(false);
+    // Updating the subscription catalog must not replace OpenRouter's catalog.
+    expect(modelStore.allModels.find((model) => model.id === "openrouter/claude-opus-4.8")?.isDefault).toBe(true);
   });
 
   it("exposes max and hides none for GPT-5.6", () => {
@@ -326,14 +311,12 @@ describe("useModelStore OpenAI effort mapping", () => {
   it("uses Claude model effort metadata from the catalog", () => {
     const modelStore = useModelStore();
 
-    modelStore.selectedModelId = "claude-opus-4.8";
-    expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
-
-    modelStore.selectedModelId = "claude-sonnet-5";
-    expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
-
-    modelStore.selectedModelId = "claude-fable-5";
-    expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
+    for (const id of ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"]) {
+      modelStore.selectedModelId = id;
+      expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
+    }
+    modelStore.selectedModelId = "claude-haiku-5-5";
+    expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "max"]);
   });
 
   it("keeps Claude CLI models hidden until the experimental setting is enabled", async () => {

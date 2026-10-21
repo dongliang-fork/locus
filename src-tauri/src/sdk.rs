@@ -131,28 +131,18 @@ const STATIC_MODELS: &[StaticModel] = &[
         provider_default: false,
     },
     StaticModel {
-        id: "claude-fable-5",
-        name: "Claude Fable 5[1m]",
+        id: "claude-opus-5-5",
+        name: "Claude Opus 5.5",
         provider: "anthropic",
-        context_window: Some(1_000_000),
-        default_effort: None,
-        supported_efforts: CLAUDE_XHIGH_EFFORTS,
-        additional_speed_tiers: NO_SPEED_TIERS,
-        provider_default: false,
-    },
-    StaticModel {
-        id: "claude-opus-4.8",
-        name: "Claude Opus 4.8[1m]",
-        provider: "anthropic",
-        context_window: Some(1_000_000),
+        context_window: None,
         default_effort: None,
         supported_efforts: CLAUDE_XHIGH_EFFORTS,
         additional_speed_tiers: NO_SPEED_TIERS,
         provider_default: true,
     },
     StaticModel {
-        id: "claude-sonnet-5",
-        name: "Claude Sonnet 5[1m]",
+        id: "claude-fable-5-1",
+        name: "Claude Fable 5.1",
         provider: "anthropic",
         context_window: Some(1_000_000),
         default_effort: None,
@@ -161,10 +151,20 @@ const STATIC_MODELS: &[StaticModel] = &[
         provider_default: false,
     },
     StaticModel {
-        id: "claude-opus-4.6",
-        name: "Claude Opus 4.6[1m]",
+        id: "claude-sonnet-5-5",
+        name: "Claude Sonnet 5.5",
         provider: "anthropic",
         context_window: Some(1_000_000),
+        default_effort: None,
+        supported_efforts: CLAUDE_XHIGH_EFFORTS,
+        additional_speed_tiers: NO_SPEED_TIERS,
+        provider_default: false,
+    },
+    StaticModel {
+        id: "claude-haiku-5-5",
+        name: "Claude Haiku 5.5",
+        provider: "anthropic",
+        context_window: None,
         default_effort: None,
         supported_efforts: CLAUDE_STANDARD_EFFORTS,
         additional_speed_tiers: NO_SPEED_TIERS,
@@ -415,7 +415,7 @@ struct RunEventsParams {
 #[serde(rename_all = "camelCase")]
 struct AnswerParams {
     question_id: String,
-    answer: String,
+    answer: Value,
 }
 
 fn default_true() -> bool {
@@ -2917,7 +2917,8 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
             let request:crate::merge_jobs::PrepareRequest=serde_json::from_value(params.clone()).map_err(|e|e.to_string())?;
             if request.project_id.as_ref().map(|id|id!=&scope.runtime().project_id().to_string()).unwrap_or(false){return Err("The destination checkout does not belong to project_id".into());}
             let destination=params.get("destination").cloned().unwrap_or_else(||json!({"kind":"checkout"}));
-            let job=crate::merge_jobs::coordination::run_blocking(_merge_guard,move||{let _scope=scope;crate::merge_jobs::prepare_with_destination(&root,&request,&destination)}).await??;
+            let policy=crate::commands::worktree_policy(&app.state::<Arc<crate::config::AppConfig>>(),&app.state::<Arc<crate::workspace_service::ProjectRegistry>>())?;
+            let job=crate::merge_jobs::coordination::run_blocking(_merge_guard,move||{let _scope=scope;crate::merge_jobs::prepare_with_destination(&root,&request,&destination,&policy)}).await??;
             let runtime=app.state::<Arc<crate::workspace_service::ProjectRegistry>>().register(&job.project_root)?;
             return Ok(json!({"workspace_ref":crate::workspace_service::WorkspaceRef::for_runtime(&runtime),"job":crate::merge_jobs::summary(&job)}));
         }
@@ -2928,7 +2929,10 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
             return crate::merge_jobs::validate_unity(&root,&job_id).await;
         }
         let action=action.to_string();
-        return crate::merge_jobs::coordination::run_blocking(_merge_guard,move||{let _scope=scope;crate::merge_jobs::execute(&root,&job_id,&action,params)}).await?;
+        let (sync_root,sync_id,is_apply)=(root.clone(),job_id.clone(),action=="apply");
+        let result=crate::merge_jobs::coordination::run_blocking(_merge_guard,move||{let _scope=scope;crate::merge_jobs::execute(&root,&job_id,&action,params)}).await??;
+        if is_apply { return Ok(crate::merge_jobs::sync_editor_after_apply(&sync_root,&sync_id,result).await); }
+        return Ok(result);
     }
     match method {
         "tasks.list" | "tasks.get" | "tasks.cancel" | "tasks.resume" | "tasks.wait" | "tasks.send_message" => {
@@ -3236,8 +3240,33 @@ mod tests {
         }
         assert!(ids.contains("openai/gpt-6-astra"));
         assert!(ids.contains("openai/gpt-5.6-sol"));
-        assert!(ids.contains("claude-opus-4.8"));
+        assert!(ids.contains("claude-opus-5-5"));
         assert!(ids.contains("openrouter/claude-opus-4.8"));
+    }
+
+    #[test]
+    fn sdk_anthropic_inventory_matches_current_subscription_models() {
+        let models: Vec<_> = STATIC_MODELS
+            .iter()
+            .filter(|model| model.provider == "anthropic")
+            .collect();
+        assert_eq!(
+            models.iter().map(|model| (model.id, model.name)).collect::<Vec<_>>(),
+            vec![
+                ("claude-opus-5-5", "Claude Opus 5.5"),
+                ("claude-fable-5-1", "Claude Fable 5.1"),
+                ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+                ("claude-haiku-5-5", "Claude Haiku 5.5"),
+            ]
+        );
+        assert_eq!(
+            models.iter().filter(|model| model.provider_default).map(|model| model.id).collect::<Vec<_>>(),
+            vec!["claude-opus-5-5"]
+        );
+        for model in &models[..3] {
+            assert_eq!(model.supported_efforts, super::CLAUDE_XHIGH_EFFORTS);
+        }
+        assert_eq!(models[3].supported_efforts, super::CLAUDE_STANDARD_EFFORTS);
     }
 
     #[test]
