@@ -1271,6 +1271,7 @@ function doConfirm() {
 
     <MergeQueuePanel
       v-if="rightPanelMode === 'merge'"
+      class="collab-side-panel"
       :unmerged-files="unmergedFiles"
       :staged-files="stagedFiles"
       :operation="mergeOperation"
@@ -1285,6 +1286,7 @@ function doConfirm() {
 
     <CommitDetail
       v-else-if="rightPanelMode === 'commit'"
+      class="collab-side-panel"
       :commit="selectedCommit"
       :commit-body="commitBody"
       :commit-files="commitFiles"
@@ -1299,6 +1301,7 @@ function doConfirm() {
 
     <StagingArea
       v-else
+      class="collab-side-panel"
       :unstaged-files="unstagedFiles"
       :staged-files="stagedFiles"
       :blocked-files="blockedFiles"
@@ -1424,6 +1427,33 @@ function doConfirm() {
   height: 100%;
   min-width: 0;
   background: var(--bg-color);
+  container: collab-view / inline-size;
+}
+
+/* Narrow layouts keep only the history column (graph + terminal). Inside the
+   collaboration page the page width decides, so the branch list and the side
+   panel collapse together; the standalone window falls back to its own width,
+   which stays below the page breakpoint minus the 260px branch list. */
+@container workbench-collab-page (max-width: 900px) {
+  .collab-view > .panel-divider-v,
+  .collab-view > .collab-side-panel {
+    display: none;
+  }
+
+  .collab-view > .left-area {
+    flex-grow: 1;
+  }
+}
+
+@container collab-view (max-width: 620px) {
+  .collab-view > .panel-divider-v,
+  .collab-view > .collab-side-panel {
+    display: none;
+  }
+
+  .collab-view > .left-area {
+    flex-grow: 1;
+  }
 }
 
 :deep(.vcs-init-overlay) {

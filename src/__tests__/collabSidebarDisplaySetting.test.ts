@@ -3,10 +3,7 @@ import { createApp, defineComponent, h, nextTick, reactive, ref, type App } from
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import CollabView from "../components/CollabView.vue";
 import WorkbenchSecondarySidebar from "../components/workbench/WorkbenchSecondarySidebar.vue";
-import { createWorkbenchEditorInput } from "../stores/workbench";
-import { findCollabSidebarOwner } from "../components/workbench/collabSidebarOwner";
 import type { GitCommitInfo, GitHistorySnapshot, GitStashEntry } from "../types";
-import type { WorkbenchEditorGroup } from "../types/workbench";
 
 const mocks = vi.hoisted(() => ({
   gitProbe: vi.fn(), gitHistorySnapshot: vi.fn(), gitBranches: vi.fn(),
@@ -180,24 +177,5 @@ describe("Collaboration secondary sidebar", () => {
     expect(host.querySelector(".git-sidebar")).toBeNull();
     expect(host.querySelector(".test-graph")).not.toBeNull();
     expect(mocks.selectHistory).not.toHaveBeenCalled();
-  });
-
-  it("keeps the original tab group as owner and follows tab moves instead of global focus", () => {
-    const editor = createWorkbenchEditorInput({ kind: "section", projectId: "p", section: "collab" }, "Collaboration", { checkoutBinding: workspace });
-    const session = createWorkbenchEditorInput({ kind: "session", projectId: "p", sessionId: "s" }, "Session");
-    const groups: Record<string, WorkbenchEditorGroup> = {
-      left: { paneId: "left", tabs: [editor, session], activeEditorId: session.editorId },
-      right: { paneId: "right", tabs: [], activeEditorId: null },
-    };
-    const target = { editorId: editor.editorId, checkoutId: workspace.checkoutId };
-    expect(findCollabSidebarOwner(groups, target)?.paneId).toBe("left");
-    groups.left!.tabs = [session];
-    groups.right!.tabs = [editor];
-    expect(findCollabSidebarOwner(groups, target)?.paneId).toBe("right");
-    expect(findCollabSidebarOwner(groups, { ...target, checkoutId: "checkout-b" })).toBeNull();
-    editor.availability = "unavailable";
-    expect(findCollabSidebarOwner(groups, target)).toBeNull();
-    groups.right!.tabs = [];
-    expect(findCollabSidebarOwner(groups, target)).toBeNull();
   });
 });

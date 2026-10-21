@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { createApp, h, nextTick } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WorkbenchSecondarySidebar from "../components/workbench/WorkbenchSecondarySidebar.vue";
-import { workspaceSecondaryResourceSection, workspaceSecondarySection } from "../components/workbench/workspaceSecondaryNavigation";
+import { isWorkspaceSecondarySection, workspaceOverlaySection, workspaceSecondaryResourceSection, workspaceSecondarySection } from "../components/workbench/workspaceSecondaryNavigation";
 import { createWorkbenchEditorInput, useWorkbenchStore, workbenchResourceKey } from "../stores/workbench";
 import { findFileHistorySidebarOwner } from "../components/workbench/fileHistorySidebarOwner";
 
@@ -47,24 +47,41 @@ describe("workspace secondary navigation", () => {
   });
 
   it("routes workspace list nodes to secondary navigation", () => {
-    expect(["knowledgeRoot", "assetsRoot", "viewsRoot", "archivedRoot", "agentsRoot", "sessionsRoot"].map(workspaceSecondarySection))
-      .toEqual(["knowledge", "assets", "views", "archived", "agents", "sessions"]);
-    for (const kind of ["collaboration", "checkout", "session", "knowledge", "localFile", "folder", "newSession"]) {
+    expect(["knowledgeRoot", "assetsRoot", "viewsRoot", "archivedRoot", "sessionsRoot"].map(workspaceSecondarySection))
+      .toEqual(["knowledge", "assets", "views", "archived", "sessions"]);
+    for (const kind of ["agentsRoot", "collaboration", "checkout", "session", "knowledge", "localFile", "folder", "newSession"]) {
       expect(workspaceSecondarySection(kind)).toBeNull();
     }
   });
 
-  it("restores individual Agent editors without turning them into list tabs", () => {
+  it("routes collaboration and Agent nodes to the workspace overlay", () => {
+    expect(["collaboration", "agentsRoot"].map(workspaceOverlaySection)).toEqual(["collab", "agents"]);
+    for (const kind of ["checkout", "knowledgeRoot", "assetsRoot", "viewsRoot", "archivedRoot", "sessionsRoot", "session", "newSession"]) {
+      expect(workspaceOverlaySection(kind)).toBeNull();
+    }
+  });
+
+  it("drops collaboration and Agent lists saved by earlier layouts", () => {
+    for (const section of ["knowledge", "assets", "views", "archived", "sessions", "archivedFiles", "fileHistory"]) {
+      expect(isWorkspaceSecondarySection(section)).toBe(true);
+    }
+    expect(isWorkspaceSecondarySection("collab")).toBe(false);
+    expect(isWorkspaceSecondarySection("agents")).toBe(false);
+  });
+
+  it("restores full Agent page tabs and individual Agent editors", () => {
     const store = useWorkbenchStore();
-    const list = { kind: "section", projectId: "p", section: "agents" } as const;
-    const agent = { ...list, agentId: "unity" };
-    expect(workspaceSecondaryResourceSection(list)).toBe("agents");
+    const page = { kind: "section", projectId: "p", section: "agents" } as const;
+    const agent = { ...page, agentId: "unity" };
+    expect(workspaceSecondaryResourceSection(page)).toBeNull();
     expect(workspaceSecondaryResourceSection(agent)).toBeNull();
+    expect(workbenchResourceKey(page)).not.toBe(workbenchResourceKey(agent));
     expect(workbenchResourceKey(agent)).not.toBe(workbenchResourceKey({ ...agent, agentId: "explorer" }));
+    store.openEditor("main", createWorkbenchEditorInput(page, "Agent", { pinned: true, preview: false }));
     store.openEditor("main", createWorkbenchEditorInput(agent, "Unity", { pinned: true, preview: false }));
     store.persist("main");
     setActivePinia(createPinia());
-    expect(useWorkbenchStore().ensureWindow("main").groups.main!.tabs[0]?.resource).toEqual(agent);
+    expect(useWorkbenchStore().ensureWindow("main").groups.main!.tabs.map(tab => tab.resource)).toEqual([page, agent]);
   });
 
   it("keeps archived conversations distinct from the old archived list tab across restore", () => {

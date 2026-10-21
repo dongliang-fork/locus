@@ -9,10 +9,11 @@ import WorktreeManager from "./WorktreeManager.vue";
 import WorkbenchEditorStack from "./WorkbenchEditorStack.vue";
 import { resolveWorkbenchSessionAvailability } from "./workbenchSessionAvailability";
 import { workbenchViewIconValue } from "./workbenchViewIcon";
+import { sessionTabWorkspaceLabels } from "./workbenchTabWorkspace";
 import type { ManagedWorktree } from "../../services/worktrees";
 import { beginWorkspaceGitHeadObservation, differingSessionBranchLabel, rememberWorkspaceGitHead, workspaceGitHead } from "../../services/workspaceGitHead";
 import { computed, nextTick, onMounted, onUnmounted, provide, reactive, ref, shallowReactive, watch } from "vue";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { emitTo, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow, type Window as TauriWindowHandle } from "@tauri-apps/api/window";
 import {
@@ -132,14 +133,15 @@ import { useNotificationStore } from "../../stores/notification";
 import { useProjectStore } from "../../stores/project";
 import { useUiStore } from "../../stores/ui";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
-import { workspaceMaterializationMatches } from "../../services/project";
+import { isManagedWorktreeCheckout, projectEntryCheckout, workspaceMaterializationMatches } from "../../services/project";
 import { workspaceRefForEditorBinding, editorBindingMatchesRuntime } from "./editorWorkspaceScope";
+import { lastSessionWorktree, rememberSessionWorktree } from "./sessionWorktreePreference";
 import { resolveWorkbenchFileTarget } from "./workbenchFileTarget";
 import { useWorkspaceExplorerStore } from "../../stores/workspaceExplorer";
 import { useWorkspaceNavigationMode, type WorkspaceNavigationMode } from "../../composables/useWorkspaceNavigationMode";
 import { useWorkspaceFileDrop } from "../../composables/useWorkspaceFileDrop";
 import { workspaceFileParent, workspaceMovedPath, workspaceRelativeEntryPath, type WorkspaceFileDropScope } from "../explorer/workspaceFileMove";
-import { workspaceCreateDocument } from "../../services/workspaceExplorer";
+import { workspaceCreateDocument, workspaceCreateFolder } from "../../services/workspaceExplorer";
 import { useWorkspaceFileOrderDrop, type WorkspaceOrderDragItem } from "../../composables/useWorkspaceFileOrderDrop";
 import { orderWorkspaceFileRows, workspaceFileOrderKey, workspaceNodeOrderKey, workspaceOrderDirectory } from "../explorer/workspaceFileOrder";
 import WorkspaceFileTreeSource from "../explorer/WorkspaceFileTreeSource.vue";
@@ -158,6 +160,7 @@ import {
 } from "../../stores/workbench";
 import type {
   DevelopmentResourceRef,
+  EditorCheckoutBinding,
   KnowledgeWorkbenchPage,
   ProjectExplorerMountEntry,
   ProjectExplorerNode,
@@ -172,15 +175,15 @@ import type {
   WorkbenchEditorTransferSnapshot,
   WorkbenchWindowDropIntent,
 } from "../../types/workbench";
-import type { AgentInfo, AssetRefAttachment, KnowledgeDocumentSummary, KnowledgeDocumentType, SessionSummary } from "../../types";
+import type { AssetRefAttachment, KnowledgeDocumentSummary, KnowledgeDocumentType, SessionSummary } from "../../types";
 import type { UserMessageDraft } from "../../composables/chatMessageDraft";
 import {
   KNOWLEDGE_QUOTE_SELECTION_KEY,
   type KnowledgeQuoteSelection,
 } from "../../services/knowledgeSelection";
+import { createDocumentSelectionHub, DOCUMENT_SELECTION_HUB_KEY } from "../../composables/documentSelection";
 import { clearSharedComposerDraft } from "../../composables/chatComposerDraftMemory";
 import { emptyComposerIntent } from "../../composables/chatInputIntents";
-import CollabView from "../CollabView.vue";
 import AssetView from "../AssetView.vue";
 import AgentView from "../AgentView.vue";
 import KnowledgeView from "../KnowledgeView.vue";
@@ -195,8 +198,15 @@ import WorkbenchViewEditor from "./WorkbenchViewEditor.vue";
 import WorkbenchArchivedSessionsEditor from "./WorkbenchArchivedSessionsEditor.vue";
 import WorkbenchSecondarySidebar from "./WorkbenchSecondarySidebar.vue";
 import { cancelWorkbenchSidebarMotion, enterWorkbenchSidebar, leaveWorkbenchSidebar } from "./workbenchSidebarMotion";
-import { workspaceSecondarySection, workspaceSecondaryResourceSection, type WorkspaceSecondarySection } from "./workspaceSecondaryNavigation";
-import { findCollabSidebarOwner, isCollabEditor } from "./collabSidebarOwner";
+import {
+  isWorkspaceSecondarySection,
+  workspaceOverlaySection,
+  workspaceSecondarySection,
+  workspaceSecondaryResourceSection,
+  type WorkspaceOverlaySection,
+  type WorkspaceSecondarySection,
+} from "./workspaceSecondaryNavigation";
+import WorkbenchCollabPage from "./WorkbenchCollabPage.vue";
 import { findFileHistorySidebarOwner } from "./fileHistorySidebarOwner";
 import type { FileHistoryTarget } from "../../services/fileHistory";
 import FileHistoryPanel from "../explorer/FileHistoryPanel.vue";
@@ -468,6 +478,8 @@ interface DevelopmentContextMenuState {
   y: number;
   item: DevelopmentTreeItem;
   sessionTargets?: DevelopmentSessionTarget[];
+  /** Set only when a file-mode menu applies to more than one selected row. */
+  fileTargets?: DevelopmentTreeItem[];
 }
 
 interface FolderDialogState {
@@ -485,10 +497,6 @@ interface WorkspaceInlineCreateState {
   fileTarget?: WorkspaceFileDropScope;
 }
 
-interface CollabHeadFocusRequest {
-  id: number;
-  checkoutId: string;
-}
 
 interface PresetDialogState {
   mode: "create" | "rename" | "delete";
@@ -661,9 +669,90 @@ const secondaryNavigation = ref<{
   projectId: string;
   checkoutId: string;
   editorId?: string;
-} | null>(restoredNavigation?.secondary ?? null);
-const collabSidebarTarget = ref<HTMLElement | null>(null);
-const collabSidebarToolbarTarget = ref<HTMLElement | null>(null);
+} | null>(restoredNavigation?.secondary && isWorkspaceSecondarySection(restoredNavigation.secondary.section)
+  ? restoredNavigation.secondary
+  : null);
+
+interface WorkspaceOverlayTarget {
+  section: WorkspaceOverlaySection;
+  projectId: string;
+  checkoutId: string;
+}
+// Collaboration and Agent pages cover the secondary list and editor tabs
+// without changing them, so closing the overlay restores the previous layout.
+const workspaceOverlay = ref<WorkspaceOverlayTarget | null>(null);
+// The last page of each section stays mounted while hidden to keep its state.
+const workspaceOverlayPages = ref<Partial<Record<WorkspaceOverlaySection, WorkspaceOverlayTarget>>>({});
+const collabOverlayToolbarTarget = ref<HTMLElement | null>(null);
+let workspaceOverlayRequestId = 0;
+
+function workspaceOverlayPage(section: WorkspaceOverlaySection) {
+  const target = workspaceOverlayPages.value[section];
+  const checkout = target ? workspaceContextBaseStore.checkoutsById[target.checkoutId] : null;
+  if (!target || checkout?.available === false || !checkout?.runtime) return null;
+  const workspaceRef: WorkspaceRef = {
+    checkoutId: checkout.checkoutId,
+    expectedGeneration: checkout.runtime.workspaceGeneration,
+    expectedMaterializationEpoch: checkout.runtime.materializationEpoch,
+  };
+  return { target, root: checkout.root, workspaceRef };
+}
+const collabOverlayPage = computed(() => workspaceOverlayPage("collab"));
+const agentOverlayPage = computed(() => workspaceOverlayPage("agents"));
+const workspaceOverlayOpen = computed(() => {
+  const overlay = workspaceOverlay.value;
+  if (!overlay || !props.showExplorer) return false;
+  const page = overlay.section === "collab" ? collabOverlayPage.value : agentOverlayPage.value;
+  return page?.target.checkoutId === overlay.checkoutId;
+});
+const collabOverlayActive = computed(() => workspaceOverlayOpen.value && workspaceOverlay.value?.section === "collab");
+const agentOverlayActive = computed(() => workspaceOverlayOpen.value && workspaceOverlay.value?.section === "agents");
+const workspaceOverlayTitle = computed(() => (
+  workspaceOverlay.value?.section === "agents" ? t("app.tab.agent") : t("app.tab.collab")
+));
+const workspaceOverlaySubtitle = computed(() => {
+  const overlay = workspaceOverlay.value;
+  if (!overlay) return null;
+  const project = workspaceContextStore.projectsById[overlay.projectId];
+  const root = workspaceContextBaseStore.checkoutsById[overlay.checkoutId]?.root;
+  if (!project || !root) return null;
+  // Name the checkout only when the explorer header does not already identify it.
+  return project.checkouts.length > 1 || displaySettings.workspaceDisplayMode === "multi"
+    ? { label: shortPath(root), title: root }
+    : null;
+});
+
+function workspaceOverlayIsOpen(projectId: string, section: WorkspaceOverlaySection): boolean {
+  const overlay = workspaceOverlay.value;
+  return workspaceOverlayOpen.value && overlay?.projectId === projectId && overlay.section === section;
+}
+
+function closeWorkspaceOverlay(): void {
+  workspaceOverlayRequestId += 1;
+  workspaceOverlay.value = null;
+}
+
+async function showWorkspaceOverlay(
+  section: WorkspaceOverlaySection,
+  projectId: string,
+  checkout: WorkspaceCheckoutDescriptor,
+): Promise<void> {
+  const requestId = ++workspaceOverlayRequestId;
+  const target: WorkspaceOverlayTarget = { section, projectId, checkoutId: checkout.checkoutId };
+  // Record the intent first so a second click can cancel a cold checkout open.
+  workspaceOverlay.value = target;
+  try {
+    if (!workspaceContextBaseStore.checkoutsById[checkout.checkoutId]?.runtime) {
+      await workspaceContextBaseStore.openCheckout(checkout.root);
+    }
+  } catch (error) {
+    if (requestId === workspaceOverlayRequestId) closeWorkspaceOverlay();
+    throw error;
+  }
+  if (requestId !== workspaceOverlayRequestId) return;
+  workspaceOverlayPages.value = { ...workspaceOverlayPages.value, [section]: target };
+}
+
 const fileHistorySidebarTarget = ref<HTMLElement | null>(null);
 const fileHistorySidebarToolbarTarget = ref<HTMLElement | null>(null);
 const fileHistorySidebarOwner = computed(() => {
@@ -705,29 +794,6 @@ async function openFileHistory(target: FileHistoryTarget): Promise<void> {
     showFileHistorySecondarySidebar(editor);
   } catch (error) { notificationStore.addNotice("error", normalizeAppError(error).message); }
 }
-const collabSidebarOwner = computed(() => {
-  const target = secondaryNavigation.value;
-  if (target?.section !== "collab") return null;
-  const owner = findCollabSidebarOwner(workbenchWindow.value.groups, target);
-  const runtime = workspaceContextBaseStore.checkoutsById[target.checkoutId]?.runtime;
-  return owner && editorBindingMatchesRuntime(owner.editor.checkoutBinding, runtime) ? owner : null;
-});
-
-function showCollabSecondarySidebar(editor: WorkbenchEditorInput): void {
-  if (!editor.checkoutBinding || editor.availability === "unavailable") return;
-  if (!isCollabEditor(editor)) return;
-  secondaryNavigationRequestId += 1;
-  secondaryNavigation.value = {
-    section: "collab",
-    projectId: editor.resource.projectId,
-    checkoutId: editor.checkoutBinding.checkoutId,
-    editorId: editor.editorId,
-  };
-}
-
-watch(collabSidebarOwner, owner => {
-  if (secondaryNavigation.value?.section === "collab" && !owner) closeSecondaryNavigation();
-});
 let secondaryNavigationRequestId = 0;
 const secondaryCheckout = computed(() => {
   const target = secondaryNavigation.value;
@@ -745,11 +811,9 @@ const secondaryWorkspaceRef = computed<WorkspaceRef | null>(() => {
 const secondaryTitle = computed(() => {
   switch (secondaryNavigation.value?.section) {
     case "fileHistory": return t("fileHistory.title");
-    case "collab": return t("app.tab.collab");
     case "knowledge": return t("app.tab.knowledge");
     case "assets": return t("app.tab.asset");
     case "sessions": return t("development.sessions");
-    case "agents": return t("app.tab.agent");
     case "views": return t("app.tab.views");
     case "archived": return t("app.tab.archived");
     case "archivedFiles": return t("development.archivedFiles");
@@ -775,6 +839,17 @@ function secondarySectionIsOpen(projectId: string, section: WorkspaceSecondarySe
 
 watch(workbenchWorkspaceScopeId, (scopeId) => {
   if (scopeId && secondaryNavigation.value?.checkoutId !== scopeId) closeSecondaryNavigation();
+  if (scopeId && workspaceOverlay.value && workspaceOverlay.value.checkoutId !== scopeId) closeWorkspaceOverlay();
+});
+
+// Opening another list belongs to the covered layout, so reveal it.
+watch(secondaryNavigation, (navigation) => {
+  if (navigation) closeWorkspaceOverlay();
+});
+
+watch(() => [displaySettings.workspaceSectionVisibility.collab, displaySettings.showAgentTab] as const, ([collab, agents]) => {
+  const section = workspaceOverlay.value?.section;
+  if ((section === "collab" && !collab) || (section === "agents" && !agents)) closeWorkspaceOverlay();
 });
 
 async function showSecondaryNavigation(
@@ -851,26 +926,6 @@ async function openSecondaryFile(file: { path: string; name: string }): Promise<
     title: file.name,
     checkoutId: target.checkoutId,
   });
-}
-
-async function openSecondaryAgent(agent: AgentInfo): Promise<void> {
-  const target = secondaryNavigation.value;
-  if (!target) return;
-  const resource: DevelopmentResourceRef = { kind: "section", projectId: target.projectId, section: "agents", agentId: agent.id };
-  const existing = matchingWorkbenchEditors(resource).find(match => match.editor.checkoutBinding?.checkoutId === target.checkoutId
-    && match.editor.availability !== "unavailable" && editorBindingMatchesRuntime(match.editor.checkoutBinding, secondaryCheckout.value?.runtime));
-  try {
-    if (existing) {
-      workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, existing.paneId, existing.editor.editorId, { title: agent.name });
-      await focusWorkbenchEditor(existing.paneId, existing.editor.editorId);
-    } else {
-      await openWorkbenchResource({ resource, title: agent.name, checkoutId: target.checkoutId }, {
-        preview: false, pinned: true, allowDuplicate: true,
-      });
-    }
-  } catch (error) {
-    notificationStore.addNotice("error", normalizeAppError(error).message);
-  }
 }
 
 async function openSecondaryKnowledgePage(page: KnowledgeWorkbenchPage): Promise<void> {
@@ -981,15 +1036,11 @@ const collapsedSessionParents = ref<Set<string>>(new Set());
 const activeResource = ref<DevelopmentResourceRef | null>(
   workbenchStore.activeEditor(WORKBENCH_WINDOW_ID)?.resource ?? null,
 );
-const secondaryAgentId = computed(() => {
-  const editor = workbenchStore.activeEditor(WORKBENCH_WINDOW_ID);
-  const target = secondaryNavigation.value;
-  return target?.section === "agents" && editor?.checkoutBinding?.checkoutId === target.checkoutId
-    && editor.resource.kind === "section" && editor.resource.section === "agents"
-    ? editor.resource.agentId : undefined;
-});
 const selectedSessionIds = ref<Set<string>>(new Set());
 const lastSessionSelectionAnchorId = ref<string | null>(null);
+// File-mode rows are selected by tree key; Ctrl/Shift selection stays within one checkout.
+const selectedFileKeys = ref<Set<string>>(new Set());
+const lastFileSelectionAnchorKey = ref<string | null>(null);
 const contextMenu = ref<DevelopmentContextMenuState | null>(null);
 const contextCanEditLayout = computed(() => {
   const item = contextMenu.value?.item;
@@ -998,6 +1049,10 @@ const contextCanEditLayout = computed(() => {
   return (item.meta.kind === "project" || item.meta.kind === "newSession")
     && workspaceNavigation.getMode(navigationCheckout(item.meta.projectId)?.checkoutId) === "sessions";
 });
+/** Multi-workspace trees manage their root workspaces from project rows and the empty area. */
+const contextCanManageWorkspaces = computed(() => !props.fixedWorkspaceRef
+  && displaySettings.workspaceDisplayMode === "multi"
+  && contextMenu.value?.item.meta.kind === "project");
 const resourceActions = ref<InstanceType<typeof ExplorerResourceActions> | null>(null);
 const viewResourceActions = ref<InstanceType<typeof ViewResourceActions> | null>(null);
 const contextViewTarget = computed(() => contextMenu.value?.item.meta.kind === "view" ? contextMenu.value.item.meta.view : null);
@@ -1145,6 +1200,9 @@ const dragging = computed<DevelopmentTreeItem | null>(() => {
   if (source?.payload.type !== WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE) return null;
   return (source.payload.data as WorkspaceLayoutInternalDragData).item;
 });
+// Dragging a workspace item that opens a tab reveals the covered editor groups as drop targets.
+const workspaceOverlayShown = computed(() => workspaceOverlayOpen.value
+  && !(dragging.value && treeEditorDescriptor(dragging.value)));
 const dropTargetKey = ref<string | null>(null);
 const layoutDropIntent = ref<LayoutDropIntent | null>(null);
 const FOLDER_DRAG_EXPAND_DELAY_MS = 800;
@@ -1337,8 +1395,6 @@ const WORKSPACE_SPECIAL_NODE_DEFINITIONS: ReadonlyArray<{
   { resourceId: AGENTS_SYSTEM_RESOURCE_ID, labelKey: "app.tab.agent", icon: Bot },
   { resourceId: ARCHIVED_SYSTEM_RESOURCE_ID, labelKey: "app.tab.archived", icon: Archive },
 ];
-const collabHeadFocusRequest = ref<CollabHeadFocusRequest | null>(null);
-let collabHeadFocusRequestId = 0;
 
 const visibleProjects = computed<ProjectContextDescriptor[]>(() => {
   if (props.fixedWorkspaceRef) {
@@ -1360,16 +1416,28 @@ const visibleProjects = computed<ProjectContextDescriptor[]>(() => {
   return focused ? [focused] : [];
 });
 
+const explorerHeaderCheckout = computed<WorkspaceCheckoutDescriptor | null>(() => {
+  const scopedCheckoutId = singleWorkspaceScopeId.value
+    ?? workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID);
+  return (scopedCheckoutId ? workspaceContextStore.checkoutsById[scopedCheckoutId] : null)
+    ?? workspaceContextStore.focusedCheckout
+    ?? visibleProjects.value[0]?.checkouts[0]
+    ?? null;
+});
+
+/** Worktrees are entered through their source workspace, so the header names it. */
+const explorerHeaderEntryCheckout = computed(() => {
+  const checkout = explorerHeaderCheckout.value;
+  return checkout
+    ? projectEntryCheckout(workspaceContextStore.projectsById[checkout.projectId], checkout)
+    : null;
+});
+
 const explorerHeaderLabel = computed(() => {
   if (!props.fixedWorkspaceRef && displaySettings.workspaceDisplayMode === "multi") {
     return t("development.explorer");
   }
-  const scopedCheckoutId = singleWorkspaceScopeId.value
-    ?? workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID);
-  const root = (scopedCheckoutId ? workspaceContextStore.checkoutsById[scopedCheckoutId]?.root : null)
-    ?? workspaceContextStore.focusedCheckout?.root
-    ?? visibleProjects.value[0]?.checkouts[0]?.root
-    ?? "";
+  const root = explorerHeaderEntryCheckout.value?.root ?? "";
   return root ? shortPath(root) : t("development.explorer");
 });
 
@@ -1428,12 +1496,12 @@ async function openGlobalSearchResult(hit: GlobalSearchResult): Promise<void> {
 
 const explorerHeaderTitle = computed(() => {
   if (!props.fixedWorkspaceRef && displaySettings.workspaceDisplayMode === "multi") return undefined;
-  const scopedCheckoutId = singleWorkspaceScopeId.value
-    ?? workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID);
-  return (scopedCheckoutId ? workspaceContextStore.checkoutsById[scopedCheckoutId]?.root : null)
-    ?? workspaceContextStore.focusedCheckout?.root
-    ?? visibleProjects.value[0]?.checkouts[0]?.root
-    ?? undefined;
+  const checkout = explorerHeaderCheckout.value;
+  const entry = explorerHeaderEntryCheckout.value;
+  if (!checkout) return undefined;
+  return entry && entry.checkoutId !== checkout.checkoutId
+    ? `${entry.root}\n${checkout.root}`
+    : checkout.root;
 });
 
 const presetProjectId = computed(() => activeResource.value?.projectId
@@ -1549,6 +1617,7 @@ function setNavigationMode(mode: WorkspaceNavigationMode, checkout = navigationM
   displayMenu.value = null;
   contextMenu.value = null;
   resetSessionMultiSelection();
+  resetFileMultiSelection();
   if (secondaryNavigation.value?.checkoutId === checkout.checkoutId
     && (secondaryNavigation.value.section === "sessions" || secondaryNavigation.value.section === "assets"
       || secondaryNavigation.value.section === "archivedFiles")) {
@@ -1634,7 +1703,10 @@ function normalizedWorkspacePath(path: string): string {
 }
 
 function isCurrentWorkspacePath(path: string): boolean {
-  const current = workspaceContextStore.focusedCheckout?.root ?? "";
+  const focused = workspaceContextStore.focusedCheckout;
+  const current = focused
+    ? projectEntryCheckout(workspaceContextStore.projectsById[focused.projectId], focused)?.root ?? ""
+    : "";
   return normalizedWorkspacePath(path) === normalizedWorkspacePath(current);
 }
 
@@ -1752,9 +1824,10 @@ function knowledgeDocumentMatchesPendingSelection(
 }
 
 function projectLabel(project: ProjectContextDescriptor): string {
-  const preferred = project.checkouts.find(
+  const focused = project.checkouts.find(
     (checkout) => checkout.checkoutId === workspaceContextStore.focusedCheckout?.checkoutId,
   ) ?? project.checkouts[0];
+  const preferred = projectEntryCheckout(project, focused);
   return preferred ? shortPath(preferred.root) : project.projectId;
 }
 
@@ -1980,6 +2053,15 @@ function resetSessionMultiSelection(): void {
   lastSessionSelectionAnchorId.value = null;
 }
 
+function clearFileMultiSelection(): void {
+  if (selectedFileKeys.value.size > 0) selectedFileKeys.value = new Set();
+}
+
+function resetFileMultiSelection(): void {
+  clearFileMultiSelection();
+  lastFileSelectionAnchorKey.value = null;
+}
+
 function checkoutBranchLabel(projectId: string, checkoutId?: string): string {
   if (!checkoutId) return "";
   const checkout = explorerStore.resources[projectId]?.collaboration?.checkouts.find(
@@ -2118,6 +2200,54 @@ function titleForResource(resource: DevelopmentResourceRef, sourcePath?: string 
   }
 }
 
+/**
+ * Layout checkout for a session that runs in `target`, or null when its tab
+ * belongs to `target` itself. A worktree is chosen per session: a
+ * single-workspace window keeps the tab in its current workspace of the same
+ * project, and a Locus-managed worktree is otherwise placed under its source
+ * checkout. Selecting or reopening a worktree session therefore never moves
+ * the workbench scope, pane focus or header to the worktree.
+ */
+function sessionLayoutCheckoutId(projectId: string, target: WorkspaceCheckoutDescriptor): string | null {
+  if (usesCheckoutScopedWorkbench()) {
+    const scopeId = workbenchWorkspaceScopeId.value;
+    const scope = scopeId ? workspaceContextStore.checkoutsById[scopeId] : null;
+    if (scope?.projectId === projectId && (props.fixedWorkspaceRef || !isManagedWorktreeCheckout(scope))) {
+      return scope.checkoutId === target.checkoutId ? null : scope.checkoutId;
+    }
+  }
+  if (!isManagedWorktreeCheckout(target)) return null;
+  const entry = projectEntryCheckout(workspaceContextStore.projectsById[projectId], target);
+  return entry && entry.checkoutId !== target.checkoutId ? entry.checkoutId : null;
+}
+
+/** The workspace a descriptor's tab belongs to; a session held per checkout stays in the current layout. */
+function descriptorLayoutCheckoutId(descriptor: TreeEditorDescriptor): string | null {
+  const checkoutId = descriptor.checkoutId?.trim();
+  if (!checkoutId) return null;
+  const checkout = workspaceContextStore.checkoutsById[checkoutId];
+  const resource = descriptor.resource;
+  if (!checkout || (resource.kind !== "session" && resource.kind !== "newSession")) return checkoutId;
+  return sessionLayoutCheckoutId(resource.projectId, checkout) ?? checkoutId;
+}
+
+/** New sessions start in the worktree last chosen for the project while it still holds that assignment. */
+function defaultNewSessionWorktree(projectId: string): {
+  checkout: WorkspaceCheckoutDescriptor;
+  materializationEpoch: number | null;
+} | null {
+  if (!displaySettings.worktreeEnabled || props.fixedWorkspaceRef) return null;
+  const preference = lastSessionWorktree(projectId);
+  const checkout = preference ? workspaceContextStore.checkoutsById[preference.checkoutId] : null;
+  if (!preference || !checkout || checkout.projectId !== projectId || checkout.available === false
+    || !isManagedWorktreeCheckout(checkout)) return null;
+  // A recycled pool slot holds another branch now.
+  if (checkout.runtime && !workspaceMaterializationMatches(preference.materializationEpoch, checkout.runtime.materializationEpoch)) {
+    return null;
+  }
+  return { checkout, materializationEpoch: preference.materializationEpoch };
+}
+
 function createEditorForResource(
   resource: DevelopmentResourceRef,
   options: {
@@ -2130,24 +2260,51 @@ function createEditorForResource(
   } = {},
 ): WorkbenchEditorInput {
   const paneId = options.paneId ?? workbenchWindow.value.focusedPaneId;
-  const checkoutId = preferredCheckoutIdForResource(resource, paneId, options.checkoutId);
-  const checkout = checkoutId ? workspaceContextStore.checkoutsById[checkoutId] : null;
+  let checkoutId = preferredCheckoutIdForResource(resource, paneId, options.checkoutId);
+  let checkout = checkoutId ? workspaceContextStore.checkoutsById[checkoutId] : null;
   const sessionBinding=resource.kind === "session"
     ? explorerStore.resources[resource.projectId]?.sessions.find((session)=>session.id===resource.sessionId)
       ?? chatStore.sessions.find((session)=>session.id===resource.sessionId)
     : undefined;
-  const materializationEpoch=sessionBinding?.defaultCheckoutId===checkoutId
+  let materializationEpoch=sessionBinding?.defaultCheckoutId===checkoutId
     ? sessionBinding.defaultMaterializationEpoch : checkout?.runtime?.materializationEpoch ?? null;
+  if (resource.kind === "newSession" && (!checkout || !isManagedWorktreeCheckout(checkout))) {
+    const remembered = defaultNewSessionWorktree(resource.projectId);
+    if (remembered) {
+      checkout = remembered.checkout;
+      checkoutId = checkout.checkoutId;
+      materializationEpoch = remembered.materializationEpoch ?? checkout.runtime?.materializationEpoch ?? null;
+    }
+  }
+  // A session in another checkout of the project keeps its tab in the
+  // workspace layout; only the conversation runs in that checkout.
+  let layoutCheckoutId = checkoutId;
+  let sessionCheckout: EditorCheckoutBinding | null = null;
+  if (checkoutId && checkout && (resource.kind === "session" || resource.kind === "newSession")) {
+    const sessionLayoutId = sessionLayoutCheckoutId(resource.projectId, checkout);
+    if (sessionLayoutId) {
+      sessionCheckout = {
+        checkoutId,
+        expectedGeneration: checkout.runtime?.workspaceGeneration ?? null,
+        expectedMaterializationEpoch: materializationEpoch,
+      };
+      layoutCheckoutId = sessionLayoutId;
+    }
+  }
+  const layoutCheckout = layoutCheckoutId ? workspaceContextStore.checkoutsById[layoutCheckoutId] : null;
   return createWorkbenchEditorInput(resource, options.title ?? titleForResource(resource, options.sourcePath), {
     preview: options.preview ?? true,
     pinned: options.pinned ?? false,
-    checkoutBinding: checkoutId
+    checkoutBinding: layoutCheckoutId
       ? {
-          checkoutId,
-          expectedGeneration: checkout?.runtime?.workspaceGeneration ?? null,
-          expectedMaterializationEpoch: materializationEpoch,
+          checkoutId: layoutCheckoutId,
+          expectedGeneration: layoutCheckout?.runtime?.workspaceGeneration ?? null,
+          expectedMaterializationEpoch: sessionCheckout
+            ? layoutCheckout?.runtime?.materializationEpoch ?? null
+            : materializationEpoch,
         }
       : null,
+    sessionCheckout,
     sourcePath: options.sourcePath ?? null,
     capabilities: resource.kind === "fileHistory"
       ? { split: false, detach: false, duplicate: false }
@@ -2162,6 +2319,19 @@ function createEditorForResource(
 function treeEditorDescriptor(item: DevelopmentTreeItem): TreeEditorDescriptor | null {
   if (workspaceSecondarySection(item.meta.kind)) return null;
   switch (item.meta.kind) {
+    // A click covers the tabs with these pages; dragging them opens a full-page tab.
+    case "collaboration":
+      return {
+        resource: { kind: "section", projectId: item.meta.projectId, section: "collab" },
+        title: t("app.tab.collab"),
+        checkoutId: item.meta.checkoutId,
+      };
+    case "agentsRoot":
+      return {
+        resource: { kind: "section", projectId: item.meta.projectId, section: "agents" },
+        title: t("app.tab.agent"),
+        checkoutId: item.meta.checkoutId,
+      };
     case "view":
       return item.meta.explorerNode?.resourceId ? {
         resource: { kind: "view", projectId: item.meta.projectId, viewId: item.meta.explorerNode.resourceId },
@@ -2179,21 +2349,6 @@ function treeEditorDescriptor(item: DevelopmentTreeItem): TreeEditorDescriptor |
         title: item.treeRow?.name ?? t("chat.session.newSession"),
         checkoutId: item.meta.checkoutId,
       };
-    case "collaboration":
-      return {
-        resource: { kind: "section", projectId: item.meta.projectId, section: "collab" },
-        title: item.treeRow?.name ?? t("app.tab.collab"),
-      };
-    case "checkout":
-      return item.meta.checkoutId ? {
-        resource: {
-          kind: "checkout",
-          projectId: item.meta.projectId,
-          checkoutId: item.meta.checkoutId,
-        },
-        title: item.treeRow?.name ?? item.meta.checkoutId,
-        checkoutId: item.meta.checkoutId,
-      } : null;
     case "folder":
       if (!item.meta.explorerNode) return null;
       return item.meta.explorerNode.sourcePath ? {
@@ -2282,6 +2437,8 @@ async function focusWorkbenchEditor(
 ): Promise<void> {
   const focusPane = options.focusPane !== false;
   const paneWasFocused = workbenchWindow.value.focusedPaneId === paneId;
+  // Revealing an editor exits the collaboration or Agent overlay.
+  closeWorkspaceOverlay();
   if (!workbenchStore.activateEditor(
     WORKBENCH_WINDOW_ID,
     paneId,
@@ -2349,14 +2506,7 @@ async function focusWorkbenchEditor(
   if ((focusPane || paneWasFocused)
     && workbenchWindow.value.focusedPaneId === paneId
     && workbenchWindow.value.groups[paneId]?.activeEditorId === editorId) {
-    showCollabSecondarySidebar(editor);
     showFileHistorySecondarySidebar(editor);
-    if (editor.resource.kind === "section" && editor.resource.section === "agents" && editor.checkoutBinding) {
-      secondaryNavigationRequestId += 1;
-      secondaryNavigation.value = {
-        section: "agents", projectId: editor.resource.projectId, checkoutId: editor.checkoutBinding.checkoutId,
-      };
-    }
   }
 }
 
@@ -2701,9 +2851,14 @@ async function executeWorkspaceSessionTreeNavigation(
     });
     const descriptor = treeEditorDescriptor(item);
     if (!checkout || !descriptor) return null;
+    // A session continues in its own checkout (such as its worktree) when
+    // that checkout is held per session rather than as the workspace.
+    const target = workspaceContextStore.checkoutsById[item.meta.session.executionTarget?.checkoutId ?? ""];
+    const runsInOwnCheckout = !!target && target.projectId === project.projectId
+      && target.available !== false && !!sessionLayoutCheckoutId(project.projectId, target);
     return await openWorkspaceSessionDescriptor({
       ...descriptor,
-      checkoutId: checkout.checkoutId,
+      checkoutId: runsInOwnCheckout ? target.checkoutId : checkout.checkoutId,
     }, mode);
   } catch (error) {
     notificationStore.addNotice("error", normalizeAppError(error).message);
@@ -2953,7 +3108,7 @@ async function splitFocusedWorkbenchEditor(
   const duplicate = createEditorForResource(editor.resource, {
     paneId,
     title: editor.title,
-    checkoutId: editor.checkoutBinding?.checkoutId,
+    checkoutId: editorExecutionBinding(editor)?.checkoutId,
     sourcePath: editor.sourcePath,
     preview: false,
     pinned: true,
@@ -2999,11 +3154,17 @@ function handleWorkbenchKeydown(event: KeyboardEvent): void {
   }
 }
 
+/** Where the editor operates: a session's own checkout, otherwise its layout checkout. */
+function editorExecutionBinding(editor: WorkbenchEditorInput): EditorCheckoutBinding | null {
+  return editor.sessionCheckout ?? editor.checkoutBinding ?? null;
+}
+
 function editorWorkspaceRef(editor: WorkbenchEditorInput): WorkspaceRef | null {
-  const checkoutId = editor.checkoutBinding?.checkoutId;
+  const binding = editorExecutionBinding(editor);
+  const checkoutId = binding?.checkoutId;
   if (!checkoutId) return null;
   const runtime = workspaceContextStore.checkoutsById[checkoutId]?.runtime;
-  const reference=workspaceRefForEditorBinding(editor.checkoutBinding,runtime)!;
+  const reference=workspaceRefForEditorBinding(binding,runtime)!;
   const expectedGeneration = reference.expectedGeneration;
   const expectedMaterializationEpoch=reference.expectedMaterializationEpoch;
   const cached = editorWorkspaceRefs.get(checkoutId);
@@ -3018,7 +3179,7 @@ function editorWorkspaceRef(editor: WorkbenchEditorInput): WorkspaceRef | null {
 }
 
 function editorWorkingDir(editor: WorkbenchEditorInput): string {
-  const checkoutId = editor.checkoutBinding?.checkoutId;
+  const checkoutId = (editor.sessionCheckout ?? editor.checkoutBinding)?.checkoutId;
   return checkoutId ? workspaceContextStore.checkoutsById[checkoutId]?.root ?? "" : "";
 }
 
@@ -3089,6 +3250,25 @@ function workbenchViewIcon(editor: WorkbenchEditorInput): string | null | undefi
   return workbenchViewIconValue(editor, workbenchViewIcons, explorerStore.viewResources);
 }
 
+function editorWorkspaceLabel(editor: WorkbenchEditorInput): string | null {
+  const project = workspaceContextBaseStore.projectsById[editor.resource.projectId];
+  if (!project) return null;
+  const bound = editor.checkoutBinding
+    ? workspaceContextBaseStore.checkoutsById[editor.checkoutBinding.checkoutId]
+    : null;
+  const entry = bound ? projectEntryCheckout(project, bound) : null;
+  return entry ? shortPath(entry.root) : projectLabel(project);
+}
+
+const workbenchTabWorkspaceLabels = computed(() => sessionTabWorkspaceLabels(
+  Object.values(workbenchWindow.value.groups),
+  editorWorkspaceLabel,
+));
+
+function workbenchTabWorkspaceLabel(editor: WorkbenchEditorInput): string | null {
+  return workbenchTabWorkspaceLabels.value.get(editor.editorId) ?? null;
+}
+
 async function ensureWorkbenchViewEditorReady(editorId: string): Promise<void> {
   const editor = Object.values(workbenchWindow.value.groups)
     .flatMap((group) => group.tabs)
@@ -3153,6 +3333,8 @@ async function openViewInWorkbench(payload: ViewWorkbenchOpenPayload): Promise<v
 
 provide(WORKBENCH_FILE_OPEN_KEY, openFileInWorkbench);
 provide(KNOWLEDGE_QUOTE_SELECTION_KEY, quoteKnowledgeSelectionInConversation);
+// Document editors of this window report their selection; new-session composers read it.
+provide(DOCUMENT_SELECTION_HUB_KEY, createDocumentSelectionHub());
 
 async function quoteKnowledgeSelectionInConversation(
   workspaceRef: WorkspaceRef,
@@ -4071,7 +4253,7 @@ async function handleWorkbenchSessionForked(
       title: forkedSession?.title || t("chat.session.forkTitle", sourceEditor.title),
       checkoutId: forkedSession?.executionTarget?.checkoutId
         ?? forkedSession?.defaultCheckoutId
-        ?? sourceEditor.checkoutBinding?.checkoutId
+        ?? editorExecutionBinding(sourceEditor)?.checkoutId
         ?? undefined,
     }, {
       paneId,
@@ -4176,7 +4358,7 @@ async function handleWorkbenchSessionReview(
   )?.title || sourceEditor.title;
   await reviewSessionInWorkbench(paneId, {
     projectId: sourceEditor.resource.projectId,
-    checkoutId: sourceEditor.checkoutBinding?.checkoutId,
+    checkoutId: editorExecutionBinding(sourceEditor)?.checkoutId,
     sessionId: sourceSessionId,
     title: sourceTitle,
     messageId: payload.request.messageId,
@@ -4273,48 +4455,114 @@ async function selectSessionWorktree(paneId: string, editorId: string, item: Man
   const editor = workbenchWindow.value.groups[paneId]?.tabs.find((candidate) => candidate.editorId === editorId);
   if (!editor || editor.resource.kind !== "newSession") throw new Error(t("worktrees.selector.locked"));
   if (editor.resource.projectId !== item.projectId) throw new Error(t("worktrees.selector.unavailable"));
-  const draft = sessionEditorRefs.get(editorId)?.exportComposerDraft();
-  const selection = sessionEditorRefs.get(editorId)?.exportExecutionSelection();
   worktreeSelectionBusy.value = true;
   try {
-    const context = await workspaceContextStore.openAndFocusInPane(item.root, WORKBENCH_WINDOW_ID, paneId);
-    if (!context) throw new Error(t("worktrees.selector.unavailable"));
+    // The worktree belongs to this session only: open its runtime without
+    // focusing the pane or changing the workbench workspace.
+    const runtime = await workspaceContextStore.openCheckout(item.root);
     rememberWorkspaceGitHead({
-      checkoutId: context.focusedCheckoutId,
-      expectedGeneration: context.workspaceGeneration,
+      checkoutId: runtime.checkoutId,
+      expectedGeneration: runtime.workspaceGeneration,
       expectedMaterializationEpoch: item.materializationEpoch,
     }, {
       kind: item.branch ? "attached" : "detached",
       refName: item.branch,
       hash: item.headOid || null,
     }, headObservation);
-    if (usesCheckoutScopedWorkbench() && workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID) !== item.checkoutId) {
-      await adoptWorkbenchWorkspaceContext(item.checkoutId);
-      const target = await openWorkspaceSessionDescriptor({
-        resource: { kind: "newSession", projectId: item.projectId },
-        title: t("chat.session.newSession"), checkoutId: item.checkoutId,
-      }, "reuse");
-      if (!target) throw new Error(t("worktrees.selector.unavailable"));
-      await nextTick();
-      const targetView = sessionEditorRefs.get(target.editorId);
-      if (selection) targetView?.applyExecutionSelection(selection);
-      if (draft) await targetView?.applyDraftPrefill(draft);
-      return;
-    }
     const current = workbenchWindow.value.groups[paneId]?.tabs.find((candidate) => candidate.editorId === editorId);
     if (!current || current.resource.kind !== "newSession") throw new Error(t("worktrees.selector.locked"));
+    const checkout = workspaceContextStore.checkoutsById[runtime.checkoutId];
+    rememberSessionWorktree(item.projectId, checkout && isManagedWorktreeCheckout(checkout)
+      ? { checkoutId: runtime.checkoutId, materializationEpoch: item.materializationEpoch }
+      : null);
     workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, paneId, editorId, {
-      checkoutBinding: {
-        checkoutId: context.focusedCheckoutId,
-        expectedGeneration: context.workspaceGeneration,
-        expectedMaterializationEpoch: item.materializationEpoch,
-      },
+      sessionCheckout: runtime.checkoutId === current.checkoutBinding?.checkoutId
+        ? null
+        : {
+            checkoutId: runtime.checkoutId,
+            expectedGeneration: runtime.workspaceGeneration,
+            expectedMaterializationEpoch: item.materializationEpoch,
+          },
     });
-    await workspaceContextStore.setActiveSessionInPane(null, WORKBENCH_WINDOW_ID, paneId);
   } finally {
     worktreeSelectionBusy.value = false;
   }
 }
+
+function sessionCheckoutEditors(): Array<{ paneId: string; editor: WorkbenchEditorInput; binding: EditorCheckoutBinding }> {
+  return Object.values(workbenchWindow.value.groups).flatMap((group) => group.tabs.flatMap((editor) => (
+    editor.sessionCheckout ? [{ paneId: group.paneId, editor, binding: editor.sessionCheckout }] : []
+  )));
+}
+
+// No pane focuses a session's checkout, so its runtime is opened here after
+// restore, tab creation or a window transfer.
+const pendingSessionCheckoutRuntimes = computed(() => [...new Set(sessionCheckoutEditors()
+  .map(({ binding }) => workspaceContextStore.checkoutsById[binding.checkoutId])
+  .filter((checkout) => !!checkout && !checkout.runtime && checkout.available !== false)
+  .map((checkout) => checkout!.checkoutId))].sort().join("\n"));
+const sessionCheckoutRuntimeRequests = new Set<string>();
+watch(pendingSessionCheckoutRuntimes, (ids) => {
+  for (const checkoutId of ids ? ids.split("\n") : []) {
+    const root = workspaceContextStore.checkoutsById[checkoutId]?.root;
+    if (!root || sessionCheckoutRuntimeRequests.has(checkoutId)) continue;
+    sessionCheckoutRuntimeRequests.add(checkoutId);
+    void workspaceContextStore.openCheckout(root)
+      .catch((error) => console.warn(`[DevelopmentWorkbench] session checkout ${checkoutId} is unavailable`, error))
+      .finally(() => sessionCheckoutRuntimeRequests.delete(checkoutId));
+  }
+}, { immediate: true });
+
+// A removed worktree or a recycled pool slot no longer holds the session's
+// branch. A new session falls back to its workspace; an existing one is
+// shown as unavailable rather than continuing on another branch.
+const staleSessionCheckouts = computed(() => sessionCheckoutEditors().filter(({ editor, binding }) => {
+  const checkout = workspaceContextStore.checkoutsById[binding.checkoutId];
+  if (!checkout) return false;
+  const stale = checkout.available === false
+    || (!!checkout.runtime && !editorBindingMatchesRuntime(binding, checkout.runtime));
+  return stale && (editor.resource.kind === "newSession" || editor.availability !== "unavailable");
+}));
+watch(staleSessionCheckouts, (entries) => {
+  for (const { paneId, editor } of entries) {
+    workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, paneId, editor.editorId, editor.resource.kind === "newSession"
+      ? { sessionCheckout: null }
+      : { availability: "unavailable", unavailableReason: t("workbench.unavailable.checkout") });
+  }
+});
+
+// Worktrees used to be entered as the workspace. A single-workspace window
+// still scoped to a Locus-managed worktree returns to its project's source
+// workspace; the worktree's sessions reopen there per session.
+const worktreeScopeMigrationTarget = computed(() => {
+  if (props.fixedWorkspaceRef || props.auxiliary || displaySettings.workspaceDisplayMode !== "single") return null;
+  const scopeId = workbenchWorkspaceScopeId.value;
+  const scope = scopeId ? workspaceContextStore.checkoutsById[scopeId] : null;
+  if (!scope || !isManagedWorktreeCheckout(scope)) return null;
+  const entry = projectEntryCheckout(workspaceContextStore.projectsById[scope.projectId], scope);
+  return entry && entry.checkoutId !== scope.checkoutId && entry.available !== false
+    ? { scopeId: scope.checkoutId, root: entry.root }
+    : null;
+});
+const migratedWorktreeScopes = new Set<string>();
+let worktreeScopeMigrationReady = false;
+function migrateWorktreeScope(target: { scopeId: string; root: string } | null): void {
+  if (!worktreeScopeMigrationReady || !target || migratedWorktreeScopes.has(target.scopeId)) return;
+  migratedWorktreeScopes.add(target.scopeId);
+  void (async () => {
+    try {
+      await workspaceContextStore.openAndFocus(target.root);
+      await refreshFocusedCheckoutServices();
+    } catch (error) {
+      console.warn("[DevelopmentWorkbench] could not leave the worktree workspace", error);
+    }
+  })();
+}
+watch(worktreeScopeMigrationTarget, migrateWorktreeScope);
+onMounted(() => {
+  worktreeScopeMigrationReady = true;
+  migrateWorktreeScope(worktreeScopeMigrationTarget.value);
+});
 
 async function handleWorkbenchNewSessionRequested(
   paneId: string,
@@ -4483,6 +4731,13 @@ async function reconcileRestoredWorkbenchEditors(
       if (editor.checkoutBinding && (!checkout || checkout.available === false || (checkout.runtime && !editorBindingMatchesRuntime(editor.checkoutBinding,checkout.runtime)))) {
         available=false; reason=t("workbench.unavailable.checkout");
       }
+      const sessionTarget = editor.sessionCheckout
+        ? workspaceContextStore.checkoutsById[editor.sessionCheckout.checkoutId]
+        : null;
+      if (resource.kind === "session" && editor.sessionCheckout && sessionTarget && (sessionTarget.available === false
+        || (sessionTarget.runtime && !editorBindingMatchesRuntime(editor.sessionCheckout, sessionTarget.runtime)))) {
+        available = false; reason = t("workbench.unavailable.checkout");
+      }
       if (
         epoch !== workbenchReconcileEpoch
         || workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID) !== expectedWorkspaceScopeId
@@ -4580,17 +4835,6 @@ function isExpanded(key: string): boolean {
 
 function isSessionParentExpanded(key: string): boolean {
   return !collapsedSessionParents.value.has(key);
-}
-
-function isCollaborationExpanded(projectId: string): boolean {
-  if (secondarySectionIsOpen(projectId, "collab")) return true;
-  const resource = activeResource.value;
-  return resource?.projectId === projectId
-    && (
-      resource.kind === "checkout"
-      || resource.kind === "collaboration"
-      || (resource.kind === "section" && resource.section === "collab")
-    );
 }
 
 function knowledgeFolderKind(nodeId: string): KnowledgeFolderKind | null {
@@ -5105,46 +5349,31 @@ function appendLayoutChildren(
       node.resourceKind === SYSTEM_RESOURCE_KIND
       && node.resourceId === COLLABORATION_SYSTEM_RESOURCE_ID
     ) {
+      const preferredCheckout = workspaceContextStore.focusedCheckout?.projectId === project.projectId
+        ? workspaceContextStore.focusedCheckout
+        : project.checkouts[0];
+      if (!preferredCheckout) continue;
       const key = `collaboration:${project.projectId}`;
-      const collaborationExpanded = isCollaborationExpanded(project.projectId);
+      const collaborationOverlayOpen = workspaceOverlayIsOpen(project.projectId, "collab");
       items.push({
         key,
         treeRow: makeRow(key, t("app.tab.collab"), depth, "folder", {
-          expandable: project.checkouts.length > 0,
-          expanded: collaborationExpanded,
-          selected: secondarySectionIsOpen(project.projectId, "collab") || activeResource.value?.projectId === project.projectId
+          selected: collaborationOverlayOpen || activeResource.value?.projectId === project.projectId
             && (
-              activeResource.value.kind === "collaboration"
+              activeResource.value.kind === "checkout"
+              || activeResource.value.kind === "collaboration"
               || (activeResource.value.kind === "section" && activeResource.value.section === "collab")
             ),
           dragEnabled: true,
-          classes: { "is-hidden-node": node.hidden },
+          classes: { "is-open": collaborationOverlayOpen, "is-hidden-node": node.hidden },
         }),
         meta: {
           kind: "collaboration",
           projectId: project.projectId,
+          checkoutId: preferredCheckout.checkoutId,
           explorerNode: node,
         },
       });
-      if (collaborationExpanded) {
-        for (const checkout of project.checkouts) {
-          const checkoutKey = `checkout:${checkout.checkoutId}`;
-          items.push({
-            key: checkoutKey,
-            treeRow: makeRow(checkoutKey, shortPath(checkout.root), depth + 1, "folder", {
-              selected: activeResource.value?.kind === "checkout"
-                && activeResource.value.checkoutId === checkout.checkoutId,
-              focused: workspaceContextStore.focusedCheckout?.checkoutId === checkout.checkoutId,
-              title: checkout.root,
-            }),
-            meta: {
-              kind: "checkout",
-              projectId: project.projectId,
-              checkoutId: checkout.checkoutId,
-            },
-          });
-        }
-      }
       continue;
     }
     if (
@@ -5158,7 +5387,11 @@ function appendLayoutChildren(
       if (!preferredCheckout) continue;
       const kind = section === "assets" ? "assetsRoot" as const : section === "agents" ? "agentsRoot" as const : "viewsRoot" as const;
       const key = `${section}:${project.projectId}`;
-      const selected = secondarySectionIsOpen(project.projectId, section);
+      const open = section === "agents"
+        ? workspaceOverlayIsOpen(project.projectId, "agents")
+        : secondarySectionIsOpen(project.projectId, section);
+      const selected = open || (section === "agents" && activeResource.value?.kind === "section"
+        && activeResource.value.section === "agents" && activeResource.value.projectId === project.projectId);
       items.push({
         key,
         treeRow: makeRow(
@@ -5170,7 +5403,7 @@ function appendLayoutChildren(
             selected,
             dragEnabled: true,
             classes: {
-              "is-open": selected,
+              "is-open": open,
               "is-hidden-node": node.hidden,
             },
           },
@@ -5428,14 +5661,17 @@ function buildWorkspaceTreeItems(projects: ProjectContextDescriptor[], showProje
       items.push(...navigationItems.filter(item => item.meta.kind === "project"));
       for (const entry of workspaceFileStates[checkout.checkoutId]?.entries ?? []) {
         const key = `workspace-file:${checkout.checkoutId}:${entry.key}`;
-        const selected = !entry.loadMore && (activeResource.value?.kind === "asset" || activeResource.value?.kind === "workspaceFile")
+        const open = !entry.loadMore && (activeResource.value?.kind === "asset" || activeResource.value?.kind === "workspaceFile")
           && activeResource.value.projectId === project.projectId
           && explorerFileKey(explorerFilePath(checkout.root, activeResource.value.path)) === explorerFileKey(explorerFilePath(checkout.root, entry.node.path))
           && workbenchStore.activeEditor(WORKBENCH_WINDOW_ID)?.checkoutBinding?.checkoutId === checkout.checkoutId;
+        const multiSelected = !entry.loadMore && selectedFileKeys.value.has(key);
+        const contextSelected = contextMenu.value?.fileTargets?.some(target => target.key === key) === true;
         fileItems.push({ key, treeRow: { ...entry.treeRow!, key,
           depth: resourceDepth + entry.treeRow!.depth,
-          selected, title: explorerFilePath(checkout.root, entry.node.path),
-          dragEnabled: !entry.loadMore, classes: { "is-open": selected },
+          selected: open || multiSelected || contextSelected, title: explorerFilePath(checkout.root, entry.node.path),
+          dragEnabled: !entry.loadMore,
+          classes: { "is-open": open, "is-multi-selected": multiSelected, "is-context-selected": contextSelected },
         }, meta: { kind: "workspaceFile", projectId: project.projectId, checkoutId: checkout.checkoutId, workspaceFile: entry } });
       }
       const ordered = orderWorkspaceFileRows(fileItems, workspaceFileStates[checkout.checkoutId]?.order.placements ?? [], fileOrderItemKey);
@@ -5611,6 +5847,36 @@ function resolveSessionClickSelection(item: DevelopmentTreeItem, event?: MouseEv
   });
   selectedSessionIds.value = result.nextSelectedSessionIds;
   lastSessionSelectionAnchorId.value = result.nextAnchorSessionId;
+  return result.shouldActivateSession;
+}
+
+function visibleWorkspaceFileItems(checkoutId: string): DevelopmentTreeItem[] {
+  return treeItems.value.filter(item => item.meta.kind === "workspaceFile" && item.meta.checkoutId === checkoutId
+    && !!item.meta.workspaceFile && !item.meta.workspaceFile.loadMore);
+}
+
+function selectedWorkspaceFileItems(checkoutId: string): DevelopmentTreeItem[] {
+  return visibleWorkspaceFileItems(checkoutId).filter(item => selectedFileKeys.value.has(item.key));
+}
+
+function resolveFileClickSelection(item: DevelopmentTreeItem, event?: MouseEvent): boolean {
+  if (item.meta.archivedFile || item.meta.workspaceFile?.loadMore || !item.meta.checkoutId) return true;
+  const visible = visibleWorkspaceFileItems(item.meta.checkoutId);
+  const visibleKeys = visible.map(candidate => candidate.key);
+  // The session resolver is id-agnostic: Ctrl toggles, Shift selects a visible
+  // range, and a plain click clears the selection and opens the row.
+  const result = resolveWorkspaceSessionSelection({
+    visibleSessionIds: visibleKeys,
+    selectedSessionIds: new Set(visibleKeys.filter(key => selectedFileKeys.value.has(key))),
+    anchorSessionId: lastFileSelectionAnchorKey.value,
+    activeSessionId: visible.find(candidate => candidate.treeRow?.classes?.["is-open"])?.key ?? null,
+    clickedSessionId: item.key,
+    shiftKey: event?.shiftKey ?? false,
+    ctrlKey: event?.ctrlKey ?? false,
+    metaKey: event?.metaKey ?? false,
+  });
+  selectedFileKeys.value = result.nextSelectedSessionIds;
+  lastFileSelectionAnchorKey.value = result.nextAnchorSessionId;
   return result.shouldActivateSession;
 }
 
@@ -5985,6 +6251,40 @@ async function removeRecentWorkspace(): Promise<void> {
   }
 }
 
+async function removeContextWorkspace(): Promise<void> {
+  const item = contextMenu.value?.item;
+  const allowed = contextCanManageWorkspaces.value;
+  contextMenu.value = null;
+  // Empty-area menus target the active project implicitly; only a project row names one.
+  if (!allowed || item?.meta.kind !== "project" || !item.treeRow) return;
+  const project = workspaceContextStore.projectsById[item.meta.projectId];
+  if (!project) return;
+  const approved = await confirm(t("development.removeWorkspaceConfirm", projectLabel(project)), {
+    title: t("development.removeWorkspace"),
+    kind: "warning",
+    okLabel: t("development.removeWorkspaceAction"),
+    cancelLabel: t("common.cancel"),
+  });
+  if (!approved) return;
+  // Open tabs stay usable. Only a pane focused on the project without showing
+  // one of its editors moves to another workspace.
+  const refocus = workspaceContextStore.focusedCheckout?.projectId === project.projectId
+    && workbenchStore.activeEditor(WORKBENCH_WINDOW_ID)?.resource.projectId !== project.projectId;
+  try {
+    if (!await workspaceContextBaseStore.removeProject(project.projectId)) return;
+    await projectStore.loadRecentDirs();
+    const fallback = refocus
+      ? workspaceContextStore.projects.flatMap((candidate) => candidate.checkouts)
+        .find((checkout) => checkout.available !== false)
+      : null;
+    if (fallback && await workspaceContextStore.focusCheckout(fallback.checkoutId)) {
+      await refreshFocusedCheckoutServices();
+    }
+  } catch (error) {
+    notificationStore.addNotice("error", normalizeAppError(error).message);
+  }
+}
+
 async function revealPendingKnowledgeSelection(): Promise<void> {
   const pending = uiStore.pendingKnowledgeSelection;
   if (!pending) return;
@@ -6059,6 +6359,7 @@ async function activateItem(raw: WorkspaceTreeItem, event?: MouseEvent): Promise
   const item = raw as DevelopmentTreeItem;
   const project = workspaceContextStore.projectsById[item.meta.projectId];
   if (!project) return;
+  if (item.meta.kind !== "workspaceFile") resetFileMultiSelection();
   try {
     if (item.meta.kind === "project") {
       toggleItem(item);
@@ -6068,6 +6369,7 @@ async function activateItem(raw: WorkspaceTreeItem, event?: MouseEvent): Promise
     explorerStore.selectedNodeKey = item.key;
     if (item.meta.kind === "workspaceFile" && item.meta.workspaceFile) {
       resetSessionMultiSelection();
+      if (!resolveFileClickSelection(item, event)) return;
       const { node, loadMore } = item.meta.workspaceFile;
       const state = workspaceFileStates[item.meta.checkoutId!];
       if (loadMore) state?.loadMore(node.path);
@@ -6126,34 +6428,12 @@ async function activateItem(raw: WorkspaceTreeItem, event?: MouseEvent): Promise
       await toggleSecondaryNavigation(item, secondarySection);
       return;
     }
-    if (item.meta.kind === "collaboration") {
+    const overlaySection = workspaceOverlaySection(item.meta.kind);
+    if (overlaySection) {
       resetSessionMultiSelection();
-      const checkout = await ensureProjectCheckout(project);
-      const descriptor = treeEditorDescriptor(item);
-      if (descriptor) await openWorkbenchResourceFromWorkspaceTree({
-        ...descriptor,
-        checkoutId: checkout?.checkoutId,
-      }, {
-        preview: !pinEditor,
-        pinned: pinEditor,
-      });
-      return;
-    }
-    if (item.meta.kind === "checkout" && item.meta.checkoutId) {
-      resetSessionMultiSelection();
-      if (workspaceContextStore.focusedCheckout?.checkoutId !== item.meta.checkoutId) {
-        await workspaceContextStore.focusCheckout(item.meta.checkoutId);
-        await refreshFocusedCheckoutServices();
-      }
-      const descriptor = treeEditorDescriptor(item);
-      if (descriptor) await openWorkbenchResourceFromWorkspaceTree(descriptor, {
-        preview: !pinEditor,
-        pinned: pinEditor,
-      });
-      collabHeadFocusRequest.value = {
-        id: ++collabHeadFocusRequestId,
-        checkoutId: item.meta.checkoutId,
-      };
+      // The second click of a double-click must not close the page the first one opened.
+      if ((event?.detail ?? 1) > 1) return;
+      await activateWorkspaceOverlayItem(item, overlaySection, project);
       return;
     }
     if (item.meta.kind === "session" && item.meta.session) {
@@ -6190,6 +6470,23 @@ async function activateItem(raw: WorkspaceTreeItem, event?: MouseEvent): Promise
   } catch (error) {
     notificationStore.addNotice("error", normalizeAppError(error).message);
   }
+}
+
+async function activateWorkspaceOverlayItem(
+  item: DevelopmentTreeItem,
+  section: WorkspaceOverlaySection,
+  project: ProjectContextDescriptor,
+): Promise<void> {
+  if (workspaceOverlayIsOpen(project.projectId, section)) {
+    closeWorkspaceOverlay();
+    return;
+  }
+  const focused = workspaceContextStore.focusedCheckout;
+  const checkout = projectCheckout(
+    project.projectId,
+    focused?.projectId === project.projectId ? focused.checkoutId : item.meta.checkoutId,
+  );
+  if (checkout) await showWorkspaceOverlay(section, project.projectId, checkout);
 }
 
 function toggleItem(raw: WorkspaceTreeItem): void {
@@ -6513,6 +6810,7 @@ function openContextMenu(raw: WorkspaceTreeItem, event: MouseEvent): void {
     || item.meta.kind === "newSession"
     || item.meta.kind === "folder"
     || item.meta.kind === "checkout"
+    || item.meta.kind === "collaboration"
     || item.meta.kind === "session"
     || item.meta.kind === "knowledge"
     || item.meta.kind === "localFile"
@@ -6521,6 +6819,21 @@ function openContextMenu(raw: WorkspaceTreeItem, event: MouseEvent): void {
     || (item.meta.kind === "workspaceFile" && item.meta.workspaceFile && !item.meta.workspaceFile.loadMore)
     || item.meta.kind === "view")) return;
   event.preventDefault();
+  if (item.meta.kind === "workspaceFile" && item.meta.checkoutId && !item.meta.archivedFile) {
+    resetSessionMultiSelection();
+    const visible = visibleWorkspaceFileItems(item.meta.checkoutId);
+    const targetKeys = resolveWorkspaceSessionContextIds({
+      visibleSessionIds: visible.map(candidate => candidate.key),
+      selectedSessionIds: selectedFileKeys.value,
+      targetSessionId: item.key,
+    });
+    if (targetKeys.length === 1 && !selectedFileKeys.value.has(item.key)) clearFileMultiSelection();
+    const targetKeySet = new Set(targetKeys);
+    contextMenu.value = { x: event.clientX, y: event.clientY, item,
+      fileTargets: targetKeys.length > 1 ? visible.filter(candidate => targetKeySet.has(candidate.key)) : undefined };
+    return;
+  }
+  resetFileMultiSelection();
   if (item.meta.kind === "session" && item.meta.session) {
     const visibleTargets = visibleWorkspaceSessionTargets(!!item.meta.archived);
     const targetIds = resolveWorkspaceSessionContextIds({
@@ -6553,6 +6866,7 @@ function openExplorerBackgroundContextMenu(event: MouseEvent): void {
   if (!projectId) return;
   event.preventDefault();
   resetSessionMultiSelection();
+  resetFileMultiSelection();
   contextMenu.value = {
     x: event.clientX,
     y: event.clientY,
@@ -6576,6 +6890,31 @@ function setContextFileHidden(hidden: boolean): void {
   contextMenu.value = null;
   if (!item?.meta.checkoutId || !item.meta.workspaceFile || item.meta.workspaceFile.loadMore) return;
   try { workspaceFileVisibility.setHidden(item.meta.checkoutId, item.meta.workspaceFile.node.path, hidden); }
+  catch (error) { notificationStore.addNotice("error", normalizeAppError(error).message); }
+}
+
+const contextFileBatchTargets = computed(() => (contextMenu.value?.fileTargets ?? []).flatMap(item => {
+  const target = treeFileTarget(item);
+  return target ? [target] : [];
+}));
+
+async function runContextFileBatchAction(action: "copy" | "delete"): Promise<void> {
+  const targets = contextFileBatchTargets.value;
+  contextMenu.value = null;
+  if (action === "delete") resetFileMultiSelection();
+  await resourceActions.value?.runMany(action, targets);
+}
+
+function hideContextFiles(): void {
+  const items = contextMenu.value?.fileTargets ?? [];
+  contextMenu.value = null;
+  resetFileMultiSelection();
+  const paths = items.flatMap(item => item.meta.checkoutId && item.meta.workspaceFile
+    ? [{ checkoutId: item.meta.checkoutId, path: item.meta.workspaceFile.node.path }] : []);
+  // A descendant of another hidden folder is already hidden with it.
+  const outermost = paths.filter(entry => !paths.some(parent => parent.checkoutId === entry.checkoutId
+    && entry.path.startsWith(`${parent.path}/`)));
+  try { for (const entry of outermost) workspaceFileVisibility.setHidden(entry.checkoutId, entry.path, true); }
   catch (error) { notificationStore.addNotice("error", normalizeAppError(error).message); }
 }
 
@@ -6615,7 +6954,8 @@ function treeFileCreateTarget(item: DevelopmentTreeItem): WorkspaceFileDropScope
 
 function contextCheckout(): WorkspaceCheckoutDescriptor | null {
   const item = contextMenu.value?.item;
-  if (item?.meta.kind !== "checkout" || !item.meta.checkoutId) return null;
+  // The collaboration row targets the checkout its page opens.
+  if ((item?.meta.kind !== "checkout" && item?.meta.kind !== "collaboration") || !item.meta.checkoutId) return null;
   return workspaceContextStore.checkoutsById[item.meta.checkoutId] ?? null;
 }
 
@@ -6736,9 +7076,11 @@ function resourceFileChanged(target: ExplorerResourceTarget, newPath: string | n
         : resource.kind === "workspaceFile" || resource.kind === "asset"
           ? explorerFilePath(workspaceContextStore.checkoutsById[editor.checkoutBinding?.checkoutId ?? ""]?.root ?? target.root, resource.path) : null;
       const movedPath = editorFilePath && newPath ? workspaceMovedPath(editorFilePath, target.path, newPath, !!target.isDirectory) : null;
+      const insideDeletedFolder = !newPath && !!target.isDirectory && !!editorFilePath
+        && workspaceMovedPath(editorFilePath, target.path, target.path, true) !== null;
       const matches = target.document
         ? resource.kind === "knowledge" && resource.documentId === target.document.id
-        : !!movedPath || (resource.kind === "localFile" && !!editor.sourcePath && explorerFileKey(editor.sourcePath) === explorerFileKey(target.path))
+        : !!movedPath || insideDeletedFolder || (resource.kind === "localFile" && !!editor.sourcePath && explorerFileKey(editor.sourcePath) === explorerFileKey(target.path))
           || ((resource.kind === "workspaceFile" || resource.kind === "asset") && explorerFileKey(explorerFilePath(
             workspaceContextStore.checkoutsById[editor.checkoutBinding?.checkoutId ?? ""]?.root ?? target.root, resource.path,
           )) === explorerFileKey(target.path));
@@ -6844,7 +7186,7 @@ function beginCreateFolder(): void {
   });
 }
 
-async function beginCreateWorkspaceDocument(kind: "document" | "csv"): Promise<void> {
+async function beginCreateWorkspaceDocument(kind: WorkspaceInlineCreateState["kind"]): Promise<void> {
   const target = contextCreateTarget.value;
   contextMenu.value = null;
   if (!target) return;
@@ -6881,6 +7223,13 @@ async function submitInlineCreate(): Promise<void> {
   try {
     if (draft.fileTarget) {
       const target = draft.fileTarget;
+      if (draft.kind === "folder") {
+        const path = await workspaceCreateFolder(target.workspaceRef, target.directory, name);
+        // Creation is committed: a refresh failure must not restore a draft that would create it twice.
+        try { await workspaceFileStates[target.workspaceRef.checkoutId]?.refresh(path, "upsert"); }
+        catch (error) { notificationStore.addNotice("error", normalizeAppError(error).message); }
+        return;
+      }
       const extension = draft.kind === "csv" ? ".csv" : ".md";
       const fileName = (draft.kind === "csv" ? /\.csv$/i : /\.(md|markdown)$/i).test(name) ? name : `${name}${extension}`;
       const path = await workspaceCreateDocument(target.workspaceRef, target.directory, fileName);
@@ -7481,8 +7830,12 @@ function onDragPointerDown(raw: WorkspaceTreeItem, event: PointerEvent): void {
   if (item.meta.kind === "workspaceFile" && item.meta.workspaceFile && !item.meta.workspaceFile.loadMore) {
     const checkout = projectCheckout(item.meta.projectId, item.meta.checkoutId);
     if (!checkout?.runtime) return;
+    // Dragging a row inside the multi-selection carries every selected row.
+    const selected = selectedFileKeys.value.has(item.key) && item.meta.checkoutId
+      ? selectedWorkspaceFileItems(item.meta.checkoutId) : [];
+    const nodes = selected.length > 1 ? selected.map(candidate => candidate.meta.workspaceFile!.node) : item.meta.workspaceFile.node;
     const data = assetWorkspaceReferenceDragData({ projectId: item.meta.projectId,
-      workspaceRef: checkoutWorkspaceRef(checkout), workspaceRoot: checkout.root }, item.meta.workspaceFile.node);
+      workspaceRef: checkoutWorkspaceRef(checkout), workspaceRoot: checkout.root }, nodes);
     if (data) internalDrag.start(event, workbenchReferenceInternalDragSource(data,
       event.currentTarget instanceof HTMLElement ? event.currentTarget : undefined));
     return;
@@ -8677,7 +9030,7 @@ async function commitWorkbenchInternalDrop(
     if (usesCheckoutScopedWorkbench()) {
       const checkoutIds = new Set(
         descriptors
-          .map((descriptor) => descriptor.checkoutId?.trim())
+          .map((descriptor) => descriptorLayoutCheckoutId(descriptor))
           .filter((checkoutId): checkoutId is string => !!checkoutId),
       );
       if (checkoutIds.size > 1) {
@@ -9085,7 +9438,6 @@ function syncWorkbenchWorkspaceScope(nextWorkspaceScopeId: string | null): Promi
     const activeEditor = workbenchStore.activeEditor(WORKBENCH_WINDOW_ID);
     activeResource.value = activeEditor?.resource ?? null;
     resetSessionMultiSelection();
-    collabHeadFocusRequest.value = null;
 
     const checkout = nextWorkspaceScopeId
       ? workspaceContextStore.checkoutsById[nextWorkspaceScopeId] ?? null
@@ -9218,18 +9570,9 @@ watch(() => Object.values(workspaceContextStore.checkoutsById).map(checkout => `
   void reconcileRestoredWorkbenchEditors().catch(error => console.warn("[workspace setup]", error));
 });
 
-watch(activeResource, (resource) => {
-  if (resource?.kind !== "checkout") {
-    collabHeadFocusRequest.value = null;
-  }
-});
-
 onMounted(() => {
   const editor = workbenchStore.activeEditor(WORKBENCH_WINDOW_ID);
-  if (editor) {
-    showCollabSecondarySidebar(editor);
-    showFileHistorySecondarySidebar(editor);
-  }
+  if (editor) showFileHistorySecondarySidebar(editor);
   treeTimeRefreshTimer = ownerWindow.setInterval(() => {
     treeTimeNow.value = Date.now() / 1000;
   }, 60_000);
@@ -9748,6 +10091,7 @@ watch(
       @mousedown="onExplorerResizeStart"
     />
 
+    <div class="development-stage" :class="{ 'has-workspace-overlay': workspaceOverlayShown }">
     <Transition
       :css="false"
       @enter="enterWorkbenchSidebar"
@@ -9768,11 +10112,6 @@ watch(
         :ref="(value) => { fileHistorySidebarTarget = value as HTMLElement | null; fileHistorySidebarToolbarTarget = toolbarTarget; }"
         class="file-history-secondary-content"
       />
-      <div
-        v-else-if="secondaryNavigation.section === 'collab'"
-        :ref="(value) => { collabSidebarTarget = value as HTMLElement | null; collabSidebarToolbarTarget = toolbarTarget; }"
-        class="collab-secondary-content"
-      />
       <KnowledgeView
         v-else-if="secondaryNavigation.section === 'knowledge'"
         :key="`knowledge:${secondaryNavigation.checkoutId}`"
@@ -9786,15 +10125,6 @@ watch(
         :model-defaults="modelStore.modelDefaults"
         @open-document="openSecondaryKnowledgeDocument"
         @open-page="openSecondaryKnowledgePage"
-      />
-      <AgentView
-        v-else-if="secondaryNavigation.section === 'agents'"
-        :key="`agents:${secondaryNavigation.checkoutId}`"
-        list-only
-        :working-dir="secondaryCheckout.root"
-        :workspace-ref="secondaryWorkspaceRef"
-        :agent-id="secondaryAgentId"
-        @open-agent="openSecondaryAgent"
       />
       <WorkspaceTree
         v-else-if="secondaryNavigation.section === 'sessions'"
@@ -9914,6 +10244,7 @@ watch(
                 :window-id="WORKBENCH_WINDOW_ID"
                 :group="group"
                 :view-icon="workbenchViewIcon"
+                :workspace-label="workbenchTabWorkspaceLabel"
                 :show-single-tab="props.auxiliary || workbenchWindow.layout.kind === 'split'"
                 :window-title="!!props.singleTabTitleTarget"
                 :drop-active="renderedEditorDropIntent?.paneId === paneId && renderedEditorDropIntent.direction === 'center'"
@@ -9970,9 +10301,9 @@ watch(
                   @composer-focus="handleWorkbenchComposerFocus(paneId, $event)"
                 />
                 <AgentView
-                  v-else-if="editor.resource.kind === 'section' && editor.resource.section === 'agents' && editor.resource.agentId"
+                  v-else-if="editor.resource.kind === 'section' && editor.resource.section === 'agents'"
                   :ref="(value) => setAgentEditorRef(editor.editorId, value)"
-                  embedded
+                  :embedded="!!editor.resource.agentId"
                   :agent-id="editor.resource.agentId"
                   :working-dir="editorWorkingDir(editor)"
                   :workspace-ref="editorWorkspaceRef(editor)"
@@ -9995,17 +10326,15 @@ watch(
                   @dirty-change="setWorkspaceFileEditorDirty(paneId, editor.editorId, $event)"
                   @close-page="closeWorkbenchEditor(paneId, editor.editorId)"
                 />
-                <CollabView
+                <WorkbenchCollabPage
                   v-else-if="editor.resource.kind === 'collaboration' || editor.resource.kind === 'checkout' || (editor.resource.kind === 'section' && editor.resource.section === 'collab')"
                   :working-dir="editorWorkingDir(editor)"
                   :workspace-ref="editorWorkspaceRef(editor)"
-                  :is-active="focused && group.activeEditorId === editor.editorId"
+                  :active="focused && group.activeEditorId === editor.editorId"
+                  :visible="group.activeEditorId === editor.editorId"
                   :selected-model-id="modelStore.selectedModelId"
                   :selected-agent-id="agentStore.selectedAgentId"
                   :models="modelStore.availableModels"
-                  :head-focus-request="collabHeadFocusRequest"
-                  :sidebar-target="collabSidebarOwner?.editor.editorId === editor.editorId ? collabSidebarTarget : null"
-                  :sidebar-toolbar-target="collabSidebarOwner?.editor.editorId === editor.editorId ? collabSidebarToolbarTarget : null"
                   :activate-editor="() => focusWorkbenchEditor(paneId, editor.editorId)"
                   @select-model="(id: string) => modelStore.selectModel(id)"
                 />
@@ -10143,6 +10472,63 @@ watch(
       </WorkbenchSplitHost>
     </main>
 
+    <section
+      v-if="collabOverlayPage || agentOverlayPage"
+      v-show="workspaceOverlayShown"
+      class="development-workspace-overlay"
+      data-native-surface-occluder
+      data-search-boundary
+      :aria-label="workspaceOverlayTitle"
+    >
+      <header class="development-workspace-overlay-header">
+        <LucideIcon
+          class="development-workspace-overlay-icon"
+          :icon="workspaceOverlay?.section === 'agents' ? Bot : GitMerge"
+          :size="14"
+        />
+        <span class="development-workspace-overlay-title">{{ workspaceOverlayTitle }}</span>
+        <span
+          v-if="workspaceOverlaySubtitle"
+          class="development-workspace-overlay-subtitle"
+          :title="workspaceOverlaySubtitle.title"
+        >{{ workspaceOverlaySubtitle.label }}</span>
+        <div ref="collabOverlayToolbarTarget" class="development-workspace-overlay-actions" />
+        <BaseButton
+          class="development-workspace-overlay-close"
+          :title="t('common.close')"
+          :aria-label="t('common.close')"
+          @click="closeWorkspaceOverlay"
+        >
+          <LucideIcon :icon="X" :size="14" />
+        </BaseButton>
+      </header>
+      <div class="development-workspace-overlay-body">
+        <WorkbenchCollabPage
+          v-if="collabOverlayPage"
+          v-show="workspaceOverlay?.section === 'collab'"
+          :key="`collab:${collabOverlayPage.target.checkoutId}`"
+          :working-dir="collabOverlayPage.root"
+          :workspace-ref="collabOverlayPage.workspaceRef"
+          :active="collabOverlayActive"
+          :visible="collabOverlayActive"
+          :toolbar-target="collabOverlayToolbarTarget"
+          :selected-model-id="modelStore.selectedModelId"
+          :selected-agent-id="agentStore.selectedAgentId"
+          :models="modelStore.availableModels"
+          @select-model="(id: string) => modelStore.selectModel(id)"
+        />
+        <AgentView
+          v-if="agentOverlayPage"
+          v-show="workspaceOverlay?.section === 'agents'"
+          :key="`agents:${agentOverlayPage.target.checkoutId}`"
+          :working-dir="agentOverlayPage.root"
+          :workspace-ref="agentOverlayPage.workspaceRef"
+          :active="agentOverlayActive"
+        />
+      </div>
+    </section>
+    </div>
+
     <WorktreeManager v-if="managedWorktreeSource" :source-root="managedWorktreeSource" @close="managedWorktreeSource = null" />
     <BaseContextMenu
       v-if="contextMenu"
@@ -10162,7 +10548,7 @@ watch(
         </button>
         <div class="base-context-menu-separator" />
       </template>
-      <template v-if="contextMenu.item.meta.kind === 'checkout'">
+      <template v-if="contextMenu.item.meta.kind === 'checkout' || contextMenu.item.meta.kind === 'collaboration'">
         <button type="button" @click="managedWorktreeSource = contextCheckout()?.root ?? null; contextMenu = null">
           <LucideIcon :icon="GitBranch" :size="13" />
           {{ t("worktrees.title") }}
@@ -10240,6 +10626,18 @@ watch(
           </template>
         </button>
       </template>
+      <template v-else-if="(contextMenu.fileTargets?.length ?? 0) > 1">
+        <button type="button" @click="runContextFileBatchAction('copy')">
+          <LucideIcon :icon="Copy" :size="13" />{{ t("knowledge.explorer.copyRelativePath") }}
+        </button>
+        <div class="base-context-menu-separator" />
+        <button type="button" @click="hideContextFiles">
+          <LucideIcon :icon="EyeOff" :size="13" />{{ t("development.hideMany", contextMenu.fileTargets?.length ?? 0) }}
+        </button>
+        <button type="button" class="danger" @click="runContextFileBatchAction('delete')">
+          <LucideIcon :icon="Trash2" :size="13" />{{ t("knowledge.explorer.deleteMany", contextMenu.fileTargets?.length ?? 0) }}
+        </button>
+      </template>
       <template v-else>
         <template v-if="contextCreateTarget">
           <button type="button" @click="beginCreateWorkspaceDocument('document')">
@@ -10247,6 +10645,9 @@ watch(
           </button>
           <button type="button" @click="beginCreateWorkspaceDocument('csv')">
             <LucideIcon :icon="Table2" :size="13" />{{ t("csv.new") }}
+          </button>
+          <button type="button" @click="beginCreateWorkspaceDocument('folder')">
+            <LucideIcon :icon="FolderPlus" :size="13" />{{ t("development.newFolder") }}
           </button>
           <div v-if="contextFileTarget" class="base-context-menu-separator" />
         </template>
@@ -10358,6 +10759,17 @@ watch(
           <LucideIcon :icon="Eye" :size="13" />
           {{ t("development.showNode") }}
         </button>
+        <template v-if="contextCanManageWorkspaces">
+          <div v-if="contextCreateTarget || contextCanEditLayout" class="base-context-menu-separator" />
+          <button type="button" @click="browseWorkspace">
+            <LucideIcon :icon="FolderOpen" :size="13" />
+            {{ t("development.addWorkspace") }}
+          </button>
+          <button v-if="contextMenu.item.treeRow" type="button" @click="removeContextWorkspace">
+            <LucideIcon :icon="X" :size="13" />
+            {{ t("development.removeWorkspace") }}
+          </button>
+        </template>
       </template>
     </BaseContextMenu>
 
@@ -10648,7 +11060,6 @@ watch(
 </template>
 
 <style scoped>
-.collab-secondary-content,
 .file-history-secondary-content {
   display: flex;
   flex: 1;
@@ -11282,6 +11693,89 @@ watch(
 .development-editor :deep(> .workbench-split),
 .development-editor :deep(> .workbench-editor-group) {
   flex: 1 1 0;
+}
+
+.development-stage {
+  position: relative;
+  flex: 1;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Covered content keeps its layout, so closing the overlay restores it unchanged. */
+.development-stage.has-workspace-overlay > .workbench-secondary-sidebar,
+.development-stage.has-workspace-overlay > .development-editor {
+  visibility: hidden;
+}
+
+.development-workspace-overlay {
+  position: absolute;
+  inset: 0;
+  /* Below the explorer resize handle; covered content is already hidden. */
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--panel-bg);
+}
+
+.development-workspace-overlay-header {
+  display: flex;
+  align-items: center;
+  flex: 0 0 34px;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 7px 0 12px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--sidebar-bg);
+}
+
+.development-workspace-overlay-icon {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+}
+
+.development-workspace-overlay-title {
+  flex: 0 0 auto;
+  color: var(--text-color);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.development-workspace-overlay-subtitle {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.development-workspace-overlay-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.development-workspace-overlay-close {
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  padding: 0;
+  border-color: transparent;
+}
+
+.development-workspace-overlay-body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .workbench-editor-empty,
