@@ -115,7 +115,9 @@ describe("Markdown document title rename", () => {
     mounted.changeTitle("新标题");
     await flush();
     expect(files.rename).toHaveBeenCalledWith("project-a", "notes.md", "新标题.md", workspaceRef);
-    expect(mounted.input().disabled).toBe(true);
+    // Read-only keeps focus and appearance while the rename is pending.
+    expect(mounted.input().readOnly).toBe(true);
+    expect(mounted.input().disabled).toBe(false);
     expect(files.read).toHaveBeenCalledTimes(1);
     await mounted.editor.value!.refreshIfChanged();
     expect(files.revision).not.toHaveBeenCalled();
@@ -127,6 +129,7 @@ describe("Markdown document title rename", () => {
     expect(mounted.scroller.scrollTop).toBe(240);
     expect(mounted.dirty.value).toBe(true);
     expect(mounted.input().value).toBe("新标题");
+    expect(mounted.input().readOnly).toBe(false);
     expect(mounted.changed).toHaveBeenCalledWith("新标题.md");
     await expect(mounted.editor.value!.saveFile()).resolves.toBe(true);
     expect(files.write.mock.lastCall?.[0]).toBe("新标题.md");

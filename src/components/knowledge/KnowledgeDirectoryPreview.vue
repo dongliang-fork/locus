@@ -92,8 +92,6 @@ const draft = ref<KnowledgeDirectoryConfig>({
   maintenanceRules: null,
   effectiveMaintenanceRules: null,
 });
-const autoSaveQueued = ref(false);
-const autoSaveInFlight = ref(false);
 const markdownTextBuffers = new Map<DirectoryMarkdownField, Text>();
 const markdownBaseTexts = new Map<DirectoryMarkdownField, Text>();
 const markdownDirtyFields = ref<Set<DirectoryMarkdownField>>(new Set());
@@ -225,7 +223,6 @@ watch(
   () => [props.directory, directoryKey(props.directory)] as const,
   ([directory, nextKey]) => {
     clearAutoSaveTimer();
-    autoSaveInFlight.value = false;
     let session: KnowledgeDirectoryEditorSession | undefined;
     if (activeDirectoryKey && activeDirectoryKey === nextKey) {
       session = currentDirectorySession();
@@ -264,25 +261,10 @@ watch(showExternalImportTab, (enabled) => {
   }
 });
 
-const statusLabel = computed(() => {
-  if (!props.directory) return "";
-  if (props.directory.readOnly) return t("knowledge.meta.readOnly");
-  if (props.saveLoading) {
-    return autoSaveInFlight.value
-      ? t("knowledge.editor.autosaving")
-      : t("knowledge.editor.saving");
-  }
-  if (autoSaveQueued.value) return t("knowledge.editor.autosavePending");
-  if (!props.directory.exists && !isDirty.value) {
-    return t("knowledge.directoryConfig.missing");
-  }
-  return isDirty.value ? t("knowledge.editor.unsaved") : t("knowledge.editor.saved");
-});
-const footerLabel = computed(() => {
-  if (!props.directory) return "";
-  if (props.directory.readOnly) return statusLabel.value;
-  return `${statusLabel.value} · ${t("knowledge.editor.shortcut")}`;
-});
+// Autosave runs silently; the footer only marks read-only directories.
+const footerLabel = computed(() =>
+  props.directory?.readOnly ? t("knowledge.meta.readOnly") : "",
+);
 const interactionDisabled = computed(() => !!props.directory?.readOnly);
 const editorViewOptions = computed(() => [
   { value: "rendered", label: t("knowledge.editor.view.rendered") },
@@ -466,7 +448,6 @@ const panelTabOptions = computed(() => {
 
 watch(() => props.saveLoading, (loading, wasLoading) => {
   if (!loading && wasLoading) {
-    autoSaveInFlight.value = false;
     if (isDirty.value) {
       maybeScheduleAutoSave();
       return;
@@ -485,7 +466,6 @@ function clearAutoSaveTimer() {
     clearTimeout(autoSaveTimer);
     autoSaveTimer = null;
   }
-  autoSaveQueued.value = false;
 }
 
 function maybeScheduleAutoSave() {
@@ -497,17 +477,15 @@ function maybeScheduleAutoSave() {
     || interactionDisabled.value
     || !isDirty.value
   ) return;
-  autoSaveQueued.value = true;
   autoSaveTimer = setTimeout(() => {
     autoSaveTimer = null;
-    saveConfig("auto");
+    saveConfig();
   }, AUTO_SAVE_DELAY_MS);
 }
 
-function saveConfig(mode: "auto" | "manual" = "manual") {
+function saveConfig() {
   if (!props.directory || props.saveLoading || interactionDisabled.value || !isDirty.value) return;
   clearAutoSaveTimer();
-  autoSaveInFlight.value = mode === "auto";
   draft.value = materializedDirectoryDraft();
   const nextDraft = {
     ...draft.value,
@@ -524,12 +502,12 @@ function handleKeydown(event: KeyboardEvent) {
   if (target?.closest(".base-markdown-editor")) return;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
     event.preventDefault();
-    saveConfig("manual");
+    saveConfig();
   }
 }
 
 function handleClose() {
-  if (isDirty.value) saveConfig("manual");
+  if (isDirty.value) saveConfig();
   emit("close");
 }
 
@@ -1024,7 +1002,7 @@ function effectiveCapabilityLabel(
               :placeholder="t('knowledge.directoryConfig.summaryPlaceholder')"
               @update:model-value="onMarkdownModelUpdate('summary', $event)"
               @document-change="onMarkdownDocumentChange('summary', $event)"
-              @shortcut-save="saveConfig('manual')"
+              @shortcut-save="saveConfig()"
             />
           </section>
 
@@ -1055,17 +1033,13 @@ function effectiveCapabilityLabel(
               :placeholder="t('knowledge.directoryConfig.maintenanceRulesPlaceholder')"
               @update:model-value="onMarkdownModelUpdate('maintenanceRules', $event)"
               @document-change="onMarkdownDocumentChange('maintenanceRules', $event)"
-              @shortcut-save="saveConfig('manual')"
+              @shortcut-save="saveConfig()"
             />
           </section>
         </article>
       </div>
 
-      <div
-        v-if="footerLabel"
-        class="directory-footnote"
-        :class="{ 'is-warning': isDirty || autoSaveQueued }"
-      >
+      <div v-if="footerLabel" class="directory-footnote">
         {{ footerLabel }}
       </div>
     </div>
@@ -1314,11 +1288,6 @@ function effectiveCapabilityLabel(
   text-align: right;
   white-space: nowrap;
   z-index: 1;
-}
-
-.directory-footnote.is-warning {
-  color: var(--status-warn-fg, var(--text-color));
-  opacity: 0.74;
 }
 
 @media (max-width: 960px) {

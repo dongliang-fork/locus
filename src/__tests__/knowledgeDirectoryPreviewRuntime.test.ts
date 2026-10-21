@@ -73,6 +73,12 @@ function makeDirectory(
   };
 }
 
+function pressSaveShortcut(host: HTMLElement): void {
+  host.querySelector(".directory-preview")?.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true }),
+  );
+}
+
 afterEach(() => {
   vi.useRealTimers();
   useMarkdownEditorViewMode().setMarkdownEditorViewMode("rendered");
@@ -84,12 +90,14 @@ describe("KnowledgeDirectoryPreview runtime", () => {
     useMarkdownEditorViewMode().setMarkdownEditorViewMode("native");
     const directory = ref(makeDirectory("alpha", 1, "combat"));
     const sessionStore = new KnowledgeEditorWorkspaceSessionStore();
+    const onSave = vi.fn();
     const Root = defineComponent(() => () => h(KnowledgeDirectoryPreview, {
       workspaceRef: { checkoutId: "checkout", expectedGeneration: 1 },
       directory: directory.value,
       loading: false,
       saveLoading: false,
       sessionStore,
+      onSave,
     }));
     const host = document.createElement("div");
     document.body.appendChild(host);
@@ -113,7 +121,11 @@ describe("KnowledgeDirectoryPreview runtime", () => {
     directory.value = makeDirectory("alpha", 1, "combat");
     await nextTick();
     expect(summaryEditor()?.value).toBe("alpha local draft");
-    expect(host.querySelector(".directory-footnote")?.classList.contains("is-warning")).toBe(true);
+    // Autosave status stays silent; the restored draft is still dirty.
+    expect(host.querySelector(".directory-footnote")).toBeNull();
+    pressSaveShortcut(host);
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave.mock.calls[0]?.[1]).toMatchObject({ summary: "alpha local draft" });
     app.unmount();
   });
 
@@ -121,12 +133,14 @@ describe("KnowledgeDirectoryPreview runtime", () => {
     useMarkdownEditorViewMode().setMarkdownEditorViewMode("native");
     const directory = ref(makeDirectory("alpha", 1, "combat"));
     const sessionStore = new KnowledgeEditorWorkspaceSessionStore();
+    const onSave = vi.fn();
     const Root = defineComponent(() => () => h(KnowledgeDirectoryPreview, {
       workspaceRef: { checkoutId: "checkout", expectedGeneration: 1 },
       directory: directory.value,
       loading: false,
       saveLoading: false,
       sessionStore,
+      onSave,
     }));
     const host = document.createElement("div");
     document.body.appendChild(host);
@@ -147,7 +161,9 @@ describe("KnowledgeDirectoryPreview runtime", () => {
     expect(host.querySelector<HTMLTextAreaElement>(
       ".directory-inline-summary .base-markdown-editor-textarea",
     )?.value).toBe("alpha local draft");
-    expect(host.querySelector(".directory-footnote")?.classList.contains("is-warning")).toBe(true);
+    pressSaveShortcut(host);
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave.mock.calls[0]?.[1]).toMatchObject({ summary: "alpha local draft" });
     app.unmount();
   });
 

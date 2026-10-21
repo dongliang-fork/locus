@@ -138,6 +138,89 @@ describe("KnowledgePreview collaborative editing", () => {
     mounted.app.unmount();
   });
 
+  it("keeps document controls and layout unchanged while a body autosave is in flight", async () => {
+    vi.useFakeTimers();
+    let resolveSave!: (document: KnowledgeDocument) => void;
+    let mounted!: Awaited<ReturnType<typeof mountPreview>>;
+    mounted = await mountPreview(vi.fn(() => {
+      mounted.saveLoading.value = true;
+      return new Promise<KnowledgeDocument>((resolve) => { resolveSave = resolve; });
+    }));
+    const title = () => mounted.host.querySelector<HTMLInputElement>(".document-title-input")!;
+    const addProperty = () => mounted.host.querySelector(".property-add-trigger");
+    expect(addProperty()).not.toBeNull();
+
+    input(bodyEditor(mounted.host), "saved body");
+    vi.advanceTimersByTime(800);
+    await nextTick();
+    expect(mounted.saveEdits).toHaveBeenCalledTimes(1);
+    expect(title().disabled).toBe(false);
+    expect(addProperty()).not.toBeNull();
+    expect(mounted.host.querySelector(".editor-footnote")).toBeNull();
+
+    mounted.saveLoading.value = false;
+    resolveSave(makeDocument("saved body", 2));
+    for (let i = 0; i < 10; i++) await nextTick();
+    expect(title().disabled).toBe(false);
+
+    // Other metadata saves leave the title alone; only its own rename makes it
+    // read-only, which keeps focus and appearance unchanged.
+    mounted.saveLoading.value = true;
+    await nextTick();
+    expect(title().disabled).toBe(false);
+    expect(title().readOnly).toBe(false);
+    mounted.saveLoading.value = false;
+    await nextTick();
+    input(title(), "Renamed");
+    title().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await nextTick();
+    expect(mounted.updateMeta).toHaveBeenCalledExactlyOnceWith({ newPath: "combat/Renamed.md" });
+    mounted.saveLoading.value = true;
+    await nextTick();
+    expect(title().readOnly).toBe(true);
+    expect(title().disabled).toBe(false);
+    mounted.saveLoading.value = false;
+    await nextTick();
+    expect(title().readOnly).toBe(false);
+    mounted.app.unmount();
+  });
+
+  it("keeps the property area editable and ordered while metadata saves are in flight", async () => {
+    const mounted = await mountPreview();
+    const rows = () => mounted.host.querySelectorAll(".property-row").length;
+    const addProperty = async (name: string) => {
+      mounted.host.querySelector<HTMLButtonElement>(".property-add-trigger")!.click();
+      await nextTick();
+      input(mounted.host.querySelector<HTMLInputElement>(".property-add input")!, name);
+      mounted.host.querySelector(".property-add")!
+        .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await nextTick();
+    };
+
+    await addProperty("owner");
+    const first = mounted.updateMeta.mock.calls[0]![0];
+    expect(first).toMatchObject({ expectedPropertiesYaml: "" });
+    expect(first.propertiesYaml).toContain("owner");
+    mounted.saveLoading.value = true;
+    await nextTick();
+    expect(rows()).toBe(1);
+    expect(mounted.host.querySelector(".property-add-trigger")).not.toBeNull();
+
+    // The second edit builds on the first and expects it on disk.
+    await addProperty("status");
+    const second = mounted.updateMeta.mock.calls[1]![0];
+    expect(second.expectedPropertiesYaml).toBe(first.propertiesYaml);
+    expect(second.propertiesYaml).toContain("owner");
+    expect(second.propertiesYaml).toContain("status");
+    expect(rows()).toBe(2);
+
+    mounted.document.value = { ...makeDocument("alpha\nbeta\ngamma", 2), propertiesYaml: second.propertiesYaml };
+    mounted.saveLoading.value = false;
+    await nextTick();
+    expect(rows()).toBe(2);
+    mounted.app.unmount();
+  });
+
   it("cancels a queued title with Escape and ignores IME confirmation", async () => {
     const mounted = await mountPreview();
     const title = mounted.host.querySelector<HTMLInputElement>(".document-title-input")!;

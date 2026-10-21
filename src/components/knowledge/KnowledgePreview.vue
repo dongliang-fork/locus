@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import type { Text } from "@codemirror/state";
-import { documentSaveStatus } from "../../document/documentSaveStatus";
 import type { EditorView } from "@codemirror/view";
 import { computed, inject, nextTick, onUnmounted, ref, watch } from "vue";
 import type { WorkbenchEditorTransferSnapshot } from "../../types/workbench";
 import { KNOWLEDGE_QUOTE_SELECTION_KEY, readKnowledgeDocumentSource } from "../../services/knowledgeSelection";
 import { knowledgeSelectionReference } from "./knowledgeSelectionReference";
 import type { MarkdownEditorSelection } from "../ui/markdown-editor/markdownEditorSelection";
+import {
+  normalizeSelectionFilePath,
+  selectionLocationLabel,
+  useDocumentSelectionReporter,
+} from "../../composables/documentSelection";
 import { normalizeAppError } from "../../services/errors";
 import type {
   KnowledgeDocument,
@@ -161,7 +165,6 @@ const autosave = useDocumentAutosave({
     && hasUnsavedSectionChanges.value,
   save: () => flushPendingChanges("auto"),
 });
-const autoSaveQueued = autosave.queued;
 let skillUnityStatusRequestId = 0;
 
 const localEditorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
@@ -235,6 +238,38 @@ async function onQuoteSelection(section: KnowledgeDocumentSection, selection: Ma
     quotingSelection.value = false;
   }
 }
+
+const selectionReporter = useDocumentSelectionReporter("knowledge");
+
+function onEditorSelectionChange(section: KnowledgeDocumentSection, selection: MarkdownEditorSelection | null): void {
+  if (!selectionReporter.enabled) return;
+  const document = props.document;
+  const workspaceRef = props.workspaceRef ? { ...props.workspaceRef } : null;
+  if (!selection?.ranges.length || !document || !workspaceRef) {
+    void selectionReporter.update(null);
+    return;
+  }
+  const savedText = section === "body" ? document.body : section === "summary" ? document.summary ?? "" : document.maintenanceRules ?? "";
+  const name = documentTitle.value;
+  // Body lines are offset by the frontmatter, so map them through the physical source.
+  void selectionReporter.update(async () => {
+    const source = await readKnowledgeDocumentSource(workspaceRef, document.type, document.path);
+    const content = knowledgeSelectionReference(source, section, savedText, selection, {
+      draft: t("editor.quoteDraft"),
+      unavailable: t("editor.quoteSourceUnavailable"),
+    });
+    return {
+      checkoutId: workspaceRef.checkoutId,
+      knowledgePath: `${document.type}/${document.path}`,
+      filePath: normalizeSelectionFilePath(source.path),
+      name,
+      location: selectionLocationLabel(source.path, content),
+      content,
+    };
+  });
+}
+
+watch(activeDocumentSessionKey, () => selectionReporter.clear());
 
 function onEditorReferencePointerDown(payload: {
   reference: MarkdownReferenceToken;
@@ -401,17 +436,13 @@ function isMarkdownEditorSessionPinned(section: KnowledgeDocumentSection): boole
     || saveBlockedSections.value.has(section);
 }
 
-const statusLabel = computed(() => {
-  if (!props.document) return "";
-  return documentSaveStatus(props.saveLoading || autoSaveInFlight.value, hasUnsavedChanges.value || autoSaveQueued.value);
-});
-
-const footerLabel = computed(() =>
-  props.document ? `${statusLabel.value} · ${t("knowledge.editor.shortcut")}` : "",
-);
-const footerWarning = computed(() =>
-  hasBlockingConflicts.value
-  || (hasUnsavedChanges.value && !autoSaveQueued.value && !autoSaveInFlight.value),
+// Saves run in the background and never lock document controls: disabling
+// them hides property buttons and shifts the page. Property edits show the
+// submitted YAML until every queued save settles, and each edit expects the
+// previous one, so consecutive edits stay ordered without a lock.
+const pendingPropertiesYaml = ref<string | null>(null);
+const propertiesYaml = computed(() =>
+  pendingPropertiesYaml.value ?? props.document?.propertiesYaml ?? "",
 );
 const editorViewMode = "rendered" as const;
 const fallbackSkillName = computed(() => inferSkillName(props.document));
@@ -624,7 +655,11 @@ watch(
 );
 
 watch(() => props.saveLoading, (loading, wasLoading) => {
-  if (!loading && wasLoading) titleCommitInFlight.value = false;
+  if (!loading && wasLoading) {
+    titleCommitInFlight.value = false;
+    // Every queued save has settled; the document is authoritative again.
+    pendingPropertiesYaml.value = null;
+  }
   if (!loading && wasLoading && !autoSaveInFlight.value) {
     maybeScheduleAutoSave();
   }
@@ -637,7 +672,10 @@ watch([() => props.saveLoading, autoSaveInFlight, activeDocumentSessionKey], ([s
     void flushPendingChanges("manual");
   }
 });
-watch(activeDocumentSessionKey, () => { titleCommitInFlight.value = false; });
+watch(activeDocumentSessionKey, () => {
+  titleCommitInFlight.value = false;
+  pendingPropertiesYaml.value = null;
+});
 
 watch(
   () => [props.document?.id ?? "", props.document?.modifiedAt ?? 0, props.document?.type ?? ""],
@@ -1263,6 +1301,13 @@ function updateMeta(patch: KnowledgeDocumentPatch) {
   emit("updateMeta", renamePatch ? { ...patch, ...renamePatch } : patch);
 }
 
+function onPropertiesChange(yaml: string) {
+  if (!props.document || isReadOnly.value) return;
+  const expectedPropertiesYaml = propertiesYaml.value;
+  pendingPropertiesYaml.value = yaml;
+  updateMeta({ propertiesYaml: yaml, expectedPropertiesYaml });
+}
+
 function onInjectModeChange(value: string) {
   if (value === "inherit_parent") {
     updateMeta({ injectMode: "inherit" });
@@ -1588,7 +1633,7 @@ function labelForProvider(provider?: string | null): string {
                   :value="fileNameDraft"
                   class="document-title-input"
                   type="text"
-                  :disabled="saveLoading"
+                  :readonly="titleCommitInFlight"
                   :placeholder="t('knowledge.preview.titlePlaceholder')"
                   :aria-label="t('knowledge.preview.titleLabel')"
                   @input="onFileNameInputEvent"
@@ -1647,7 +1692,7 @@ function labelForProvider(provider?: string | null): string {
                     <KnowledgeInjectionAgents
                       :model-value="document.injectAgents"
                       :workspace-ref="workspaceRef"
-                      :disabled="documentMetaDisabled || saveLoading"
+                      :disabled="documentMetaDisabled"
                       @update:model-value="updateMeta({ injectAgents: $event })"
                     />
                   </template>
@@ -1761,10 +1806,10 @@ function labelForProvider(provider?: string | null): string {
               v-if="document.propertiesYaml?.trim() || (!documentMetaDisabled && !isPackageDocument)"
               :key="documentContentKey"
               :title="t('editor.properties.customTitle')"
-              :yaml="document.propertiesYaml ?? ''"
-              :disabled="documentMetaDisabled || isPackageDocument || saveLoading"
+              :yaml="propertiesYaml"
+              :disabled="documentMetaDisabled || isPackageDocument"
               :reserved-keys="KNOWLEDGE_RESERVED_PROPERTY_KEYS"
-              @change="updateMeta({ propertiesYaml: $event, expectedPropertiesYaml: document.propertiesYaml ?? '' })"
+              @change="onPropertiesChange"
               @shortcut-save="flushPendingChanges('manual')"
             />
 
@@ -1786,6 +1831,7 @@ function labelForProvider(provider?: string | null): string {
                 :model-value="summaryDraft"
                 :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
                 @quote-selection="onQuoteSelection('summary', $event)"
+                @selection-change="onEditorSelectionChange('summary', $event)"
                 :active="active"
                 :session-cache="markdownEditorSessions"
                 :session-pinned="isMarkdownEditorSessionPinned('summary')"
@@ -1835,6 +1881,7 @@ function labelForProvider(provider?: string | null): string {
                 :model-value="rulesPropertyValue"
                 :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
                 @quote-selection="onQuoteSelection('maintenanceRules', $event)"
+                @selection-change="onEditorSelectionChange('maintenanceRules', $event)"
                 :active="active"
                 :session-cache="markdownEditorSessions"
                 :session-pinned="isMarkdownEditorSessionPinned('maintenanceRules')"
@@ -1887,6 +1934,7 @@ function labelForProvider(provider?: string | null): string {
                   :model-value="bodyDraft"
                   :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
                   @quote-selection="onQuoteSelection('body', $event)"
+                  @selection-change="onEditorSelectionChange('body', $event)"
                   :active="active"
                   :session-cache="markdownEditorSessions"
                   :session-pinned="isMarkdownEditorSessionPinned('body')"
@@ -1909,10 +1957,6 @@ function labelForProvider(provider?: string | null): string {
                   @reference-pointer-down="onEditorReferencePointerDown"
                 />
             </section>
-
-            <div v-if="footerLabel" class="editor-footnote" :class="{ 'is-warning': footerWarning }">
-              {{ footerLabel }}
-            </div>
             </article>
           </div>
         </div>
@@ -2564,29 +2608,6 @@ function labelForProvider(provider?: string | null): string {
   line-height: 1.5;
 }
 
-.editor-footnote {
-  position: absolute;
-  right: 16px;
-  bottom: 10px;
-  display: inline-flex;
-  justify-content: flex-end;
-  margin: 0;
-  font-size: 11px;
-  line-height: 1;
-  color: var(--text-secondary);
-  opacity: 0.62;
-  pointer-events: none;
-  user-select: none;
-  text-align: right;
-  white-space: nowrap;
-  z-index: 1;
-}
-
-.editor-footnote.is-warning {
-  color: var(--status-warn-fg, var(--text-color));
-  opacity: 0.72;
-}
-
 @media (max-width: 860px) {
   .preview-support-layout,
   .preview-support-layout.has-two-sections,
@@ -2807,12 +2828,6 @@ function labelForProvider(provider?: string | null): string {
 
 .document-page .preview-search-hit {
   margin: 6px 0 8px;
-}
-
-.document-page .editor-footnote {
-  position: fixed;
-  right: 16px;
-  bottom: 10px;
 }
 
 @media (max-width: 860px) {
