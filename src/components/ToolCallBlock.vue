@@ -25,7 +25,8 @@ import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 import { resolveViewToolOpenId } from "./viewToolCallActions";
 import { resolveSkillLoadedMarkerForToolCall } from "./toolCallSkillLoadedMarker";
 import { parseToolSearchOutput } from "./toolSearchOutput";
-import { parseLegacyTodoWriteOutput, parseTodoWriteArguments } from "../composables/todoWrite";
+import { todoToolItems, todoToolOutput } from "../composables/todoWrite";
+import { nativeToolOutputDisplay } from "./nativeToolOutput";
 import { resolveToolFilePreviewPayload } from "./toolFilePreviewActions";
 import { normalizeAppError } from "../services/errors";
 import { openWorkbenchFileTab, WORKBENCH_FILE_OPEN_KEY } from "../services/workbenchFile";
@@ -220,14 +221,13 @@ const displayName = computed(() => {
 });
 
 const isEditTool = computed(() => props.toolCall.name === "edit");
-const isTodoWriteTool = computed(() => props.toolCall.name === "todowrite");
-const todoWriteItems = computed(() => (
-  isTodoWriteTool.value
-    ? parseTodoWriteArguments(props.toolCall.arguments)
-      ?? parseLegacyTodoWriteOutput(props.toolCall.output ?? "")
-      ?? []
-    : []
+const todoToolResult = computed(() => todoToolItems(
+  props.toolCall.name, props.toolCall.arguments, props.toolCall.output ?? "", props.toolCall.status,
 ));
+const isTodoWriteTool = computed(() => todoToolResult.value !== null);
+const todoWriteItems = computed(() => todoToolResult.value ?? []);
+const todoWriteOutput = computed(() => isTodoWriteTool.value
+  ? todoToolOutput(props.toolCall.name, props.toolCall.output ?? "") : "");
 const todoWriteRemainingCount = computed(() => todoWriteItems.value.filter(
   (todo) => todo.status !== "completed" && todo.status !== "cancelled",
 ).length);
@@ -512,7 +512,12 @@ const outputDisplay = computed(() => {
 });
 
 const displayOutput = computed(() => {
+  if (todoWriteOutput.value) return todoWriteOutput.value;
   const text = outputDisplay.value.text;
+  if (outputDisplay.value.kind === "normal" && props.toolCall.status !== "error") {
+    const native = nativeToolOutputDisplay(props.toolCall.name, text);
+    if (native !== null) return native;
+  }
   if (props.toolCall.name !== "read") return text;
   const contentMatch = text.match(/^<content>\r?\n?([\s\S]*?)\r?\n?<\/content>\s*$/);
   return contentMatch?.[1] ?? text;
@@ -520,7 +525,7 @@ const displayOutput = computed(() => {
 const isDeletedOutput = computed(() => outputDisplay.value.kind === "deleted");
 const deletedOutputPath = computed(() => outputDisplay.value.path || "");
 const toolSearchOutput = computed(() => {
-  if (props.toolCall.name !== "tool_search" || outputDisplay.value.kind !== "normal") {
+  if (!["tool_search", "ToolSearch"].includes(props.toolCall.name) || outputDisplay.value.kind !== "normal") {
     return null;
   }
   return parseToolSearchOutput(displayOutput.value);
@@ -692,7 +697,7 @@ const highlightedOutput = computed(() => {
         </div>
         <pre v-else-if="rawArgsFallback" class="tool-call-pre ui-select-text">{{ rawArgsFallback }}</pre>
       </div>
-      <div v-if="!isTodoWriteTool && (toolCall.output !== undefined || toolCall.status === 'running')" class="tool-call-section">
+      <div v-if="(!isTodoWriteTool || todoWriteOutput) && (toolCall.output !== undefined || toolCall.status === 'running')" class="tool-call-section">
         <div class="tool-call-section-label">
           {{ t("tool.section.output") }}
           <span v-if="toolCall.status === 'running' && displayedToolOutput" class="output-streaming-indicator"></span>

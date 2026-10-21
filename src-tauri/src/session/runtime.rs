@@ -121,6 +121,13 @@ impl SessionRuntimeRegistry {
         let status = runtime_status_for_event(event);
         match self.sessions.lock() {
             Ok(mut sessions) => {
+                // Display-only CLI callbacks must not resurrect a completed run
+                // or replace a newer session snapshot with an old renderer update.
+                if matches!(event, StreamEvent::ClaudeCodePhase { .. } | StreamEvent::ClaudeCodeNotice { .. })
+                    && !sessions.get(session_id).is_some_and(|snapshot| snapshot.active_run.run_id == run_id)
+                {
+                    return;
+                }
                 let snapshot = ensure_snapshot(
                     &mut sessions,
                     session_id,
@@ -169,6 +176,7 @@ fn empty_snapshot(
         active_tool_calls: Vec::new(),
         streaming_text: String::new(),
         streaming_thinking: String::new(),
+        claude_code_phase: None,
         live_render_parts: Vec::new(),
         stream_sequence: 0,
         streaming_text_order: 0,
@@ -243,7 +251,9 @@ fn runtime_status_for_event(event: &StreamEvent) -> Option<&'static str> {
         StreamEvent::AskUser { .. } | StreamEvent::ToolConfirm { .. } => {
             Some(RUN_STATUS_WAITING_INPUT)
         }
-        StreamEvent::KnowledgeProposal { .. }
+        StreamEvent::ClaudeCodePhase { .. }
+        | StreamEvent::ClaudeCodeNotice { .. }
+        | StreamEvent::KnowledgeProposal { .. }
         | StreamEvent::PendingInputQueued { .. }
         | StreamEvent::PendingInputDeleted { .. }
         | StreamEvent::PendingInputAccepted { .. }
@@ -263,6 +273,8 @@ fn event_session_id(event: &StreamEvent) -> &str {
         | StreamEvent::PendingInputDeleted { session_id, .. }
         | StreamEvent::PendingInputAccepted { session_id, .. }
         | StreamEvent::TextDelta { session_id, .. }
+        | StreamEvent::ClaudeCodePhase { session_id, .. }
+        | StreamEvent::ClaudeCodeNotice { session_id, .. }
         | StreamEvent::ThinkingDelta { session_id, .. }
         | StreamEvent::ToolCallStart { session_id, .. }
         | StreamEvent::ToolCallDone { session_id, .. }
@@ -314,6 +326,14 @@ fn apply_event_to_snapshot(
                 part_id.as_deref(),
                 *render_seq,
             );
+        }
+        StreamEvent::ClaudeCodePhase { phase, .. } => {
+            snapshot.claude_code_phase = Some(*phase);
+            if *phase == crate::session::models::ClaudeCodePhase::Recovering {
+                set_snapshot_run_status(snapshot, RUN_STATUS_RUNNING);
+                snapshot.pending_question = None;
+                snapshot.pending_tool_confirms.clear();
+            }
         }
         StreamEvent::ThinkingDelta {
             text,
@@ -457,6 +477,7 @@ fn apply_event_to_snapshot(
             tool_call_id,
             question,
             options,
+            questions,
             ..
         } => {
             snapshot.pending_question = Some(PendingQuestion {
@@ -464,6 +485,7 @@ fn apply_event_to_snapshot(
                 tool_call_id: tool_call_id.clone(),
                 question: question.clone(),
                 options: options.clone(),
+                questions: questions.clone(),
             });
         }
         StreamEvent::ToolConfirm {
@@ -500,7 +522,15 @@ fn apply_event_to_snapshot(
         StreamEvent::CompactDone { .. } => {
             snapshot.is_compacting = false;
         }
-        StreamEvent::PendingInputQueued { .. }
+        StreamEvent::HistorySynchronized { .. } => {
+            let phase = snapshot.claude_code_phase;
+            reset_round_runtime(snapshot);
+            snapshot.claude_code_phase = phase;
+            snapshot.pending_question = None;
+            snapshot.pending_tool_confirms.clear();
+        }
+        StreamEvent::ClaudeCodeNotice { .. }
+        | StreamEvent::PendingInputQueued { .. }
         | StreamEvent::PendingInputDeleted { .. }
         | StreamEvent::PendingInputAccepted { .. }
         | StreamEvent::UserMessage { .. }
@@ -508,7 +538,6 @@ fn apply_event_to_snapshot(
         | StreamEvent::UsageUpdate { .. }
         | StreamEvent::UndoAvailable { .. }
         | StreamEvent::PlanModeChanged { .. }
-        | StreamEvent::HistorySynchronized { .. }
         | StreamEvent::Done { .. }
         | StreamEvent::Cancelled { .. }
         | StreamEvent::Error { .. } => {}
@@ -518,6 +547,7 @@ fn apply_event_to_snapshot(
 fn reset_round_runtime(snapshot: &mut SessionRuntimeSnapshot) {
     snapshot.streaming_text.clear();
     snapshot.streaming_thinking.clear();
+    snapshot.claude_code_phase = None;
     snapshot.live_render_parts.clear();
     snapshot.stream_sequence = 0;
     snapshot.streaming_text_order = 0;
@@ -767,6 +797,7 @@ fn tool_call_info_from_display(tool_call: &ToolCallDisplay) -> ToolCallInfo {
         order: tool_call.order,
         server_tool: None,
         server_tool_output: None,
+        server_tool_result: None,
         outcome: tool_call_outcome_from_status(&tool_call.status),
         recorded_output: tool_call.output.clone(),
         nested_tool_calls: tool_call
@@ -976,6 +1007,32 @@ mod tests {
     use crate::commands::{StreamEvent, ToolCallOutcome};
 
     #[test]
+    fn questionnaire_runtime_roundtrips_all_questions_and_clears_as_one_input() {
+        let registry = SessionRuntimeRegistry::default();
+        registry.start_run("s1", "run-1");
+        let form = crate::user_question::QuestionForm::parse(&serde_json::json!({"questions":[
+            {"question":"Targets?","header":"Targets","multiSelect":true,"options":[{"label":"A"},{"label":"B"}]},
+            {"question":"Why?","options":[]}
+        ]})).unwrap();
+        let event = StreamEvent::AskUser {
+            session_id:"s1".into(), question_id:"form-1".into(), tool_call_id:"ask-1".into(),
+            question:"Targets?".into(), options:Vec::new(), questions:form.questions,
+        };
+        registry.apply_stream_event("run-1", &event);
+        let snapshot = registry.snapshot("s1").unwrap();
+        let question = snapshot.pending_question.unwrap();
+        assert_eq!(question.questions.len(), 2);
+        let encoded = serde_json::to_value(&question).unwrap();
+        assert_eq!(encoded["questions"][0]["multiSelect"], true);
+        let restored: PendingQuestion = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.questions[0].header, "Targets");
+        let legacy: PendingQuestion = serde_json::from_value(serde_json::json!({"questionId":"old","toolCallId":"ask","question":"Choose","options":[]})).unwrap();
+        assert!(legacy.questions.is_empty());
+        registry.apply_stream_event("run-1", &StreamEvent::InputAnswered { session_id:"s1".into(), question_id:"form-1".into() });
+        assert!(registry.snapshot("s1").unwrap().pending_question.is_none());
+    }
+
+    #[test]
     fn runtime_snapshot_tracks_nested_subagent_tool_calls() {
         let registry = SessionRuntimeRegistry::default();
         registry.start_run("s1", "run-1");
@@ -1017,6 +1074,79 @@ mod tests {
         assert_eq!(nested.len(), 1);
         assert_eq!(nested[0].id, "read-1");
         assert_eq!(nested[0].status, ToolCallDisplayStatus::Running);
+    }
+
+    #[test]
+    fn claude_code_phase_is_status_only_and_cannot_revive_old_runs() {
+        use crate::session::models::ClaudeCodePhase;
+        let registry = SessionRuntimeRegistry::default();
+        let event = StreamEvent::ClaudeCodePhase { session_id: "s1".into(), phase: ClaudeCodePhase::Thinking };
+        registry.apply_stream_event("old", &event);
+        assert!(registry.snapshot("s1").is_none());
+        registry.start_run("s1", "current");
+        registry.update_run_status("current", RUN_STATUS_WAITING_INPUT);
+        registry.apply_stream_event("current", &event);
+        let snapshot = registry.snapshot("s1").unwrap();
+        assert_eq!(snapshot.claude_code_phase, Some(ClaudeCodePhase::Thinking));
+        assert_eq!(snapshot.active_run.status, RUN_STATUS_WAITING_INPUT);
+        assert!(!snapshot.is_thinking);
+        assert!(snapshot.streaming_thinking.is_empty() && snapshot.live_render_parts.is_empty());
+        assert_eq!(serde_json::to_value(&snapshot).unwrap()["claudeCodePhase"], "thinking");
+        registry.start_run("s1", "new");
+        registry.apply_stream_event("current", &event);
+        let snapshot = registry.snapshot("s1").unwrap();
+        assert_eq!(snapshot.active_run.run_id, "new");
+        assert_eq!(snapshot.claude_code_phase, None);
+        registry.update_run_status("new", RUN_STATUS_CANCELLED);
+        registry.apply_stream_event("new", &event);
+        assert!(registry.snapshot("s1").is_none());
+    }
+
+    #[test]
+    fn claude_diagnostics_do_not_finish_waiting_runs_or_revive_closed_runs() {
+        let registry = SessionRuntimeRegistry::default();
+        let event = StreamEvent::ClaudeCodeNotice {
+            session_id: "s1".into(),
+            notice: crate::error::AppError::new("claude_code.api_retry", "Retrying API request")
+                .severity(crate::error::ErrorSeverity::Warning),
+        };
+        registry.apply_stream_event("old", &event);
+        assert!(registry.snapshot("s1").is_none());
+        registry.start_run("s1", "current");
+        registry.update_run_status("current", RUN_STATUS_WAITING_INPUT);
+        registry.apply_stream_event("current", &event);
+        let snapshot = registry.snapshot("s1").unwrap();
+        assert_eq!(snapshot.active_run.status, RUN_STATUS_WAITING_INPUT);
+        assert!(snapshot.live_render_parts.is_empty());
+        registry.apply_stream_event("old", &event);
+        assert_eq!(registry.snapshot("s1").unwrap().active_run.run_id, "current");
+        registry.update_run_status("current", RUN_STATUS_DONE);
+        registry.apply_stream_event("current", &event);
+        assert!(registry.snapshot("s1").is_none());
+        assert_eq!(serde_json::to_value(event).unwrap()["type"], "claudeCodeNotice");
+    }
+
+    #[test]
+    fn claude_recovery_replaces_interrupted_runtime_and_terminal_error_clears_it() {
+        use crate::session::models::ClaudeCodePhase;
+        let registry = SessionRuntimeRegistry::default();
+        registry.start_run("s1", "run");
+        registry.apply_stream_event("run", &StreamEvent::ToolCallStart {
+            session_id: "s1".into(), tool_call_id: "write".into(), tool_name: "edit".into(),
+            arguments: "{}".into(), order: Some(1), part_id: None, render_seq: None,
+        });
+        registry.apply_stream_event("run", &StreamEvent::ClaudeCodePhase { session_id: "s1".into(), phase: ClaudeCodePhase::Recovering });
+        registry.apply_stream_event("run", &StreamEvent::HistorySynchronized { session_id: "s1".into(), messages: vec![] });
+        let snapshot = registry.snapshot("s1").unwrap();
+        assert_eq!(snapshot.active_run.run_id, "run");
+        assert_eq!(snapshot.claude_code_phase, Some(ClaudeCodePhase::Recovering));
+        assert!(snapshot.active_tool_calls.is_empty() && snapshot.live_render_parts.is_empty());
+        registry.apply_stream_event("run", &StreamEvent::Error {
+            session_id: "s1".into(), error: crate::error::AppError::new("chat.stream_failed", "retries exhausted"),
+        });
+        assert!(registry.snapshot("s1").is_none());
+        registry.apply_stream_event("run", &StreamEvent::ClaudeCodePhase { session_id: "s1".into(), phase: ClaudeCodePhase::Starting });
+        assert!(registry.snapshot("s1").is_none());
     }
 
     #[test]

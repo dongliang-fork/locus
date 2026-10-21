@@ -104,20 +104,12 @@ pub fn adapt(id: &str, tool: &str, input: &Value) -> Result<NativeCall, String> 
                 .as_array()
                 .filter(|q| !q.is_empty())
                 .ok_or("AskUserQuestion requires questions")?;
-            for question in questions {
-                if question["question"].as_str().unwrap_or_default().is_empty() {
-                    return Err("Question text is required".into());
-                }
-                if question["kind"]
-                    .as_str()
-                    .is_some_and(|kind| kind != "select" && kind != "text")
-                {
-                    return Err(
-                        "This question kind is not supported by the Locus question panel".into(),
-                    );
-                }
+            let form = crate::user_question::QuestionForm::parse(input)?;
+            let mut prompts = std::collections::HashSet::new();
+            if form.questions.iter().any(|q| !prompts.insert(q.question.clone())) {
+                return Err("Native AskUserQuestion requires distinct question text for its answer map".into());
             }
-            ("ask_user_question", questions[0].clone())
+            ("ask_user_question", json!({"questions": questions}))
         }
         _ => {
             return Err(format!(
@@ -153,17 +145,54 @@ pub fn finish_result(
     result: &super::ClaudeCodeToolResult,
     structured: Option<Value>,
 ) -> Value {
+    let mut answer = finish_result_inner(call, result, structured);
+    if answer.get("deny").is_some() {
+        // Failed executions also carry queued notifications. Never turn an
+        // error/interruption into a successful structured result.
+        let mut message = answer["deny"].as_str().unwrap_or_default().to_string();
+        for context in &result.context {
+            if !context.is_empty() && !message.contains(context) {
+                message.push_str("\n\n");
+                message.push_str(context);
+            }
+        }
+        answer["deny"] = json!(message);
+        if result.output == crate::session::history::INTERRUPTED_TOOL_RESULT
+            || result.output == super::native_journal::INTERRUPTED_DISPATCH_MESSAGE
+        {
+            answer["interrupted"] = json!(true);
+        }
+    } else {
+        let mut context = answer["context"].as_array().cloned().unwrap_or_default();
+        for text in &result.context {
+            let item = json!(text);
+            if !text.is_empty() && !context.contains(&item) { context.push(item); }
+        }
+        if !context.is_empty() { answer["context"] = json!(context); }
+    }
+    answer
+}
+
+fn finish_result_inner(
+    call: &NativeCall,
+    result: &super::ClaudeCodeToolResult,
+    structured: Option<Value>,
+) -> Value {
     if result.is_error || result.output == crate::session::history::INTERRUPTED_TOOL_RESULT {
         return json!({"callId":call.id,"deny":result.output});
     }
     if let Some(structured) = structured {
-        return json!({"callId":call.id,"result":structured});
+        let mut answer = json!({"callId":call.id,"result":structured});
+        if call.tool == "Write" || result.output.starts_with("<persisted-output>") {
+            answer["context"] = json!([result.output]);
+        }
+        return answer;
     }
     if call.tool == "Read" {
         if let Some(image) = result.images.as_ref().and_then(|images| images.first()) {
             let size = image.data.len() * 3 / 4
                 - image.data.chars().rev().take_while(|c| *c == '=').count();
-            return json!({"callId":call.id,"result":{"type":"image","file":{"base64":image.data,"type":image.mime_type,"originalSize":size}}});
+            return json!({"callId":call.id,"result":{"type":"image","file":{"base64":image.data,"type":image.mime_type,"originalSize":size}},"context":[result.output]});
         }
     }
     if call.tool == "Bash" && call.input["run_in_background"] == true {
@@ -175,7 +204,7 @@ pub fn finish_result(
             let id = serde_json::from_str::<String>(id).unwrap_or_else(|_| id.to_string());
             let code = format!("task = await locus.wait_task({}, timeout=30)\nprint(task.status, task.output)", json!(id));
             return json!({"callId":call.id,"result":{"stdout":"","stderr":"","interrupted":false,"backgroundTaskId":id},
-                "context":[format!("This background task runs in Locus. Read its output with mcp__locus__python, readonly=true, code: {code}. Use locus.get_task_status with the same task ID for a nonblocking check, or native TaskStop to stop it. Task APIs are scoped to the current Locus session.")]});
+                "context":[result.output, format!("This background task runs in Locus. Read its output with mcp__locus__python, readonly=true, code: {code}. Use locus.get_task_status with the same task ID for a nonblocking check, or native TaskStop to stop it. Task APIs are scoped to the current Locus session.")]});
         }
         // Immediate commands can finish during the background startup handshake.
     }
@@ -186,7 +215,16 @@ pub fn finish_result(
 /// Compare the actual Locus operation, not JSON spelling (e.g. replace_all=false).
 pub fn same_operation(id: &str, tool: &str, observed: &Value, forwarded: &Value) -> bool {
     // These adapters consume fields outside the canonical Locus arguments.
-    if matches!(tool, "TaskOutput" | "TaskStop" | "AskUserQuestion") {
+    if tool == "AskUserQuestion" {
+        return match (
+            crate::user_question::QuestionForm::parse(observed),
+            crate::user_question::QuestionForm::parse(forwarded),
+        ) {
+            (Ok(left), Ok(right)) => serde_json::to_value(left.questions).ok() == serde_json::to_value(right.questions).ok(),
+            _ => false,
+        };
+    }
+    if matches!(tool, "TaskOutput" | "TaskStop") {
         return observed.as_object().is_some_and(|fields| {
             fields
                 .iter()
@@ -301,7 +339,7 @@ mod tests {
     fn interrupted_locus_output_never_becomes_a_successful_native_write() {
         let call = adapt("write-cancelled","Write",&json!({"file_path":"a","content":"new content"})).unwrap();
         let output = super::super::ClaudeCodeToolResult {
-            output:crate::session::history::INTERRUPTED_TOOL_RESULT.into(),is_error:false,images:None,
+            output:crate::session::history::INTERRUPTED_TOOL_RESULT.into(),is_error:false,images:None,context:Vec::new(),
         };
         let reply = finish_result(&call,&output,Some(json!({"type":"create"})));
         assert_eq!(reply["deny"],crate::session::history::INTERRUPTED_TOOL_RESULT);
@@ -311,10 +349,10 @@ mod tests {
     #[test]
     fn background_result_unquotes_locus_ids_and_accepts_local_task_control(){
         let call=adapt("b1","Bash",&json!({"command":"sleep 1","run_in_background":true})).unwrap();
-        let output=super::super::ClaudeCodeToolResult{output:"Async task: id=\"t4\" status=queued notify=false".into(),is_error:false,images:None};
+        let output=super::super::ClaudeCodeToolResult{output:"Async task: id=\"t4\" status=queued notify=false".into(),is_error:false,images:None,context:Vec::new()};
         let result = finish_result(&call,&output,None);
         assert_eq!(result["result"]["backgroundTaskId"],"t4");
-        let context = result["context"][0].as_str().unwrap();
+        let context = result["context"][1].as_str().unwrap();
         assert!(context.contains("mcp__locus__python"));
         assert!(context.contains("readonly=true"));
         assert!(context.contains("await locus.wait_task(\"t4\", timeout=30)"));
@@ -412,6 +450,7 @@ mod tests {
         let call = adapt("image", "Read", &json!({"file_path":"image.png"})).unwrap();
         let mut result = super::super::ClaudeCodeToolResult {
             output: "Image file read. Image attached.".into(),
+            context: Vec::new(),
             is_error: false,
             images: Some(vec![crate::session::models::ImageData {
                 data: "aQ==".into(), mime_type: "image/png".into(), capture: None,
@@ -425,6 +464,91 @@ mod tests {
         let answer = finish_result(&call, &result, None);
         assert_eq!(answer["deny"], "permission denied");
         assert!(answer.get("result").is_none());
+    }
+
+    #[test]
+    fn every_native_result_branch_preserves_supplemental_context() {
+        let reminder = "<system-reminder>Background task completed.</system-reminder>";
+        let cases = [
+            ("Write", json!({"file_path":"a.md","content":"body"}), Some(json!({"type":"create","content":"body"})), "Created a.md\nKnowledge index: updated"),
+            ("Glob", json!({"pattern":"*"}), Some(json!({"filenames":["a.md"],"numFiles":1})), "Found 1 files"),
+            ("Grep", json!({"pattern":"match"}), Some(json!({"mode":"content","content":"match"})), "Found 1 matches"),
+            ("TaskOutput", json!({"task_id":"t1"}), Some(json!({"task":{"output":"done"}})), "Task t1: completed"),
+            ("TaskStop", json!({"task_id":"t1"}), Some(json!({"message":"Cancellation requested"})), "Cancellation requested"),
+            ("AskUserQuestion", json!({"questions":[{"question":"Continue?","options":[]}]}), Some(json!({"answers":{"Continue?":"Yes"}})), "User answered: Yes"),
+            ("Edit", json!({"file_path":"a.md","old_string":"old","new_string":"new"}), None, "Edited a.md\nKnowledge index: immediate update failed; filesystem watcher will retry"),
+            ("Read", json!({"file_path":"a.txt"}), None, "<content>\n1\tline\n\n(End of file — 1 lines total)\n</content>\n\nSkill runtime ready"),
+            ("Bash", json!({"command":"echo ok"}), None, "Exit code: 0\nok"),
+            ("Bash", json!({"command":"echo ok","run_in_background":true}), None, "Async task: id=\"t1\" status=queued notify=false"),
+        ];
+        for (tool, input, structured, output) in cases {
+            let call = adapt("notification", tool, &input).unwrap();
+            let result = super::super::ClaudeCodeToolResult {
+                output: output.into(), is_error: false, images: None, context: vec![reminder.into()],
+            };
+            let answer = finish_result(&call, &result, structured);
+            assert!(answer.get("deny").is_none(), "{tool}: {answer}");
+            let context = answer["context"].as_array().unwrap();
+            assert_eq!(context.iter().filter(|value| value.as_str() == Some(reminder)).count(), 1, "{tool}: {answer}");
+            if matches!(tool, "Write" | "Edit") { assert!(context.contains(&json!(output))); }
+            if tool == "Read" { assert!(context.contains(&json!("Skill runtime ready"))); }
+        }
+        let call = adapt("image", "Read", &json!({"file_path":"a.png"})).unwrap();
+        let result = super::super::ClaudeCodeToolResult {
+            output: "Image attached; runtime note".into(), is_error: false,
+            images: Some(vec![crate::session::models::ImageData { data:"aQ==".into(), mime_type:"image/png".into(), capture:None }]),
+            context: vec![reminder.into()],
+        };
+        let answer = finish_result(&call, &result, None);
+        assert_eq!(answer["result"]["file"]["base64"], "aQ==");
+        assert!(answer["context"].as_array().unwrap().contains(&json!(reminder)));
+        assert!(answer["context"].as_array().unwrap().contains(&json!(result.output)));
+    }
+
+    #[test]
+    fn native_adapter_errors_keep_the_reason_and_notifications() {
+        let call = adapt("bad-read", "Read", &json!({"file_path":"a.txt"})).unwrap();
+        let mut result: super::super::ClaudeCodeToolResult = crate::tool::ToolResult { output:"invalid frame".into(), is_error:false }.into();
+        result.context.push("Task completed".into());
+        let answer = finish_result(&call, &result, None);
+        assert!(answer["deny"].as_str().unwrap().contains("not a supported text frame"));
+        assert!(answer["deny"].as_str().unwrap().contains("Task completed"));
+        result.is_error = true;
+        result.output = "Permission denied".into();
+        let answer = finish_result(&call, &result, Some(json!({"must":"not succeed"})));
+        assert_eq!(answer["deny"], "Permission denied\n\nTask completed");
+        assert!(answer.get("result").is_none());
+        result.output = crate::session::history::INTERRUPTED_TOOL_RESULT.into();
+        let answer = finish_result(&call, &result, None);
+        assert_eq!(answer["interrupted"], true);
+        assert!(answer["deny"].as_str().unwrap().contains("Task completed"));
+    }
+
+    #[test]
+    fn persisted_structured_results_keep_the_full_output_reference() {
+        let call = adapt("large", "Glob", &json!({"pattern":"*"})).unwrap();
+        let result: super::super::ClaudeCodeToolResult = crate::tool::ToolResult {
+            output:"<persisted-output>Full output saved to: /tmp/result.txt</persisted-output>".into(), is_error:false,
+        }.into();
+        let answer = finish_result(&call, &result, Some(json!({"filenames":[],"numFiles":0,"truncated":true})));
+        assert_eq!(answer["context"], json!([result.output]));
+    }
+
+    #[test]
+    fn questions_are_forwarded_as_one_form_with_native_defaults_and_multi_select() {
+        let input = json!({"questions":[
+            {"question":"Targets?","header":"Targets","multiSelect":true,"options":[{"label":"A","description":"First"},{"label":"B","description":"Second"}]},
+            {"question":"Why?","kind":"text"}
+        ]});
+        let call = adapt("form", "AskUserQuestion", &input).unwrap();
+        assert_eq!(call.locus_input["questions"], input["questions"]);
+        assert_eq!(call.locus_input["questions"].as_array().unwrap().len(), 2);
+        let mut defaults = input.clone();
+        defaults["questions"][1]["multiSelect"] = json!(false);
+        assert!(same_operation("form", "AskUserQuestion", &input, &defaults));
+        defaults["questions"][0]["multiSelect"] = json!(false);
+        assert!(!same_operation("form", "AskUserQuestion", &input, &defaults));
+        assert!(adapt("duplicate", "AskUserQuestion", &json!({"questions":[{"question":"Same?"},{"question":"Same?"}]})).is_err());
     }
 
     #[test]

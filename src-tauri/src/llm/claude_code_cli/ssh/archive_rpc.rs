@@ -47,9 +47,9 @@ impl ArchiveRpc {
         true
     }
     pub fn cancel(&self,id:&str) { self.0.lock().unwrap_or_else(|e|e.into_inner()).remove(id); }
-    pub fn close(&self) {
+    pub fn close(&self, error: &str) {
         for (_,request) in self.0.lock().unwrap_or_else(|e|e.into_inner()).drain() {
-            let _=request.sender.send(Err("SSH connection closed during native archive synchronization".into()));
+            let _=request.sender.send(Err(error.to_string()));
         }
     }
 }
@@ -61,17 +61,17 @@ impl Transport {
         let _cancel=CancelOnDrop{rpc:self.archive_rpc.clone(),id:id.clone()};
         if request.get("type").is_none(){request["type"]=json!("archive");}
         request["id"]=json!(id);
-        if !self.alive(){return Err("SSH archive connection closed".into());}
+        if !self.alive(){return Err(self.failure());}
         // A large restore can fill the bounded writer queue. Preserve chunk /
         // commit ordering and wait for capacity instead of losing the commit.
-        self.send.send(request).await.map_err(|_|"SSH archive writer closed")?;
+        self.send.send(request).await.map_err(|_|self.failure())?;
         let response=tokio::time::timeout(Duration::from_secs(120),receiver).await;
         self.archive_rpc.cancel(&id);
-        response.map_err(|_|"Native archive synchronization timed out")?
-            .map_err(|_|"Native archive response channel closed")?
+        response.map_err(|_|super::super::turn_retry::disconnected("Native archive synchronization timed out"))?
+            .map_err(|_|self.failure())?
     }
     pub async fn archive_upload_chunk(&self,value:Value)->Result<(),String> {
-        if !self.alive(){return Err("SSH archive connection closed".into());}
-        self.send.send(value).await.map_err(|_|"SSH archive writer closed".into())
+        if !self.alive(){return Err(self.failure());}
+        self.send.send(value).await.map_err(|_|self.failure())
     }
 }

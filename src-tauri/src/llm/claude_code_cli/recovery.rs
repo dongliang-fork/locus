@@ -8,6 +8,9 @@ use serde_json::Value;
 #[cfg(test)]
 #[path = "recovery_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "turn_recovery_tests.rs"]
+mod turn_recovery_tests;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +30,8 @@ pub struct NativeMessage {
     pub timestamp: Option<String>,
     pub model: Option<String>,
     pub usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub is_error: bool,
@@ -54,6 +59,10 @@ pub struct NativeSnapshot {
     pub task_snapshot: Value,
     pub incomplete_tail: bool,
     pub pending_tool_ids: Vec<String>,
+    /// Native user records excluded from display, retained as UUIDs so recovery
+    /// can remove older projections without touching the source transcript.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_user_uuids: Vec<String>,
 }
 impl NativeSnapshot {
     pub fn validate(&self, expected: Option<&str>) -> Result<(), String> {
@@ -61,6 +70,13 @@ impl NativeSnapshot {
             || expected.is_some_and(|id| id != self.native_id)
             || self.digest.len() != 64 || !self.digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("Invalid or mismatched remote Claude snapshot".into());
+        }
+        let mut hidden = std::collections::HashSet::new();
+        let visible: std::collections::HashSet<_> = self.messages.iter().flat_map(|m| &m.uuids).collect();
+        for id in &self.hidden_user_uuids {
+            if uuid::Uuid::parse_str(id).is_err() || !hidden.insert(id) || visible.contains(id) {
+                return Err("Invalid hidden native user record identities".into());
+            }
         }
         let mut keys = std::collections::HashSet::new();
         for message in &self.messages {
@@ -137,6 +153,8 @@ pub struct SyncReport {
     pub warning: Option<String>,
     #[serde(skip)]
     pub resume_context: Option<String>,
+    #[serde(skip)]
+    pub completed_message: Option<ChatMessage>,
 }
 
 pub fn failed_tool_message() -> &'static str { super::native_journal::RECOVERY_FAILURE }
@@ -157,6 +175,31 @@ pub fn native_session_id(store:&SessionStore,id:&str)->Result<Option<String>,Str
 pub fn text_content(content: &Value) -> String {
     if let Some(text) = content.as_str() { return text.to_string(); }
     content.as_array().map(|blocks| blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default()
+}
+
+/// Native `user` is a storage/API role, not proof that a person typed the row.
+/// Keep this rule in sync with ssh_host.py; both consume the shared visibility
+/// fixtures. Never apply it to arbitrary Locus messages or tool result text.
+/// Filtering is display-only: ancestry and the native transcript stay intact.
+pub(super) fn hidden_native_user(row: &Value) -> bool {
+    if row["type"] != "user" || row["isCompactSummary"] == true { return false; }
+    let content = &row["message"]["content"];
+    if content.as_array().is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result")) {
+        return false;
+    }
+    let text = text_content(content);
+    if pending_input_token(&text).is_some() { return false; }
+    if ["isMeta", "isVisibleInTranscriptOnly", "isVirtual"].iter().any(|key| row[*key] == true) {
+        return true;
+    }
+    // A real prompt may deliberately quote the CLI's wrappers. New Locus
+    // inputs carry a pending receipt; native human prompts carry an origin.
+    if row["origin"]["kind"] == "human" { return false; }
+    let text = text.trim_start();
+    ["<command-name>", "<command-message>", "<command-args>",
+     "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+     "<bash-input>", "<bash-stdout>", "<bash-stderr>", "<bash-exit-code>",
+     "<task-notification>"].iter().any(|prefix| text.starts_with(*prefix))
 }
 
 pub fn assistant_content(content: &Value) -> ClaudeCodeAssistantMessage {
@@ -215,8 +258,12 @@ pub fn pending_input_text(token: &str, text: &str) -> String {
 }
 
 pub async fn fetch(id: &str, remote: &ssh::SshConfig, native: Option<&str>) -> Result<NativeSnapshot, String> {
+    fetch_snapshot(id, remote, native, false).await
+}
+
+async fn fetch_snapshot(id: &str, remote: &ssh::SshConfig, native: Option<&str>, require_idle: bool) -> Result<NativeSnapshot, String> {
     let (_transport, info) = ssh::Transport::start(remote, serde_json::json!({
-        "mode":"history", "sessionKey":ssh::session_key(id, remote), "nativeId":native,
+        "mode":"history", "sessionKey":ssh::session_key(id, remote), "nativeId":native, "requireIdle":require_idle,
     }), None).await?;
     let snapshot: NativeSnapshot = serde_json::from_value(info.history.ok_or("Remote host did not return a native history snapshot")?)
         .map_err(|e| format!("Invalid remote history snapshot: {e}"))?;
@@ -233,11 +280,18 @@ async fn synchronization_guard(id: &str) -> Result<tokio::sync::OwnedRwLockWrite
 }
 
 pub async fn synchronize(store: &SessionStore, id: &str, pending: Option<&str>) -> Result<SyncReport, String> {
-    synchronize_inner(store, id, pending, false).await
+    synchronize_inner(store, id, pending, false, false).await
 }
 
 pub async fn synchronize_for_compaction(store: &SessionStore, id: &str) -> Result<SyncReport, String> {
-    synchronize_inner(store, id, None, true).await
+    synchronize_inner(store, id, None, true, false).await
+}
+
+/// Automatic recovery must fetch the source before deciding whether an input
+/// was consumed. It also preserves every proven pending input, not just the
+/// prompt that started the interrupted run.
+pub(crate) async fn synchronize_for_retry(store: &SessionStore, id: &str, pending: Option<&str>) -> Result<SyncReport, String> {
+    synchronize_inner(store, id, pending, false, true).await
 }
 
 fn verified_live_session(store: &SessionStore, id: &str, pending: Option<&str>) -> Result<bool, String> {
@@ -252,13 +306,38 @@ fn verified_live_session(store: &SessionStore, id: &str, pending: Option<&str>) 
     Ok(false)
 }
 
-async fn synchronize_inner(store: &SessionStore, id: &str, pending: Option<&str>, compact: bool) -> Result<SyncReport, String> {
+async fn synchronize_inner(store: &SessionStore, id: &str, pending: Option<&str>, compact: bool, automatic: bool) -> Result<SyncReport, String> {
+    synchronize_with_fetch(store, id, pending, compact, automatic, |remote, native| async move {
+        if automatic {
+            // Wait for an orphaned remote host's exclusive lease to end.
+            return fetch_snapshot(id, &remote, native.as_deref(), true).await;
+        }
+        let archived = async {
+            let info=super::archive::backup_for_history(store,id,pending).await?.ok_or("No native archive")?;
+            super::archive::project(&info,&store.claude_archive_files(id)?)
+        }.await;
+        // A corrupt local archive/cache must not prevent reading the source server.
+        match archived { Ok(snapshot)=>Ok(snapshot), Err(_)=>fetch(id,&remote,native.as_deref()).await }
+    }).await
+}
+
+pub(crate) async fn synchronize_with_fetch<F, Fut>(
+    store: &SessionStore, id: &str, pending: Option<&str>, compact: bool, automatic: bool,
+    fetch: F,
+) -> Result<SyncReport, String>
+where
+    F: FnOnce(ssh::SshConfig, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<NativeSnapshot, String>>,
+{
+    let passive = pending.is_none() && !compact && !automatic;
+    if passive && store.active_run_for_session(id)?.is_some() { return Ok(SyncReport::default()); }
     let Some(remote) = recorded_remote(store, id)? else { return Ok(SyncReport::default()); };
     // A live, successfully streamed session already has its input/output lease.
     // Reuse it; do not open a second SSH connection before every prompt.
-    if verified_live_session(store,id,pending)? { return Ok(SyncReport::default()); }
+    if !automatic && verified_live_session(store,id,pending)? { return Ok(SyncReport::default()); }
     let _guard = synchronization_guard(id).await?;
-    if verified_live_session(store,id,pending)? { return Ok(SyncReport::default()); }
+    if passive && store.active_run_for_session(id)?.is_some() { return Ok(SyncReport::default()); }
+    if !automatic && verified_live_session(store,id,pending)? { return Ok(SyncReport::default()); }
     let native = native_session_id(store,id)?;
     if native.is_none() {
         // A new/API conversation has no bound native history to restore.
@@ -268,16 +347,24 @@ async fn synchronize_inner(store: &SessionStore, id: &str, pending: Option<&str>
         store.verify_claude_history_origin(id,&messages,&metadata,&pending_ids)?;
         return Ok(SyncReport::default());
     }
-    if !tui::is_prewarmed(id) { tui::close_session(id); }
-    let archived = async {
-        let info=super::archive::backup_for_history(store,id,pending).await?.ok_or("No native archive")?;
-        super::archive::project(&info,&store.claude_archive_files(id)?)
-    }.await;
-    // A corrupt local archive/cache must not prevent reading the source server.
-    let snapshot = match archived { Ok(snapshot)=>snapshot, Err(_)=>fetch(id,&remote,native.as_deref()).await? };
+    if automatic || !tui::is_prewarmed(id) { tui::close_session(id); }
+    let snapshot = fetch(remote.clone(), native.clone()).await?;
+    if passive && store.active_run_for_session(id)?.is_some() { return Ok(SyncReport::default()); }
     snapshot.validate(native.as_deref())?;
-    if snapshot.messages.is_empty() {
+    if snapshot.messages.is_empty() && !automatic {
         return Err("The remote Claude conversation has no committed messages. Local input was retained and was not automatically resubmitted.".into());
+    }
+    if snapshot.messages.is_empty() {
+        snapshot.can_continue()?;
+        // An empty source is proof of non-submission only when there are no
+        // acknowledged messages or operations to lose. Never replay accepted
+        // input merely because a server returned an empty transcript.
+        let messages = store.get_messages(id)?;
+        let metadata = store.get_response_request_metadata(id)?;
+        let unsent = store.claude_recovery_pending_messages(id, &messages, &metadata, pending)?;
+        if messages.iter().any(|message| !unsent.contains(&message.id)) {
+            return Err("Native Claude history is empty despite locally recorded activity; automatic recovery stopped without replaying input.".into());
+        }
     }
     let journal = super::native_journal::Journal::new(ssh::profile_root(id)?.join("calls"));
     let (resume_context, warning) = match snapshot.resume_context(&journal) {
@@ -291,14 +378,23 @@ async fn synchronize_inner(store: &SessionStore, id: &str, pending: Option<&str>
     // failed input. A later explicit submission still decides what to resume.
     let discard_local = resume_context.is_some() || pending_local.as_ref()
         .map_or(true,|ids|pending.is_some() && ids.iter().any(|old|Some(old.as_str())!=pending));
-    let changed = if discard_local {
-        store.rebuild_claude_native(id,&remote,&snapshot,&messages,pending)?
+    let rebuild = || if automatic {
+        store.rebuild_claude_native_for_retry(id, &remote, &snapshot, &messages, pending)
+    } else {
+        store.rebuild_claude_native(id, &remote, &snapshot, &messages, pending)
+    };
+    let changed = if passive {
+        // Opening a view is not authorization to discard unsubmitted input.
+        // In particular, a run may start while the remote snapshot is fetched.
+        store.reconcile_claude_native_if_idle(id, &remote, &snapshot, &messages)?
+    } else if discard_local {
+        rebuild()?
     } else {
         // Keep stable display identities and verified pre-compaction history in
         // the normal case. Inconsistent local projections are replaceable.
         match store.reconcile_claude_native(id,&remote,&snapshot,&messages,pending) {
             Ok(changed)=>changed,
-            Err(_)=>store.rebuild_claude_native(id,&remote,&snapshot,&messages,pending)?,
+            Err(_)=>rebuild()?,
         }
     };
     store.bind_claude_native_session(id,&remote,&snapshot.native_id)?;
@@ -306,5 +402,31 @@ async fn synchronize_inner(store: &SessionStore, id: &str, pending: Option<&str>
     if changed { tui::close_session(id); }
     store_session_id(id, &snapshot.native_id).await;
     if compact { snapshot.can_compact()?; }
-    Ok(SyncReport { changed, message_count: snapshot.messages.len(), native_id: Some(snapshot.native_id), warning, resume_context })
+    let completed_message = if automatic && warning.is_none() && resume_context.is_none() {
+        let current = store.get_messages(id)?;
+        let current_metadata = store.get_response_request_metadata(id)?;
+        let unsent = store.claude_recovery_pending_messages(id, &current, &current_metadata, pending)?;
+        completed_native_message(&snapshot, pending.and_then(|id| metadata.get(id)), &unsent)
+            .and_then(|native| current.into_iter().find(|message| current_metadata.get(&message.id)
+                .is_some_and(|value| value["claude_checkpoint"]["uuid"].as_str() == native.uuids.last().map(String::as_str))))
+    } else { None };
+    Ok(SyncReport { changed, message_count: snapshot.messages.len(), native_id: Some(snapshot.native_id), warning, resume_context, completed_message })
+}
+
+// A persisted end_turn after the interrupted input proves completion even if
+// its final bridge ACK was lost. Missing stop reasons, pending inputs/tools or
+// an unrelated old answer are never treated as completion.
+fn completed_native_message<'a>(snapshot: &'a NativeSnapshot, input: Option<&Value>, unsent: &[String]) -> Option<&'a NativeMessage> {
+    if snapshot.incomplete_tail || !snapshot.pending_tool_ids.is_empty() || !unsent.is_empty() { return None; }
+    let input = input?;
+    let last = snapshot.messages.last()?;
+    if last.role != MessageRole::Assistant || last.stop_reason.as_deref() != Some("end_turn")
+        || !assistant_content(&last.content).tool_calls.is_empty() { return None; }
+    let found = snapshot.messages[..snapshot.messages.len() - 1].iter().any(|message| {
+        message.role == MessageRole::User && (
+            input["claude_checkpoint"]["uuid"].as_str().is_some_and(|uuid| message.uuids.iter().any(|id| id == uuid))
+            || input["claude_pending_input"]["token"].as_str().is_some_and(|token|
+                pending_input_token(&text_content(&message.content)) == Some(token)))
+    });
+    found.then_some(last)
 }

@@ -50,7 +50,7 @@ impl ClaudeCodeHost for IdleHost {
     fn on_tool_call_start(&mut self, _: String, _: String) {}
     fn on_assistant_message(&mut self, _: ClaudeCodeAssistantMessage) -> Result<(), String> { Err("Unexpected output during prewarm".into()) }
     fn execute_tool<'a>(&'a mut self, _: &'a str, _: &'a str, _: serde_json::Value) -> ClaudeCodeHostFuture<'a> {
-        Box::pin(async { ClaudeCodeToolResult { output: "Tools cannot execute during prewarm".into(), is_error: true, images: None } })
+        Box::pin(async { ClaudeCodeToolResult { output: "Tools cannot execute during prewarm".into(), is_error: true, images: None, context: Vec::new() } })
     }
 }
 
@@ -59,6 +59,7 @@ fn launch(state: &mut Pool, options: ClaudeCodeCliOptions, permission: Permissio
     if state.jobs.contains_key(&id) { return; }
     let (done, receive) = tokio::sync::watch::channel(false);
     let job_id = id.clone();
+    let context = state.desired.as_ref().map(|(context, _)| context.clone());
     let generation = uuid::Uuid::new_v4().to_string();
     let job_generation = generation.clone();
     let task = tokio::spawn(async move {
@@ -92,18 +93,27 @@ fn launch(state: &mut Pool, options: ClaudeCodeCliOptions, permission: Permissio
         }).await;
         let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
         if state.jobs.get(&job_id).is_some_and(|job| job.generation == job_generation) {
-            if !matches!(result, Ok(Ok(()))) {
-                state.last_error = Some(match result {
-                    Ok(Err(error)) => error,
-                    _ => "Claude connection timed out".to_string(),
-                });
-                state.retry_after = Some(Instant::now() + Duration::from_secs(60));
-            }
+            record_result(&mut state, context.as_ref(), match result {
+                Ok(result) => result,
+                Err(_) => Err("Claude connection timed out".to_string()),
+            });
             state.jobs.remove(&job_id);
         }
         let _ = done.send(true);
     });
     state.jobs.insert(id, Job { generation, abort: task.abort_handle(), done: receive, claimed: false });
+}
+
+fn record_result(state: &mut Pool, context: Option<&Context>, result: Result<(), String>) {
+    if context.is_none() || context != state.desired.as_ref().map(|(context, _)| context) { return; }
+    match result {
+        Ok(()) => { state.last_error = None; state.retry_after = None; }
+        Err(error) => {
+            eprintln!("[Claude] connection failed: {error}");
+            state.last_error = Some(error);
+            state.retry_after = Some(Instant::now() + Duration::from_secs(60));
+        }
+    }
 }
 
 /// Called on selection, and by a lightweight foreground interest heartbeat.
@@ -112,7 +122,10 @@ pub(crate) fn maintain(context: Context, existing: Option<(String, Option<String
     // Background windows may keep sending interest heartbeats. Only an explicit
     // selection can replace another context; heartbeats must not churn the pool.
     if !warm_existing && state.desired.as_ref().is_none_or(|(desired, _)| desired != &context) { return; }
-    if state.desired.as_ref().is_none_or(|(desired, _)| desired != &context) { state.retry_after = None; }
+    if state.desired.as_ref().is_none_or(|(desired, _)| desired != &context) {
+        state.retry_after = None;
+        state.last_error = None;
+    }
     state.desired = Some((context.clone(), Instant::now()));
     if warm_existing {
         if let Some((id, resume)) = existing {
@@ -137,7 +150,6 @@ pub(crate) async fn connect(context: Context) -> Result<(), String> {
         let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
         state.manual = true;
         state.retry_after = None;
-        state.last_error = None;
     }
     maintain(context.clone(), None, true);
     reconcile_inner(true);
@@ -254,9 +266,13 @@ pub(super) struct PoolSnapshot {
     pub pending: Vec<String>,
     pub demanded: bool,
     pub retrying: bool,
+    pub last_error: Option<String>,
 }
 pub(super) fn status(config: &SshConfig, settings: &ConnectionSettings) -> PoolSnapshot {
     let state = pool().lock().unwrap_or_else(|e| e.into_inner());
+    pool_snapshot(&state, config, settings)
+}
+fn pool_snapshot(state: &Pool, config: &SshConfig, settings: &ConnectionSettings) -> PoolSnapshot {
     let spares: std::collections::HashSet<_> = state.spares.iter().filter(|s| &s.context.remote == config).map(|s| s.id.clone()).collect();
     let demanded = state.desired.as_ref().is_some_and(|(context, touched)| &context.remote == config
         && (settings.prewarm || state.manual) && context.configured(settings) && touched.elapsed() < Duration::from_secs(u64::from(settings.idle_minutes.clamp(1, 60)) * 60));
@@ -264,6 +280,8 @@ pub(super) fn status(config: &SshConfig, settings: &ConnectionSettings) -> PoolS
         pending: spares.iter().filter(|id| state.jobs.contains_key(*id)).cloned().collect(),
         spares, demanded,
         retrying: demanded && state.retry_after.is_some_and(|at| Instant::now() < at),
+        last_error: state.desired.as_ref().filter(|(context, _)| &context.remote == config && context.configured(settings))
+            .and(state.last_error.clone()),
     }
 }
 pub(crate) fn cancel_all() {
@@ -272,6 +290,7 @@ pub(crate) fn cancel_all() {
         state.desired = None;
         state.manual = false;
         state.last_error = None;
+        state.retry_after = None;
         let ids: Vec<_> = state.spares.drain(..).map(|s| s.id).collect();
         state.jobs.retain(|_, job| { if !job.claimed { job.abort.abort(); } job.claimed });
         ids
@@ -293,6 +312,32 @@ mod tests {
     fn context() -> Context {
         Context { cwd: "C:/workspace".into(), checkout: "checkout".into(), epoch: 3, model: "claude_code/claude-opus-5-5".into(),
             remote: SshConfig { target: "unused.invalid".into(), port: None, identity_file: None, known_hosts_file: None, cli_path: None }, permission: PermissionMode::Auto, runtime: Default::default(), native_tool_search: true }
+    }
+    #[test]
+    fn connection_failures_remain_visible_until_recovery_and_do_not_cross_contexts() {
+        let context = context();
+        let settings = ConnectionSettings { prewarm: true, remote: Some(context.remote.clone()), ..Default::default() };
+        let mut state = Pool { desired: Some((context.clone(), Instant::now())), ..Default::default() };
+        let error = "Claude plugin validation failed.\nregister.js:116: invalid helper";
+        record_result(&mut state, Some(&context), Err(error.into()));
+        let snapshot = pool_snapshot(&state, &context.remote, &settings);
+        assert!(snapshot.retrying);
+        assert_eq!(snapshot.last_error.as_deref(), Some(error));
+        state.retry_after = None; // Starting another attempt keeps its previous cause visible.
+        assert_eq!(pool_snapshot(&state, &context.remote, &settings).last_error.as_deref(), Some(error));
+        let other = Context { model: "claude_code/sonnet".into(), ..context.clone() };
+        record_result(&mut state, Some(&other), Ok(()));
+        assert_eq!(state.last_error.as_deref(), Some(error));
+        record_result(&mut state, Some(&other), Err("stale failure".into()));
+        assert_eq!(state.last_error.as_deref(), Some(error));
+        let another_server = SshConfig { target: "other.invalid".into(), ..context.remote.clone() };
+        assert!(pool_snapshot(&state, &another_server, &settings).last_error.is_none());
+        let changed = ConnectionSettings { permission_mode: PermissionMode::BypassPermissions, ..settings.clone() };
+        assert!(pool_snapshot(&state, &context.remote, &changed).last_error.is_none());
+        record_result(&mut state, Some(&context), Ok(()));
+        assert!(state.last_error.is_none());
+        assert!(state.retry_after.is_none());
+        assert!(pool_snapshot(&state, &context.remote, &settings).last_error.is_none());
     }
     #[test]
     fn allocation_is_exclusive_and_never_crosses_server_model_or_checkout() {

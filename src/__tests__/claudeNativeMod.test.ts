@@ -36,6 +36,85 @@ async function inputHarness(options: Record<string, any>) {
 }
 
 describe('Claude native tools Mod', () => {
+  it('bridges main TUI spinner transitions without thinking text, animation duplicates, or idle leakage', async () => {
+    const h = await inputHarness({ active: true, inputId: 'main', prompt: 'Hello' });
+    const api = { ...h.api, session: { ...h.api.session, usage: async () => ({ context: {} }) } };
+    const render = h.hooks.get('ui.render')!;
+    const next = vi.fn(async (event) => ({ unchanged: event }));
+    const spinner = (mode: string, requestId = 'main', surface = 'terminal') =>
+      render.run(api, { component: 'Spinner', requestId, surface, props: { mode, word: 'Random verb', message: 'Not a summary' } }, next);
+    const phases = () => h.events().filter(event => event.type === 'phase');
+    await spinner('thinking');
+    expect(phases()).toEqual([]);
+    await h.hooks.get('prompt.submit')!.run(api, { text: 'main' }, h.next);
+    const step = () => h.hooks.get('turn.step')!.run(api, {}, () => Object.assign((async function* () {
+      yield { kind: 'engine', ref: 1 }; // block start, no thinking text
+      yield { kind: 'text', text: 'Answer' };
+    })(), { result: Promise.resolve({ answer: 'Answer', toolUses: [], usage: {} }) }));
+    const first = step();
+    await first.next();
+    await spinner('requesting');
+    await spinner('thinking', 'subagent');
+    await spinner('thinking', 'main', 'desktop');
+    await spinner('unknown');
+    expect(phases()).toEqual([]);
+    const result = await spinner('thinking');
+    await spinner('thinking');
+    expect(result.unchanged.props.mode).toBe('thinking');
+    expect(phases()).toEqual([{ protocol: 1, type: 'phase', runId: 'main', stepId: 1, sequence: 1, phase: 'thinking' }]);
+    expect(h.events().some(event => event.type === 'thinking')).toBe(false);
+    await spinner('tool-input');
+    await spinner('tool-use');
+    await first.next();
+    await first.next();
+    expect(phases().map(event => event.phase)).toEqual(['thinking', 'tool-input', 'tool-use', 'responding']);
+    expect(phases().map(event => event.sequence)).toEqual([1, 2, 3, 4]);
+    const second = step();
+    await second.next();
+    await spinner('thinking');
+    expect(phases()[phases().length - 1]).toMatchObject({ stepId: 2, sequence: 1, phase: 'thinking' });
+    await second.next();
+    await second.next();
+    await h.hooks.get('turn.complete')!.run(api, {}, h.next);
+    const count = phases().length;
+    await spinner('thinking');
+    expect(phases()).toHaveLength(count);
+  });
+
+  it('uses progress-only thinking as a phase without inventing summary text', async () => {
+    const h = await inputHarness({ active: true, inputId: 'hidden', prompt: 'Hello' });
+    const api = { ...h.api, session: { ...h.api.session, usage: async () => ({ context: {} }) } };
+    await h.hooks.get('prompt.submit')!.run(api, { text: 'hidden' }, h.next);
+    const chunks = [{ kind: 'thinking', index: 0 }, { kind: 'text', text: 'Answer' }];
+    const stream = Object.assign((async function* () { yield* chunks; })(), { result: Promise.resolve({ answer: 'Answer', toolUses: [], usage: {} }) });
+    const received = [];
+    for await (const chunk of h.hooks.get('turn.step')!.run(api, {}, () => stream)) received.push(chunk);
+    expect(received).toEqual(chunks);
+    expect(h.events().filter(event => event.type === 'phase').map(event => event.phase)).toEqual(['thinking', 'responding']);
+    expect(h.events().some(event => event.type === 'thinking')).toBe(false);
+    expect(h.events().find(event => event.type === 'assistant').message.content).toEqual([{ type: 'text', text: 'Answer' }]);
+  });
+
+  it('does not let a failed status receipt break native rendering or output', async () => {
+    const h = await inputHarness({ active: true, inputId: 'main', prompt: 'Hello' });
+    const api = { ...h.api, session: { ...h.api.session, usage: async () => ({ context: {} }) } };
+    await h.hooks.get('prompt.submit')!.run(api, { text: 'main' }, h.next);
+    const fetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation(async (url, init) => {
+      if (JSON.parse(init.body).type === 'phase') throw new Error('status unavailable');
+      return fetch(url, init);
+    });
+    const stream = Object.assign((async function* () { yield { kind: 'engine', ref: 1 }; yield { kind: 'text', text: 'Answer' }; })(),
+      { result: Promise.resolve({ answer: 'Answer', toolUses: [], usage: {} }) });
+    const iterator = h.hooks.get('turn.step')!.run(api, {}, () => stream);
+    await iterator.next();
+    const next = vi.fn(async () => ({ native: true }));
+    await expect(h.hooks.get('ui.render')!.run(api, { surface: 'terminal', requestId: 'main', props: { mode: 'thinking' } }, next)).resolves.toEqual({ native: true });
+    expect(next).toHaveBeenCalledTimes(1);
+    expect((await iterator.next()).value).toEqual({ kind: 'text', text: 'Answer' });
+    await iterator.next();
+    expect(h.events().find(event => event.type === 'text')).toMatchObject({ text: 'Answer' });
+  });
   it.each(['user', 'attachment'])('persists a checkpoint for consumed mid-turn %s meta rows', async (type) => {
     const options = { active: true, inputId: 'main', insertion: { inputId: 'insert', submissionId: 'draft', prompt: 'New direction' } };
     const h = await inputHarness(options);
@@ -301,22 +380,171 @@ describe('Claude native tools Mod', () => {
     expect(h.fetch.mock.calls.map(call=>JSON.parse(call[1].body)).find(event=>event.type==='usage').timing)
       .toEqual({version:1,source:'claude-turn-step',requestStartedAtMs:100,firstOutputAtMs:300,responseStoppedAtMs:1100,resultReadyAtMs:21100,bridgeDurationMs:0,consumerPauseMs:0,outputChunks:1});
   });
-  it.each([false, true])('keeps native WebSearch in the CLI and records its outcome (error=%s)', async (fails) => {
+  it.each([
+    ['WebSearch', false], ['WebSearch', true], ['WebFetch', false], ['WebFetch', true],
+  ] as const)('keeps native %s in the CLI and records its outcome (error=%s)', async (tool, fails) => {
     const h=harness({active:true,inputId:'search',prompt:'Search'});
     const api={...h.api,env:{get:async(key:string)=>key==='LOCUS_CLAUDE_TUI'?'1':key.endsWith('_URL')?'http://127.0.0.1:19200':'test-token'},session:{model:async()=>'claude-opus-5-5',id:async()=>'session'}};
     await h.hooks.get('session.start')!.run(api,{},h.next);
     await h.hooks.get('prompt.submit')!.run(api,{text:'search'},h.next);
-    const native=vi.fn(async()=>{if(fails)throw Error('Search endpoint unavailable');return {result:{query:'probe',results:[{tool_use_id:'web',content:[{title:'Official',url:'https://code.claude.com/'}]}],durationSeconds:1}};});
-    const call=h.hooks.get('tool.call')!.run(api,{tool:'WebSearch',tool_use_id:'web',query:'probe'},native);
-    if(fails)await expect(call).rejects.toThrow('Search endpoint unavailable');else await expect(call).resolves.toHaveProperty('result.query','probe');
+    const input = tool === 'WebFetch' ? { url: 'https://example.com/', prompt: 'Extract the title' } : { query: 'probe' };
+    const output = tool === 'WebFetch' ? { result: { url: input.url, result: 'Example Domain\nExtracted by Claude' } }
+      : { result: { query: 'probe', results: [{ content: [{ title: 'Example', url: 'https://example.com/' }] }] } };
+    const native=vi.fn(async()=>{if(fails)throw Error('Web endpoint unavailable');return output;});
+    const call=h.hooks.get('tool.call')!.run(api,{tool,tool_use_id:'web',...input},native);
+    if(fails)await expect(call).rejects.toThrow('Web endpoint unavailable');else await expect(call).resolves.toEqual(output);
     expect(native).toHaveBeenCalledTimes(1);
     const events=h.fetch.mock.calls.map(call=>JSON.parse(call[1].body));
     expect(events.find(event=>event.type==='tool_result')).toMatchObject({id:'web',isError:fails});
     expect(h.fetch.mock.calls.every(call=>!call[0].endsWith('/call'))).toBe(true);
     const check=vi.fn(async()=>({decision:'allow'}));
-    await expect(h.hooks.get('tool.check')!.run(api,{tool:'WebSearch'},check)).resolves.toEqual({decision:'allow'});
+    await expect(h.hooks.get('tool.check')!.run(api,{tool},check)).resolves.toEqual({decision:'allow'});
     expect(check).toHaveBeenCalledTimes(1);
   });
+  it('rejects a remembered Locus web_fetch call without dispatch or fallback', async () => {
+    const h = await inputHarness({ active: true, inputId: 'fetch', prompt: 'Fetch' });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'fetch' }, h.next);
+    const native = vi.fn(async () => ({ result: 'must not run' }));
+    const result = await h.hooks.get('tool.call')!.run(h.api,
+      { tool: 'mcp__locus__web_fetch', tool_use_id: 'old-fetch', url: 'https://example.com/' }, native);
+    expect(result.deny).toContain('Use Claude Code WebFetch');
+    expect(native).not.toHaveBeenCalled();
+    expect(h.fetch.mock.calls.some(([url]) => url.endsWith('/call'))).toBe(false);
+    expect(h.events().find(e => e.type === 'tool_result')).toMatchObject({ id: 'old-fetch', isError: true });
+    expect(await h.hooks.get('tool.check')!.run(h.api, { tool: 'mcp__locus__web_fetch' }, native)).toHaveProperty('decision', 'deny');
+  });
+  it('runs four native searches concurrently even when the first takes longer than the 10 s hook budget', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = await inputHarness({ active: true, inputId: 'searches', prompt: 'Search' });
+      await h.hooks.get('prompt.submit')!.run(h.api, { text: 'searches' }, h.next);
+      const native = vi.fn(async (event: { tool_use_id: string }) => {
+        await new Promise(resolve => setTimeout(resolve, event.tool_use_id === 'a' ? 20000 : 1000));
+        return { result: event.tool_use_id };
+      });
+      const calls = ['a', 'b', 'c', 'd'].map(id => h.hooks.get('tool.call')!.run(h.api,
+        { tool: 'WebSearch', tool_use_id: id, query: id }, native));
+      await vi.advanceTimersByTimeAsync(11000);
+      expect(native).toHaveBeenCalledTimes(4);
+      expect(h.events().filter(e => e.type === 'tool_result').map(e => e.id)).toEqual(['b', 'c', 'd']);
+      expect(h.events().filter(e => e.type === 'assistant')).toHaveLength(4);
+      await vi.advanceTimersByTimeAsync(10000);
+      await Promise.all(calls);
+      expect(h.events().filter(e => e.type === 'tool_result').map(e => e.id)).toEqual(['b', 'c', 'd', 'a']);
+      expect(h.fetch.mock.calls.some(([url]) => url.endsWith('/call'))).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('cancels a dispatch before execution without stranding later calls or retrying a write', async () => {
+    const h = await inputHarness({ active: true, inputId: 'cancel', prompt: 'Run' });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'cancel' }, h.next);
+    await h.hooks.get('turn.start')!.run(h.api, { turnId: 'native-turn' }, h.next);
+    const abort = new AbortController(); abort.abort();
+    const next = Object.assign(vi.fn(async () => ({ result: 'must not execute' })), { signal: abort.signal, called: false });
+    const event = { tool: 'Write', tool_use_id: 'cancelled-write', file_path: 'a', content: 'no' };
+    await expect(h.hooks.get('tool.call')!.run(h.api, event, next)).rejects.toThrow('interrupted');
+    expect(await h.hooks.get('tool.call')!.fail!(h.api, event, next)).toHaveProperty('deny');
+    expect(next).not.toHaveBeenCalled();
+    expect(h.fetch.mock.calls.some(([url]) => url.endsWith('/call'))).toBe(false);
+    expect(h.events().find(e => e.type === 'turn_interrupted')).toMatchObject({ runId: 'cancel', id: 'cancel:1' });
+    expect(h.events().find(e => e.type === 'tool_result')).toMatchObject({ id: 'cancelled-write', isError: true });
+    expect(h.events().findIndex(e => e.type === 'turn_interrupted')).toBeLessThan(h.events().findIndex(e => e.type === 'tool_result'));
+    expect(h.events().some(e => e.type === 'bridge_fault')).toBe(false);
+    const native = vi.fn(async () => ({ result: 'later search' }));
+    await h.hooks.get('tool.call')!.run(h.api, { tool: 'WebSearch', tool_use_id: 'later', query: 'ok' }, native);
+    expect(native).toHaveBeenCalledTimes(1);
+  });
+
+  it('never claims an interrupted submitted write was unexecuted and never submits it twice', async () => {
+    const h = await inputHarness({ active: true, inputId: 'write', prompt: 'Run' });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'write' }, h.next);
+    await h.hooks.get('turn.start')!.run(h.api, { turnId: 'native-turn' }, h.next);
+    const abort = new AbortController();
+    const next = Object.assign(vi.fn(), { signal: abort.signal, called: false });
+    const fetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation(async (url, init) => {
+      if (url.endsWith('/call')) { abort.abort(); throw Error('dispatch interrupted after submission'); }
+      return fetch(url, init);
+    });
+    const event = { tool: 'Write', tool_use_id: 'write-once', file_path: 'a', content: 'one' };
+    await expect(h.hooks.get('tool.call')!.run(h.api, event, next)).rejects.toThrow('after submission');
+    const result = await h.hooks.get('tool.call')!.fail!(h.api, event, next);
+    expect(result.deny).toContain('outcome may be unknown');
+    expect(result.deny).not.toContain('before execution');
+    expect(h.fetch.mock.calls.filter(([url]) => url.endsWith('/call'))).toHaveLength(1);
+    expect(next).not.toHaveBeenCalled();
+    expect(h.events().findIndex(e => e.type === 'turn_interrupted')).toBeLessThan(h.events().findIndex(e => e.type === 'tool_result'));
+  });
+
+  it('reports a hook timeout and ends the bridge instead of leaving a silent denial', async () => {
+    const h = await inputHarness({ active: true, inputId: 'timeout', prompt: 'Run' });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'timeout' }, h.next);
+    const abort = new AbortController(); abort.abort();
+    const next = Object.assign(vi.fn(), { signal: abort.signal, called: false, error: { kind: 'timeout' } });
+    await h.hooks.get('tool.call')!.fail!(h.api, { tool: 'WebSearch', tool_use_id: 'timed-out', query: 'probe' }, next);
+    expect(h.events().filter(e => e.type === 'assistant')).toHaveLength(1);
+    expect(h.events().filter(e => e.type === 'tool_result')).toHaveLength(1);
+    expect(h.events().find(e => e.type === 'bridge_fault')).toMatchObject({ runId: 'timeout' });
+    expect(h.events().findIndex(e => e.type === 'bridge_fault')).toBeLessThan(h.events().findIndex(e => e.type === 'tool_result'));
+    expect(next).not.toHaveBeenCalled();
+    expect(await h.hooks.get('tool.call')!.run(h.api, { tool: 'Write', tool_use_id: 'later' }, next)).toHaveProperty('deny');
+  });
+
+  it('rejects an active worker replacement before registering input timers or submitting another prompt', async () => {
+    const h = harness();
+    const api = { ...h.api, env: { get: async (key: string) => key === 'LOCUS_CLAUDE_TUI' ? '1' : key.endsWith('_URL') ? 'http://127.0.0.1:19200' : 'test-token' },
+      session: { id: async () => 'native', model: async () => 'test' } };
+    h.fetch.mockImplementation(async (url) => ({ ok: true, status: 200, text: JSON.stringify(url.endsWith('/ready')
+      ? { deny: 'Claude hooks worker restarted during an active turn' } : { active: true, inputId: 'old', tools: [] }) }));
+    await expect(h.hooks.get('session.start')!.run(api, {}, h.next)).rejects.toThrow('worker restarted');
+    expect(h.api.clock.every).not.toHaveBeenCalled();
+    expect(h.next).not.toHaveBeenCalled();
+    expect(await h.hooks.get('prompt.submit')!.run(api, { text: 'old' }, h.next)).toHaveProperty('drop');
+    expect(await h.hooks.get('tool.call')!.run(api, { tool: 'WebSearch', tool_use_id: 'web' }, h.next)).toHaveProperty('deny');
+  });
+
+  it('reports health during a slow native call and a terminal state after a lost completion', async () => {
+    const h = await inputHarness({ active: true, inputId: 'health', prompt: 'Run' });
+    const health = (h.api.clock.every.mock.calls.find(call => call[0] === 2000) as unknown as [number, () => Promise<void>])[1];
+    await health();
+    expect(h.events().some(e => e.type === 'bridge_health')).toBe(false);
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'health' }, h.next);
+    let finish!: (value: unknown) => void;
+    const call = h.hooks.get('tool.call')!.run(h.api, { tool: 'WebSearch', tool_use_id: 'web', query: 'slow' }, () => new Promise(resolve => { finish = resolve; }));
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    await health();
+    expect(h.events().filter(e => e.type === 'bridge_health').slice(-1)[0]).toMatchObject({ runId: 'health', state: 'running' });
+    finish({ result: 'done' }); await call;
+    const fetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation(async (url, init) => {
+      if (JSON.parse(init.body).type === 'complete') throw Error('lost completion receipt');
+      return fetch(url, init);
+    });
+    await expect(h.hooks.get('turn.complete')!.run(h.api, {}, h.next)).rejects.toThrow('lost completion');
+    await h.hooks.get('turn.complete')!.fail!(h.api, {}, h.next);
+    await health();
+    expect(h.events().filter(e => e.type === 'bridge_health').slice(-1)[0]).toMatchObject({ runId: 'health', state: 'complete' });
+    expect(h.events().some(e => e.type === 'bridge_fault')).toBe(true);
+  });
+
+  it('replays a completed native result from catch and observes its authoritative append without rerunning it', async () => {
+    const h = await inputHarness({ active: true, inputId: 'replay', prompt: 'Run' });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'replay' }, h.next);
+    const event = { tool: 'WebSearch', tool_use_id: 'web', query: 'probe' };
+    const native = vi.fn(async () => ({ result: 'actual result' }));
+    await h.hooks.get('tool.call')!.run(h.api, event, native);
+    const replay = Object.assign(vi.fn(async () => ({ result: 'actual result' })), { called: true });
+    await h.hooks.get('tool.call')!.fail!(h.api, event, replay);
+    await h.hooks.get('session.append')!.run(h.api, { uuid: 'result', door: 'tool', message: { type: 'user', role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'web', content: 'actual result' },
+    ] } }, h.next);
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(replay).toHaveBeenCalledTimes(1);
+    expect(h.events().filter(e => e.type === 'assistant')).toHaveLength(1);
+    expect(h.events().filter(e => e.type === 'tool_result')).toHaveLength(3); // host identity ledger deduplicates
+    expect(h.events().some(e => e.type === 'bridge_fault')).toBe(false);
+  });
+
   it('synchronizes the actual native task list without rerunning a mutation', async () => {
     const h=harness({active:true,inputId:'main',prompt:'Tasks'});
     const task={id:'1',subject:'Task A',description:'details',status:'completed',blocks:[],blockedBy:[]};
@@ -437,6 +665,96 @@ describe('Claude native tools Mod', () => {
     expect(events.find(e=>e.type==='checkpoint')).toMatchObject({uuid:'actual-row',text:'Run /model'});
   });
 
+  it.each(['model_refusal_no_fallback', 'model_refusal_fallback', 'model_fallback', 'model_consent_fallback', 'instruction_size_warning', 'permission_denied', 'file_attachments_missing', 'error'])(
+    'forwards native %s warnings without changing the native transcript or emitting a checkpoint', async (kind) => {
+      const h = await inputHarness({ active: true, inputId: 'input', prompt: 'question' });
+      await h.hooks.get('prompt.submit')!.run(h.api, { text: 'input' }, h.next);
+      const event = { uuid: 'notice', door: 'note', origin: { kind: 'engine' }, message: {
+        type: 'system', name: kind, content: [{ type: 'text', text: 'Native explanation' }],
+      } };
+      const append = vi.fn(async e => e);
+      await h.hooks.get('session.append')!.run(h.api, event, append);
+      expect(append).toHaveBeenCalledExactlyOnceWith(event);
+      expect(h.events().filter(e => e.type === 'diagnostic')).toEqual([
+        { protocol: 1, type: 'diagnostic', runId: 'input', kind, text: 'Native explanation' },
+      ]);
+      expect(h.events().some(e => ['checkpoint', 'assistant', 'text'].includes(e.type))).toBe(false);
+    },
+  );
+
+  it('reports retry activity even when the native append projection omits counters and error text', async () => {
+    const h = await inputHarness({ active: true, inputId: 'input', prompt: 'question' });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'input' }, h.next);
+    await h.hooks.get('session.append')!.run(h.api, { uuid: 'retry', door: 'note', origin: { kind: 'engine' },
+      message: { type: 'system', name: 'api_error', content: [] } }, h.next);
+    expect(h.events().find(e => e.type === 'diagnostic')).toMatchObject({ kind: 'api_retry', text: 'Claude Code is retrying an API request.' });
+  });
+
+  it.each(['instruction_size_warning', 'file_attachments_missing', 'model_refusal_no_fallback'])(
+    'still reports %s when native projection contains no display text', async (name) => {
+      const h = await inputHarness({ active: true, inputId: 'input', prompt: 'question' });
+      await h.hooks.get('prompt.submit')!.run(h.api, { text: 'input' }, h.next);
+      await h.hooks.get('session.append')!.run(h.api, { uuid: 'warning', door: 'note', origin: { kind: 'engine' },
+        message: { type: 'system', name, content: [] } }, h.next);
+      expect(h.events().find(e => e.type === 'diagnostic')).toMatchObject({ kind: name, text: expect.any(String) });
+      expect(h.events().find(e => e.type === 'diagnostic').text.length).toBeGreaterThan(0);
+    },
+  );
+
+  it('preserves input blocked by a native hook instead of waiting for the generic input timeout', async () => {
+    const h = await inputHarness({ active: true, inputId: 'input', prompt: 'question' });
+    const denied = { drop: 'Prompt blocked by organization hook' };
+    const next = vi.fn(async () => denied);
+    expect(await h.hooks.get('prompt.submit')!.run(h.api, { text: 'input' }, next)).toBe(denied);
+    expect(h.events().find(e => e.type === 'input_error')).toMatchObject({ error: denied.drop });
+    expect(h.events().some(e => e.type === 'input_queued')).toBe(false);
+  });
+
+  it('preserves prompt and command hook failure details', async () => {
+    const h = await inputHarness({ active: true, inputId: 'input', prompt: 'question' });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'input' }, h.next);
+    const next = Object.assign(vi.fn(), { error: { message: 'Native hook budget exceeded' } });
+    expect(await h.hooks.get('prompt.submit')!.fail!(h.api, {}, next)).toEqual({ drop: 'Locus input bridge failed. Native hook budget exceeded' });
+    await h.hooks.get('command.run')!.fail!(h.api, { command: 'compact' }, next);
+    expect(h.events().filter(e => e.type === 'input_error').map(e => e.error)).toEqual([
+      'Locus input bridge failed. Native hook budget exceeded', 'Claude command failed: /compact. Native hook budget exceeded',
+    ]);
+  });
+
+  it('does not leak idle, subagent, plugin, or ordinary system records as warnings', async () => {
+    const options = { active: true, inputId: 'input', prompt: 'question' };
+    const h = await inputHarness(options);
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'input' }, h.next);
+    const row = { uuid: 'row', door: 'note', origin: { kind: 'engine' }, message: {
+      type: 'system', name: 'model_fallback', content: [{ type: 'text', text: 'Fallback notice' }],
+    } };
+    await h.hooks.get('session.append')!.run(h.api, { ...row, agentId: 'subagent' }, h.next);
+    await h.hooks.get('session.append')!.run(h.api, { ...row, origin: { kind: 'plugin', name: 'custom' } }, h.next);
+    await h.hooks.get('session.append')!.run(h.api, { ...row, message: { ...row.message, name: 'turn_duration' } }, h.next);
+    options.active = false;
+    await h.hooks.get('session.append')!.run(h.api, row, h.next);
+    expect(h.events().filter(e => e.type === 'diagnostic')).toEqual([]);
+  });
+
+  it('reports native permission denial without approving or executing the operation', async () => {
+    const h = await inputHarness({ active: true, inputId: 'input', prompt: 'question' });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'input' }, h.next);
+    const deny = { decision: 'deny', reason: 'Blocked by managed policy' };
+    const next = vi.fn(async () => deny);
+    expect(await h.hooks.get('tool.check')!.run(h.api, { tool: 'WebFetch' }, next)).toBe(deny);
+    expect(next).toHaveBeenCalledOnce();
+    expect(h.events().find(e => e.type === 'diagnostic')).toMatchObject({ kind: 'tool_denied', text: 'WebFetch: Blocked by managed policy' });
+    expect(h.events().some(e => ['assistant', 'tool_result'].includes(e.type))).toBe(false);
+  });
+
+  it('preserves structured refusal details on completion with unfinished streamed tool input', async () => {
+    const h = await inputHarness({ active: true, inputId: 'input', prompt: 'question' });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'input' }, h.next);
+    const verdict = { reason: 'refusal', isAborted: false, answer: '', refusal: { category: 'policy', explanation: 'Output blocked' } };
+    await h.hooks.get('turn.complete')!.run(h.api, verdict, h.next);
+    expect(h.events().find(e => e.type === 'complete')).toMatchObject(verdict);
+  });
+
   it('removes only the CLI environment attachment, including on resume and hook failure', async () => {
     const h = harness();
     const api = { ...h.api, env: { get: async () => '1' } };
@@ -462,8 +780,31 @@ describe('Claude native tools Mod', () => {
     for await (const _chunk of h.hooks.get('turn.step')!.run(api, { model: 'requested-model' }, next)) { /* consume */ }
     const events = h.fetch.mock.calls.map(call => JSON.parse(call[1].body));
     expect(events.find(event => event.type === 'step_start')).toMatchObject({ model: 'requested-model' });
-    expect(events.find(event => event.type === 'usage')).toMatchObject({ usage, context: { window: 200000 } });
+    expect(events.find(event => event.type === 'usage')).toMatchObject({ stepId: 1, usage, context: { window: 200000 } });
     expect(events.findIndex(event => event.type === 'usage')).toBeLessThan(events.findIndex(event => event.type === 'assistant'));
+  });
+
+  it('keeps each request usage and identity within one long native turn', async () => {
+    const h = harness({ active: true, inputId: 'usage-turn', prompt: 'hello' });
+    const api = { ...h.api, env: { get: async (key: string) => key === 'LOCUS_CLAUDE_TUI' ? '1' : key.endsWith('_URL') ? 'http://127.0.0.1:19200' : 'test-token' },
+      session: { model: async () => 'actual-model', id: async () => 'session', usage: async () => ({ context: { window: 200000 } }) } };
+    await h.hooks.get('session.start')!.run(api, {}, h.next);
+    await h.hooks.get('prompt.submit')!.run(api, { text: 'usage-turn' }, h.next);
+    const samples = [
+      { model: 'actual-model', input_tokens: 5, output_tokens: 7, cache_read_input_tokens: 100000, cache_creation_input_tokens: 1000 },
+      { model: 'actual-model', input_tokens: 5, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 102000 },
+    ];
+    for (const usage of samples) {
+      const next = () => Object.assign((async function* () { yield { kind: 'text', text: 'answer' }; })(), {
+        result: Promise.resolve({ answer: 'answer', toolUses: [], usage }),
+      });
+      for await (const _ of h.hooks.get('turn.step')!.run(api, { model: 'actual-model' }, next)) { /* consume */ }
+    }
+    const receipts = h.fetch.mock.calls.map(call => JSON.parse(call[1].body)).filter(e => e.type === 'usage');
+    expect(receipts).toHaveLength(2);
+    expect(receipts.map(e => e.stepId)).toEqual([1, 2]);
+    expect(receipts.map(e => e.runId)).toEqual(['usage-turn', 'usage-turn']);
+    expect(receipts.map(e => e.usage)).toEqual(samples);
   });
 
   it('preserves the CLI-resolved model instead of sending the GUI alias upstream', async () => {
@@ -512,7 +853,7 @@ describe('Claude native tools Mod', () => {
     await h.hooks.get('command.run')!.run(api, { command: 'compact', args: '' }, h.next);
     h.next.mockClear();
     h.fetch.mockClear();
-    for (const tool of ['Edit', 'Bash', 'mcp__locus__unity_recompile', 'TaskUpdate', 'WebSearch']) {
+    for (const tool of ['Edit', 'Bash', 'mcp__locus__unity_recompile', 'TaskUpdate', 'WebSearch', 'WebFetch']) {
       expect(await h.hooks.get('tool.call')!.run(api, { tool, tool_use_id: 'interrupted' }, h.next))
         .toEqual({ deny: 'Tool execution is disabled during Locus compaction.' });
       expect(await h.hooks.get('tool.check')!.run(api, { tool, input: {} }, h.next))
@@ -558,6 +899,14 @@ describe('Claude native tools Mod', () => {
     expect(h.next).not.toHaveBeenCalled();
   });
 
+  it.each(['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'TaskOutput', 'TaskStop', 'AskUserQuestion'])('preserves %s protocol/context without leaking the journal display envelope', async (tool) => {
+    const result = { marker: 'native protocol' };
+    const context = ['Knowledge index: updated', '<system-reminder>Task completed</system-reminder>'];
+    const h = harness({ callId: 't1', result, context, locusOutput: 'compact display only' });
+    expect(await h.hooks.get('tool.call')!.run(h.api, { tool, tool_use_id: 't1' }, h.next)).toEqual({ result, context });
+    expect(h.next).not.toHaveBeenCalled();
+  });
+
   it('keeps session bookkeeping on its existing path', async () => {
     const h = harness();
     for (const tool of ['TodoWrite', 'ToolSearch']) {
@@ -592,6 +941,7 @@ describe('Claude native tools Mod', () => {
   it('registers Python for task control without duplicating native Read or adding a task-output tool', async () => {
     const h = harness({ active: true, inputId: 'input', prompt: 'Read the local file', tools: [
       { name: 'read', description: 'Locus read', input_schema: {} },
+      { name: 'web_fetch', description: 'Retired Locus fetch', input_schema: {} },
       { name: 'python', description: 'Locus Python', input_schema: {} },
     ] });
     const register = vi.fn(async () => ({}));

@@ -8,7 +8,7 @@ pub(crate) struct ToolCatalog {
     version: u32,
     pub native_tool_search: bool,
     initialized: bool,
-    pub tools: Vec<ClaudeCodeToolDefinition>,
+    tools: Vec<ClaudeCodeToolDefinition>,
 }
 
 impl ToolCatalog {
@@ -36,7 +36,7 @@ impl ToolCatalog {
         let mut next = self.tools.clone();
         let mut added = Vec::new();
         for tool in incoming {
-            if tool.name == "read" { continue; }
+            if tool.name == "read" || tool.name == "web_fetch" { continue; }
             if let Some(prior) = next.iter().find(|prior| prior.name == tool.name) {
                 if prior.description != tool.description || prior.input_schema != tool.input_schema {
                     return Err(format!("Claude tool '{}' changed its definition. No model request was sent with a changed tool prefix. Start a new conversation to use the new schema.", tool.name));
@@ -60,6 +60,13 @@ impl ToolCatalog {
         self.tools = next;
         self.initialized = true;
         Ok(added)
+    }
+
+    /// Retain saved schemas for historical references, but never register the
+    /// retired Locus fetch tool again (including in compatibility sessions).
+    /// This is a runtime capability change, not a rewrite of stored history.
+    pub fn active_tools(&self) -> Vec<ClaudeCodeToolDefinition> {
+        self.tools.iter().filter(|tool| tool.name != "web_fetch").cloned().collect()
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -96,7 +103,7 @@ pub(crate) fn registered_names(session_id: &str) -> Result<Vec<String>, String> 
         Ok(bytes) => {
             let catalog: ToolCatalog = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
             if catalog.version != 1 { return Err("Unsupported Claude tool catalog version".into()); }
-            Ok(catalog.tools.into_iter().map(|tool| tool.name).collect())
+            Ok(catalog.active_tools().into_iter().map(|tool| tool.name).collect())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error.to_string()),
@@ -117,6 +124,27 @@ mod tests {
     use super::*;
     fn tool(name: &str, deferred: bool) -> ClaudeCodeToolDefinition {
         ClaudeCodeToolDefinition { name: name.into(), description: name.into(), input_schema: serde_json::json!({"type":"object"}), defer_loading: deferred }
+    }
+    #[test]
+    fn web_fetch_is_unavailable_in_new_and_restored_catalogs_without_rewriting_history() {
+        for native in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("catalog.json");
+            let mut fresh = ToolCatalog::load(&path, native).unwrap();
+            assert!(fresh.merge(&[tool("web_fetch", false)]).unwrap().is_empty());
+            assert!(fresh.active_tools().is_empty());
+            // Older catalogs may contain an eager or deferred fetch schema.
+            fresh.tools = vec![tool("web_fetch", native), tool("python", false)];
+            fresh.save(&path).unwrap();
+            let history = std::fs::read(&path).unwrap();
+            let mut restored = ToolCatalog::load(&path, native).unwrap();
+            assert_eq!(restored.active_tools().iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec!["python"]);
+            let mut changed_fetch = tool("web_fetch", !native);
+            changed_fetch.description = "new description must not re-register the tool".into();
+            assert!(restored.merge(&[changed_fetch]).unwrap().is_empty());
+            restored.save(&path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), history);
+        }
     }
     #[test]
     fn native_catalog_keeps_eager_prefix_and_appends_only_deferred_tools() {

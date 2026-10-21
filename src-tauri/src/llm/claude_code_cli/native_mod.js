@@ -29,19 +29,37 @@ async function reportInterruption($, turnId, runId, text, thinking) {
   if (content.length) await callBridge($, '/event', { protocol: 1, type: 'interrupted_assistant', runId, message: { content } });
 }
 
+// Mods only allows passing $ to file-level helpers; keep session state explicit.
+async function reportPhase($, phase, activity) {
+  if (!activity || activity.phase === phase) return;
+  activity.phase = phase;
+  const event = { protocol: 1, type: 'phase', runId: activity.runId,
+    stepId: activity.stepId, sequence: ++activity.sequence, phase };
+  // The host rejects out-of-order sequences. Never await another hook's
+  // Promise: that wait spends this hook's 10 s budget, unlike its own $ calls.
+  try { await callBridge($, '/event', event); } catch { /* display only */ }
+}
+
 async function registerTools($, tools, registeredTools, toolPlacements) {
   // Validate first: replacing even one eager/previously-referenced schema
   // changes the cache prefix. Registration is append-only for this session.
   for (const tool of tools || []) {
-    if (tool.name === 'read') continue;
+    if (tool.name === 'read' || tool.name === 'web_fetch') continue;
     const prior = registeredTools.get(tool.name);
     if (prior && prior !== JSON.stringify(tool)) throw new Error('Claude tool definition changed: ' + tool.name + '. Start a new conversation.');
   }
   for (const tool of tools || []) {
-    if (tool.name === 'read' || registeredTools.has(tool.name)) continue;
+    if (tool.name === 'read' || tool.name === 'web_fetch' || registeredTools.has(tool.name)) continue;
     toolPlacements.set('mcp__locus__' + tool.name, tool.defer_loading === true);
-    await $.tool.register({ name: tool.name, description: tool.description, inputSchema: tool.input_schema });
+    // Reserve synchronously: concurrent tool receipts may contain the same
+    // append-only delta. The owning hook still awaits the actual registration.
     registeredTools.set(tool.name, JSON.stringify(tool));
+    try { await $.tool.register({ name: tool.name, description: tool.description, inputSchema: tool.input_schema }); }
+    catch (error) {
+      registeredTools.delete(tool.name);
+      toolPlacements.delete('mcp__locus__' + tool.name);
+      throw error;
+    }
   }
 }
 
@@ -75,6 +93,33 @@ function correctDeferredToolNotice(text, toolPlacements) {
   return output.join('\n');
 }
 
+// session.append exposes synthetic API errors and engine system rows separately
+// from model output. Its system projection retains name/content, not level or
+// retry counters. Never infer diagnostics by scanning ordinary assistant text.
+function nativeDiagnostic(event, content) {
+  const text = content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+  if (event.origin?.kind === 'model' && event.origin.model === '<synthetic>') {
+    return { kind: 'api_error', text };
+  }
+  if (event.origin?.kind !== 'engine' || event.message.type !== 'system') return null;
+  const kind = event.message.name;
+  if (kind === 'api_error' || kind === 'api_retry') {
+    return { kind: 'api_retry', text: text || 'Claude Code is retrying an API request.' };
+  }
+  const notices = {
+    model_refusal_no_fallback: 'Claude Code refused the request; no fallback was used.',
+    model_refusal_fallback: 'Claude Code is using a configured fallback after a model refusal.',
+    model_fallback: 'Claude Code switched to a configured fallback model.',
+    model_consent_fallback: 'Claude Code reported a model consent/fallback change.',
+    instruction_size_warning: 'Claude Code reports that the instruction files exceed its recommended size.',
+    permission_denied: 'Claude Code denied permission for an operation.',
+    file_attachments_missing: 'Claude Code could not load one or more file attachments.',
+    error: 'Claude Code reported an error.',
+  };
+  if (Object.hasOwn(notices, kind)) return { kind, text: text.trim() ? text : notices[kind] };
+  return null;
+}
+
 export function register(on) {
   let tui = false;
   let runId = null;
@@ -82,7 +127,11 @@ export function register(on) {
   let pendingText = '';
   let pendingThinking = '';
   let pendingTurnId = null;
-  let toolQueue = Promise.resolve();
+  let bridgeFailed = false;
+  let bridgeState = 'idle';
+  let reportingHealth = false;
+  const announcedTools = new Set();
+  const toolScopes = new Map();
   let stagedRunId = null;
   const stagedInputs = new Set();
   let imageStaging = null;
@@ -97,6 +146,15 @@ export function register(on) {
   let lastCheckpoint = null;
   let imageCheck = null;
   let appendingPending = null;
+  let activity = null;
+  let activityStep = 0;
+  on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
+    if (tui && e.surface === 'terminal' && e.requestId === 'main'
+        && ['requesting', 'thinking', 'tool-input', 'tool-use', 'responding'].includes(e.props?.mode)) {
+      await reportPhase($, e.props.mode, activity);
+    }
+    return next(e);
+  });
   const registeredTools = new Map();
   const toolPlacements = new Map();
   on('session.start', async ($, e, next) => {
@@ -107,8 +165,15 @@ export function register(on) {
       const options = await callBridge($, '/options', { protocol: 1 });
       await registerTools($, options.tools, registeredTools, toolPlacements);
     }
+    // A worker replacement must be authorized before it can refill/submit the
+    // current input. The host rejects reloads during an active turn.
+    const ready = await callBridge($, '/ready', { protocol: 1, ...(tui ? { sessionId: await $.session.id(), model: await $.session.model() } : {}) });
+    if (ready.deny) {
+      bridgeFailed = true;
+      throw new Error(ready.deny);
+    }
     if (tui) $.clock.every(150, async () => {
-      if (pollingInput) return;
+      if (pollingInput || bridgeFailed) return;
       pollingInput = true;
       let options;
       let input;
@@ -162,7 +227,14 @@ export function register(on) {
         }
       } finally { pollingInput = false; }
     });
-    await callBridge($, '/ready', { protocol: 1, ...(tui ? { sessionId: await $.session.id(), model: await $.session.model() } : {}) });
+    if (tui) $.clock.every(2000, async () => {
+      if (reportingHealth || !runId || bridgeFailed) return;
+      reportingHealth = true;
+      try {
+        await callBridge($, '/event', { protocol: 1, type: 'bridge_health', runId, state: bridgeState });
+      } catch { /* The host's independent lease detects a missing heartbeat. */ }
+      finally { reportingHealth = false; }
+    });
     return next(e);
   });
   on('prompt.compose', async ($, e, next) => {
@@ -185,6 +257,7 @@ export function register(on) {
   });
   on('prompt.submit', async ($, e, next) => {
     if (!tui) return next(e);
+    if (bridgeFailed) return { drop: 'Locus bridge recovery is required.' };
     settings = await callBridge($, '/options', { protocol: 1 });
     if (!settings.active) return { drop: 'The Locus turn is no longer active.' };
     const inputToken = e.text.replace(/\[Image #\d+\]/g, '').trim();
@@ -196,6 +269,8 @@ export function register(on) {
       return { drop: 'Claude did not accept every image attachment.' };
     }
     runId = settings.inputId;
+    bridgeState = 'running';
+    if (input === settings) { announcedTools.clear(); toolScopes.clear(); }
     if (input.expectedImageCount) {
       const messages = await $.session.messages({ as: 'api' });
       imageCheck = { before: messages.reduce((count, message) => count + message.content.filter(block => block.type === 'image').length, 0), expected: input.expectedImageCount };
@@ -219,6 +294,10 @@ export function register(on) {
       }
     }
     const result = await next(e.command ? e : { ...e, text: input.prompt });
+    if (result.drop) {
+      await callBridge($, '/event', { protocol: 1, type: 'input_error', runId, error: result.drop });
+      return result;
+    }
     if (input !== settings) {
       // Unblock a local tool even when the native turn waits for its result
       // before raising turn.complete. The GUI is sending this queue now.
@@ -226,7 +305,14 @@ export function register(on) {
       await callBridge($, '/event', { protocol: 1, type: 'input_queued', runId, id: input.submissionId });
     }
     return result;
-  }).catch(async () => ({ drop: 'Locus input bridge failed.' }));
+  }).catch(async ($, e, next) => {
+    const error = 'Locus input bridge failed.' + (next.error?.message ? ' ' + next.error.message : '');
+    if (tui && runId) {
+      try { await callBridge($, '/event', { protocol: 1, type: 'input_error', runId, error }); }
+      catch { /* The host's input timeout still fails closed if the bridge is unavailable. */ }
+    }
+    return { drop: error };
+  });
   // Keep a real, low-frequency builtin deferred from the FIRST request, even
   // with zero Skill tools. Otherwise the first Skill adds eager ToolSearch and
   // invalidates the entire prefix. Never toggle placement after discovery.
@@ -265,11 +351,25 @@ export function register(on) {
     });
     const result = await next({ ...e, message: { ...e.message, content } });
     if (result.deny) return result;
-    if (e.origin?.kind === 'model' && e.origin.model === '<synthetic>') {
+    const diagnostic = nativeDiagnostic(e, content);
+    if (diagnostic) {
       if (runId && options.active && !e.agentId) {
-        await callBridge($, '/event', { protocol: 1, type: 'diagnostic', runId, text: content.filter(block => block.type === 'text').map(block => block.text).join('') });
+        await callBridge($, '/event', { protocol: 1, type: 'diagnostic', runId, ...diagnostic });
       }
       return result;
+    }
+    // Native history is authoritative. This second observation closes the
+    // display even if tool.call's post-processing/catch lost its receipt. The
+    // host deduplicates by tool_use_id and never re-executes an operation here.
+    if (runId && options.active && !e.agentId && !bridgeFailed) {
+      for (const block of content) {
+        if (block.type !== 'tool_result' || !toolScopes.has(block.tool_use_id)) continue;
+        const scope = toolScopes.get(block.tool_use_id);
+        await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: scope.runId,
+          id: block.tool_use_id, output: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+          isError: block.is_error === true });
+        toolScopes.delete(block.tool_use_id);
+      }
     }
     if (!e.agentId) lastCheckpoint = { version: 1, uuid: e.uuid, sessionId: await $.session.id() };
     if (inserted) {
@@ -304,6 +404,7 @@ export function register(on) {
   });
   on('turn.step', async function* ($, e, next) {
     if (!tui) return yield* next(e);
+    if (bridgeFailed) throw new Error('Locus bridge recovery is required.');
     const inputState = await callBridge($, '/options', { protocol: 1, view: 'input' });
     if (!inputState.active) throw new Error('Claude is idle; model requests require an active Locus input.');
     if (e.agentId) return yield* next(e);
@@ -330,7 +431,11 @@ export function register(on) {
     // TUI with --resume. The engine has already resolved aliases here. Writing
     // settings.model back would send e.g. "opus" directly to the provider.
     const request = { ...e, ...(settings.effort ? { effort: settings.effort } : {}) };
-    await callBridge($, '/event', { protocol: 1, type: 'step_start', runId, model: request.model });
+    const stepId = ++activityStep;
+    const stepRunId = runId;
+    activity = null;
+    await callBridge($, '/event', { protocol: 1, type: 'step_start', runId, stepId, model: request.model });
+    activity = { runId, stepId, phase: 'requesting', sequence: 0 };
     const timing = { version: 1, source: 'claude-turn-step', requestStartedAtMs: await $.clock.now(), firstOutputAtMs: null, responseStoppedAtMs: null, resultReadyAtMs: null, bridgeDurationMs: 0, consumerPauseMs: 0, outputChunks: 0 };
     const stream = next(request);
     const tools = [];
@@ -341,16 +446,21 @@ export function register(on) {
       // arrive after a tool has finished, so neither is the output clock's end.
       if (chunk.kind === 'stop') timing.responseStoppedAtMs = await $.clock.now();
       if (chunk.kind === 'text' || chunk.kind === 'thinking') {
-        timing.outputChunks++;
-        if (chunk.kind === 'text') pendingText += chunk.text;
-        else pendingThinking += chunk.text;
-        if (chunk.kind === 'thinking') thinking += chunk.text;
         const beforeBridge = await $.clock.now();
-        await callBridge($, '/event', { protocol: 1, type: chunk.kind, runId, text: chunk.text });
+        await reportPhase($, chunk.kind === 'text' ? 'responding' : 'thinking', activity);
+        // Hidden thinking may report progress without a text payload.
+        if (typeof chunk.text === 'string') {
+          timing.outputChunks++;
+          if (chunk.kind === 'text') pendingText += chunk.text;
+          else pendingThinking += chunk.text;
+          if (chunk.kind === 'thinking') thinking += chunk.text;
+          await callBridge($, '/event', { protocol: 1, type: chunk.kind, runId, text: chunk.text });
+        }
         timing.bridgeDurationMs += Math.max(0, (await $.clock.now()) - beforeBridge);
       } else if (chunk.kind === 'tool') {
-        tools.push({ id: chunk.id, name: chunk.name });
         const beforeBridge = await $.clock.now();
+        await reportPhase($, 'tool-input', activity);
+        tools.push({ id: chunk.id, name: chunk.name });
         await callBridge($, '/event', { protocol: 1, type: 'tool_start', runId, id: chunk.id, name: chunk.name });
         timing.bridgeDurationMs += Math.max(0, (await $.clock.now()) - beforeBridge);
       }
@@ -361,7 +471,7 @@ export function register(on) {
     const result = await stream.result;
     timing.resultReadyAtMs = await $.clock.now();
     const context = (await $.session.usage()).context;
-    await callBridge($, '/event', { protocol: 1, type: 'usage', runId, usage: result.usage, context, timing });
+    await callBridge($, '/event', { protocol: 1, type: 'usage', runId: stepRunId, stepId, usage: result.usage, context, timing });
     const content = [];
     if (result.answer) content.push({ type: 'text', text: result.answer });
     if (thinking) content.push({ type: 'thinking', thinking });
@@ -378,6 +488,7 @@ export function register(on) {
     }
     return result;
     } catch (error) {
+      activity = null;
       if (insertion) {
         if (!interruptionReported) {
           interruptionReported = true;
@@ -386,9 +497,11 @@ export function register(on) {
         }
         throw error;
       }
+      bridgeState = 'complete';
       await callBridge($, '/event', { protocol: 1, type: 'complete', runId, reason: 'error', answer: String(error) });
       throw error;
     } finally {
+      if (insertion) activity = null;
       // Native queue interruption can close a generator with return(), which
       // bypasses catch and has no stream.result. Keep already-visible output.
       if (insertion && (pendingText || pendingThinking)) {
@@ -406,7 +519,20 @@ export function register(on) {
       }
       return next(e);
     }
-    if (tui && !e.agentId) await callBridge($, '/event', { protocol: 1, type: 'complete', runId, ...e });
+    if (tui && !e.agentId) {
+      activity = null;
+      bridgeState = 'complete';
+      await callBridge($, '/event', { protocol: 1, type: 'complete', runId, ...e });
+    }
+    return next(e);
+  }).catch(async ($, e, next) => {
+    if (tui && !e.agentId && !insertion && runId) {
+      bridgeState = 'complete';
+      try {
+        await callBridge($, '/event', { protocol: 1, type: 'bridge_fault', runId,
+          error: 'Claude completion could not be delivered. Resume from native history.' });
+      } catch { /* Terminal heartbeat bounds the wait even if this receipt fails. */ }
+    }
     return next(e);
   });
   on('session.compact', async ($, e, next) => {
@@ -432,6 +558,7 @@ export function register(on) {
     settings = await callBridge($, '/options', { protocol: 1 });
     const commandRunId = settings.inputId;
     runId = commandRunId;
+    bridgeState = 'running';
     await callBridge($, '/event', { protocol: 1, type: 'command_start', runId: commandRunId });
     // Only the GUI's explicit compact action may run a native command. Model
     // selection and diagnostics never become chat input or assistant output.
@@ -440,10 +567,13 @@ export function register(on) {
       return { text: '' };
     }
     const result = await next(e);
+    bridgeState = 'complete';
     await callBridge($, '/event', { protocol: 1, type: 'command', runId: commandRunId });
     return result;
-  }).catch(async ($, e) => {
-    await callBridge($, '/event', { protocol: 1, type: 'input_error', runId, error: 'Claude command failed: /' + e.command });
+  }).catch(async ($, e, next) => {
+    const detail = next.error?.message;
+    await callBridge($, '/event', { protocol: 1, type: 'input_error', runId,
+      error: 'Claude command failed: /' + e.command + (detail ? '. ' + detail : '') });
     return { text: 'Locus 命令桥接失败，未回退执行命令。' };
   });
   on('tool.call', async ($, e, next) => {
@@ -452,30 +582,34 @@ export function register(on) {
     }
     const callTurnId = currentTurnId;
     const callExecutionId = executionId;
-    let release;
-    const preceding = toolQueue;
-    toolQueue = new Promise(resolve => { release = resolve; });
-    await preceding;
-    try {
+    const callRunId = runId;
+    toolScopes.set(e.tool_use_id, { runId: callRunId, executionId: callExecutionId, dispatched: false });
+    if (bridgeFailed) return { deny: 'Locus bridge recovery is required.' };
+    if (next.signal?.aborted) throw new Error('Claude tool dispatch was interrupted before execution');
+    // Native tools retain Claude's concurrency. Bridged tools are serialized by
+    // the host, where waiting for execution cannot exhaust a Mod hook's budget.
     if (tui) {
+      if (!e.agentId) await reportPhase($, 'tool-use', activity);
       const { tool, tool_use_id, agentId, ...input } = e;
       const content = [];
       if (pendingText) content.push({ type: 'text', text: pendingText });
       if (pendingThinking) content.push({ type: 'thinking', thinking: pendingThinking });
       pendingText = ''; pendingThinking = '';
       content.push({ type: 'tool_use', id: tool_use_id, name: tool, input });
-      await callBridge($, '/event', { protocol: 1, type: 'assistant', runId, message: { content } });
+      await callBridge($, '/event', { protocol: 1, type: 'assistant', runId: callRunId, message: { content } });
+      announcedTools.add(tool_use_id);
     }
+    if (next.signal?.aborted) throw new Error('Claude tool dispatch was interrupted before execution');
     const locusTool = e.tool.startsWith('mcp__locus__');
-    // Session bookkeeping and the explicitly enabled WebSearch retain Claude's
-    // implementation. Search requests belong to the CLI, never to Locus.
+    // Session bookkeeping and web tools retain Claude's implementation.
+    // Search/fetch requests belong to the CLI, never to Locus.
     if (['TodoWrite',
-      'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch', 'WebSearch'].includes(e.tool)) {
+      'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch', 'WebSearch', 'WebFetch'].includes(e.tool)) {
       let result;
       try {
         result = await next(e);
       } catch (error) {
-        if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId, id: e.tool_use_id, output: String(error), isError: true });
+        if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: callRunId, id: e.tool_use_id, output: String(error), isError: true });
         throw error;
       }
       let observed = result;
@@ -505,19 +639,25 @@ export function register(on) {
           return result;
         }
       }
-      if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId, id: e.tool_use_id, output: JSON.stringify(observed), isError: !!(result.deny || result.isError) });
+      if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: callRunId, id: e.tool_use_id, output: JSON.stringify(observed), isError: !!(result.deny || result.isError) });
       return result;
+    }
+    if (e.tool === 'mcp__locus__web_fetch') {
+      const deny = 'Use Claude Code WebFetch. Locus web_fetch is unavailable in Claude Code sessions.';
+      if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: callRunId, id: e.tool_use_id, output: deny, isError: true });
+      return { deny };
     }
     if (!locusTool && !['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'TaskOutput', 'TaskStop', 'AskUserQuestion'].includes(e.tool)) {
       const deny = 'Locus has not adapted ' + e.tool + ' for local execution yet.';
-      if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId, id: e.tool_use_id, output: deny, isError: true });
+      if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: callRunId, id: e.tool_use_id, output: deny, isError: true });
       return { deny };
     }
     // Do not call next for a bridged tool, including on failure. Retrying a
     // transport failure could run the same write twice, so never retry here.
     const { tool, tool_use_id, agentId, ...input } = e;
+    toolScopes.get(tool_use_id).dispatched = true;
     const answer = await callBridge($, '/call', {
-      protocol: 1, tool, callId: tool_use_id, agentId: agentId ?? null, input, ...(tui ? { runId, turnId: callTurnId, executionId: callExecutionId } : {}),
+      protocol: 1, tool, callId: tool_use_id, agentId: agentId ?? null, input, ...(tui ? { runId: callRunId, turnId: callTurnId, executionId: callExecutionId } : {}),
     });
     if (answer.callId !== tool_use_id) throw new Error('Locus tool call ID mismatch');
     if (answer.deny) return { deny: answer.deny };
@@ -527,24 +667,61 @@ export function register(on) {
     // Schemas stay in bridge metadata, never in result text or system prompts.
     await registerTools($, answer.toolCatalogDelta, registeredTools, toolPlacements);
     return { result: answer.result, ...(answer.context ? { context: answer.context } : {}) };
-    } finally { release(); }
   }).catch(async ($, e, next) => {
     if (next.error?.kind === 're-entry' && ['TaskList','TaskGet'].includes(e.tool)) return next(e);
-    // For the passthrough branches, preserve an already completed result. The
-    // engine reuses it here; this does not execute the tool a second time.
-    if (next.called) return next(e);
-    return { deny: 'Locus tool bridge failed; no fallback tool was run. Verify local state before retrying a write.' };
+    // Replay a completed native result, never execute a bridged write again.
+    const scope = toolScopes.get(e.tool_use_id) || { runId, executionId };
+    let result;
+    if (next.called) {
+      try { result = await next(e); }
+      catch (error) { result = { deny: String(error) }; }
+    } else {
+      result = { deny: next.signal?.aborted
+        ? (scope.dispatched
+          ? 'Locus tool dispatch was interrupted; execution outcome may be unknown. Verify local state before retrying.'
+          : 'Claude tool dispatch was interrupted before execution.')
+        : 'Locus tool bridge failed; no fallback tool was run. Verify local state before retrying a write.' };
+    }
+    if (tui && !bridgeFailed && scope?.runId) {
+      try {
+        // These receipts bypass the ordered tool lane. Send them FIRST: a
+        // tool_result behind a pending /call cannot unblock that same call.
+        if (!next.called && next.signal?.aborted && scope.executionId) {
+          await callBridge($, '/event', { protocol: 1, type: 'turn_interrupted', runId: scope.runId, id: scope.executionId });
+        }
+        if (!next.called && (!next.signal?.aborted || next.error?.kind === 'timeout')) {
+          await callBridge($, '/event', { protocol: 1, type: 'bridge_fault', runId: scope.runId,
+            error: 'Claude tool hook failed. Resume from native history; no tool will be automatically repeated.' });
+          bridgeFailed = true;
+        }
+        if (!announcedTools.has(e.tool_use_id)) {
+          const { tool, tool_use_id, agentId, ...input } = e;
+          await callBridge($, '/event', { protocol: 1, type: 'assistant', runId: scope.runId,
+            message: { content: [{ type: 'tool_use', id: tool_use_id, name: tool, input }] } });
+          announcedTools.add(tool_use_id);
+        }
+        await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: scope.runId,
+          id: e.tool_use_id, output: JSON.stringify(result), isError: !!(result.deny || result.isError) });
+      } catch { bridgeFailed = true; /* Host heartbeat lease will fail closed. */ }
+    }
+    return result;
   });
 
   // Independent final guard: if the forwarding hook is skipped, native
   // filesystem/process tools must not execute on the Claude host.
   on('tool.check', async ($, e, next) => {
+    if (bridgeFailed) return { decision: 'deny', reason: 'Locus bridge recovery is required.' };
     if (tui && settings.control === 'compact') {
       return { decision: 'deny', reason: 'Tool execution is disabled during Locus compaction.' };
     }
     if (['TodoWrite',
-        'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch', 'WebSearch'].includes(e.tool)) {
-      return next(e);
+        'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch', 'WebSearch', 'WebFetch'].includes(e.tool)) {
+      const result = await next(e);
+      if (tui && settings.active && runId && !e.agentId && result.decision === 'deny') {
+        await callBridge($, '/event', { protocol: 1, type: 'diagnostic', runId,
+          kind: 'tool_denied', text: e.tool + ': ' + (result.reason || 'Claude Code denied this tool operation.') });
+      }
+      return result;
     }
     return { decision: 'deny', reason: 'This tool must execute through the Locus bridge.' };
   }).catch(async () => ({ decision: 'deny', reason: 'Locus tool guard failed.' }));

@@ -151,6 +151,7 @@ pub fn load_settings() -> Result<ConnectionSettings, String> {
             if value.version != 1 {
                 return Err("Unsupported Claude connection configuration version".into());
             }
+            value.runtime.validate()?;
             if let Some(remote) = &value.remote {
                 remote.validate()?;
                 if value.authorized_target.as_deref() != Some(remote.fingerprint().as_str()) {
@@ -166,6 +167,7 @@ pub fn load_settings() -> Result<ConnectionSettings, String> {
     }
 }
 pub fn save_settings(value: &ConnectionSettings) -> Result<(), String> {
+    value.runtime.validate()?;
     write_json(&settings_path()?, value)
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -279,10 +281,15 @@ pub struct Transport {
     healthy: Arc<AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     pub diagnostic: Arc<Mutex<Vec<u8>>>,
+    failure: Arc<Mutex<Option<String>>>,
     archive_rpc: Arc<archive_rpc::ArchiveRpc>,
     heartbeat: Arc<Mutex<heartbeat::Heartbeat>>,
 }
 impl Transport {
+    pub fn failure(&self) -> String {
+        self.failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            .unwrap_or_else(|| super::turn_retry::disconnected("SSH connection closed"))
+    }
     pub fn latency_ms(&self) -> Option<f64> {
         if !self.alive() { return None; }
         self.heartbeat.lock().unwrap_or_else(|e| e.into_inner()).latency_ms(std::time::Instant::now())
@@ -298,7 +305,7 @@ impl Transport {
             )
     }
     pub fn stop(&self) {
-        self.archive_rpc.close();
+        self.archive_rpc.close(&self.failure());
         self.healthy.store(false, Ordering::SeqCst);
         let _ = self.send.try_send(json!({"type":"close"}));
         #[cfg(windows)]
@@ -316,11 +323,14 @@ impl Transport {
     }
     pub fn send(&self, value: Value) -> Result<(), String> {
         if !self.alive() {
-            return Err("SSH connection closed; resume the conversation to reconnect".into());
+            return Err(self.failure());
         }
         self.send
             .try_send(value)
-            .map_err(|e| format!("SSH input unavailable: {e}"))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Closed(_) => self.failure(),
+                mpsc::error::TrySendError::Full(_) => "SSH input queue is full".into(),
+            })
     }
     pub fn input(&self, text: &str) -> Result<(), String> {
         self.send(
@@ -408,6 +418,7 @@ impl Transport {
         // or be retained as session input. The writer wipes its serialized bytes.
         let (unlock_send, mut unlock_receive) = mpsc::channel::<Option<Zeroizing<String>>>(1);
         let healthy = Arc::new(AtomicBool::new(true));
+        let failure = Arc::new(Mutex::new(None));
         let diagnostic = Arc::new(Mutex::new(Vec::new()));
         let error_buffer = diagnostic.clone();
         let stderr_task = tokio::spawn(async move {
@@ -420,6 +431,7 @@ impl Transport {
             }
         });
         let writer_health = healthy.clone();
+        let writer_failure = failure.clone();
         let heartbeat = Arc::new(Mutex::new(heartbeat::Heartbeat::default()));
         let writer_heartbeat = heartbeat.clone();
         let source = base64::engine::general_purpose::STANDARD.encode(include_str!("ssh_host.py"));
@@ -457,11 +469,15 @@ impl Transport {
                 }
                 Ok::<_, std::io::Error>(())
             };
-            let _ = run.await;
+            if let Err(error) = run.await {
+                writer_failure.lock().unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(|| super::turn_retry::disconnected(format!("SSH write failed: {error}")));
+            }
             writer_health.store(false, Ordering::SeqCst);
         });
         let (hello_send, hello_receive) = oneshot::channel();
         let read_health = healthy.clone();
+        let read_failure = failure.clone();
         let reply_send = send.clone();
         let read_buffer = diagnostic.clone();
         let archive_rpc=Arc::new(archive_rpc::ArchiveRpc::default());
@@ -478,7 +494,11 @@ impl Transport {
                 // replies: cancelling a partial read would discard its prefix.
                 let value = match read_frame(&mut reader).await {
                     Ok(Some(value)) => value,
-                    _ => break,
+                    result => {
+                        let error = result.err().unwrap_or_else(|| super::turn_retry::disconnected("SSH output closed"));
+                        read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(error);
+                        break;
+                    }
                 };
                 if read_archive_rpc.route(&value) { continue; }
                 match value["type"].as_str() {
@@ -515,11 +535,23 @@ impl Transport {
                             }
                         }
                     }
+                    Some("bridge_health") => {
+                        // One-way samples bypass tool queues and pending reply
+                        // tasks. No remote receipt is needed for liveness: the
+                        // lease advances only when this process receives it.
+                        if value["payload"]["type"] == "bridge_health" {
+                            if let Some((_, controls, options)) = &calls {
+                                controls.route(&value["payload"], options);
+                            }
+                        }
+                    }
                     Some("call") => {
                         let Some(calls) = calls.clone().filter(|_| pending.len() < 64) else {
+                            read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert("Unexpected or excessive SSH bridge calls".into());
                             break;
                         };
                         let Some(id) = value["id"].as_str().map(str::to_string) else {
+                            read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert("SSH bridge call has no identity".into());
                             break;
                         };
                         let send = reply_send.clone();
@@ -555,23 +587,34 @@ impl Transport {
                             .unwrap_or("Remote Claude failed")
                             .to_string();
                         append_diagnostic(&read_buffer, message.as_bytes());
+                        read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(message.clone());
                         if let Some(hello) = hello.take() {
                             let _ = hello.send(Err(message));
                         }
                         break;
                     }
-                    Some("exit") => break,
+                    Some("exit") => {
+                        read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(||
+                            super::turn_retry::disconnected(format!("Remote Claude exited: {value}")));
+                        break;
+                    },
                     Some("pong") => {
                         if let Some(id) = value["id"].as_u64() {
                             read_heartbeat.lock().unwrap_or_else(|e| e.into_inner()).received(id, std::time::Instant::now());
                         }
                     }
                     Some("progress") => {}
-                    _ => break,
+                    _ => {
+                        read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert("Unexpected SSH protocol frame".into());
+                        break;
+                    },
                 }
             }
             read_health.store(false, Ordering::SeqCst);
-            read_archive_rpc.close();
+            let error = read_failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                .unwrap_or_else(|| super::turn_retry::disconnected("SSH reader stopped"));
+            if calls.is_some() { eprintln!("[Claude] transport ended: {error}"); }
+            read_archive_rpc.close(&error);
         });
         let heartbeat_health = healthy.clone();
         let heartbeat_send = send.clone();
@@ -585,7 +628,7 @@ impl Transport {
                 }
             }
         });
-        let transport = Self {
+        let mut transport = Self {
             archive_rpc,
             heartbeat,
             #[cfg(windows)]
@@ -595,6 +638,7 @@ impl Transport {
             healthy,
             tasks: vec![read_task, write_task, stderr_task, heartbeat_task],
             diagnostic,
+            failure,
         };
         let info = match tokio::time::timeout(
             Duration::from_secs(if authorized { 660 } else { 45 }),
@@ -604,15 +648,18 @@ impl Transport {
         {
             Ok(Ok(result)) => result?,
             _ => {
-                return Err(format!(
-                    "SSH environment check failed: {}",
-                    String::from_utf8_lossy(
-                        &transport
-                            .diagnostic
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                    )
-                ))
+                // stdout EOF can precede delivery of OpenSSH's stderr verdict.
+                // Drain it briefly so permission/host-key failures are not
+                // mislabeled as an unexplained bridge closure.
+                let _ = tokio::time::timeout(Duration::from_millis(200), &mut transport.tasks[2]).await;
+                let diagnostic = transport.diagnostic.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let error = if diagnostic.is_empty() {
+                    transport.failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                        .unwrap_or_else(|| "SSH environment check timed out".into())
+                } else {
+                    format!("SSH environment check failed: {}", String::from_utf8_lossy(&diagnostic))
+                };
+                return Err(super::turn_retry::ssh_startup_error(error));
             }
         };
         Ok((transport, info))
@@ -649,12 +696,12 @@ async fn read_frame(
 ) -> Result<Option<Value>, String> {
     let mut bytes = Vec::new();
     loop {
-        let available = reader.fill_buf().await.map_err(|e| e.to_string())?;
+        let available = reader.fill_buf().await.map_err(|e| super::turn_retry::disconnected(format!("SSH read failed: {e}")))?;
         if available.is_empty() {
             return if bytes.is_empty() {
                 Ok(None)
             } else {
-                Err("Truncated SSH frame".into())
+                Err(super::turn_retry::disconnected("Truncated SSH frame"))
             };
         }
         let count = available
@@ -688,6 +735,7 @@ mod tests {
         assert_eq!(settings.runtime, super::super::runtime_settings::RuntimeSettings::default());
         settings.runtime.idle_compaction = true;
         settings.runtime.telemetry = true;
+        settings.runtime.auto_compact_window = Some(350_000);
         assert_eq!((settings.pool_capacity, settings.idle_minutes), (1, 15));
         assert_eq!(ConnectionSettings::default().permission_mode.as_str(), "auto");
         settings.permission_mode = PermissionMode::BypassPermissions;
@@ -699,6 +747,7 @@ mod tests {
         assert_eq!(saved.runtime, settings.runtime);
         assert_eq!(serde_json::to_value(&saved).unwrap()["idleCompaction"], true);
         assert_eq!(serde_json::to_value(&saved).unwrap()["telemetry"], true);
+        assert_eq!(serde_json::to_value(&saved).unwrap()["autoCompactWindow"], 350_000);
         assert!(serde_json::from_value::<PermissionMode>(json!("unknown")).is_err());
     }
     fn config() -> SshConfig {
@@ -769,7 +818,9 @@ mod tests {
                 .unwrap()["type"],
             "pong"
         );
-        assert!(read_frame(&mut &b"{}"[..]).await.is_err());
-        assert!(read_frame(&mut &b"oops\n"[..]).await.is_err());
+        let truncated = read_frame(&mut &b"{}"[..]).await.unwrap_err();
+        assert!(super::super::turn_retry::is_disconnected(&truncated));
+        let malformed = read_frame(&mut &b"oops\n"[..]).await.unwrap_err();
+        assert!(!super::super::turn_retry::is_disconnected(&malformed));
     }
 }

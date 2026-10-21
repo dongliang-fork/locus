@@ -9,7 +9,7 @@ vi.mock("../services/ipc", () => ({ ipcInvoke: mocks.invoke }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: mocks.confirm }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("../composables/useClaudeConnectionStatus", () => ({
-  useClaudeConnectionStatus: () => ({ visible: ref(false), phase: ref("unknown"), status: ref(null) }),
+  useClaudeConnectionStatus: () => ({ visible: ref(false), phase: ref("unknown"), status: ref(null), error: ref("") }),
 }));
 vi.mock("../composables/useClaudePrewarm", () => ({ useClaudePrewarm: () => {} }));
 vi.mock("../services/locusRuntime", () => ({ getLocusRuntime: () => ({

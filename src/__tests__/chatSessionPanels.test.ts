@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
@@ -100,6 +100,7 @@ const modelStoreMocks = vi.hoisted(() => ({
 
 const notificationStoreMocks = vi.hoisted(() => ({
   addNotice: vi.fn(),
+  clearByOperation: vi.fn(),
 }));
 
 const projectStoreState = vi.hoisted(() => ({
@@ -1103,6 +1104,88 @@ describe("chat session panel state", () => {
     expect(chatStore.currentRunId).toBeNull();
     expect(chatStore.streamingSessionIds.has("s1")).toBe(false);
     expect(chatStore.isStreaming).toBe(false);
+  });
+
+  it("restores Claude phases, filters stale runs, and clears them on cancellation and session changes", async () => {
+    const chatStore = useChatStore();
+    sessionServiceMocks.loadSession.mockResolvedValueOnce({
+      id: "s1", title: "Claude", messages: [], agentId: null, sessionType: "chat",
+      parentSessionId: null, latestCompletedRunId: null, createdAt: 0, updatedAt: 0,
+      runtime: {
+        activeRun: { runId: "native", sessionId: "s1", status: "running", startedAt: 1, updatedAt: 1 },
+        activeToolCalls: [], pendingToolConfirms: [], isCompacting: false, claudeCodePhase: "thinking",
+      },
+    });
+    await chatStore.selectSession("s1");
+    expect(chatStore.claudeCodePhase).toBe("thinking");
+    expect(chatStore.isThinking).toBe(false);
+    chatStore.handleStreamEvent({ type: "claudeCodePhase", sessionId: "s1", runId: "old", phase: "responding" });
+    expect(chatStore.claudeCodePhase).toBe("thinking");
+    chatStore.handleStreamEvent({ type: "claudeCodePhase", sessionId: "s1", runId: "native", phase: "tool-use" });
+    expect(chatStore.claudeCodePhase).toBe("tool-use");
+    chatStore.handleStreamEvent({ type: "cancelled", sessionId: "s1", runId: "native" });
+    expect(chatStore.claudeCodePhase).toBeNull();
+    chatStore.handleStreamEvent({ type: "claudeCodePhase", sessionId: "s1", runId: "native", phase: "thinking" });
+    expect(chatStore.claudeCodePhase).toBeNull();
+    chatStore.handleStreamEvent({ type: "runStart", sessionId: "s1", runId: "new" });
+    chatStore.handleStreamEvent({ type: "claudeCodePhase", sessionId: "s1", runId: "new", phase: "requesting" });
+    expect(chatStore.claudeCodePhase).toBe("requesting");
+    await chatStore.selectSession("s2");
+    expect(chatStore.claudeCodePhase).toBeNull();
+  });
+
+  it("shows scoped Claude diagnostics without terminating the run or creating transcript messages", async () => {
+    const chatStore = useChatStore();
+    await chatStore.selectSession("s1");
+    chatStore.handleStreamEvent({ type: "runStart", sessionId: "s1", runId: "notice-run" });
+    const before = [...chatStore.messages];
+    const event = { type: "claudeCodeNotice" as const, sessionId: "s1", runId: "notice-run", notice: {
+      code: "claude_code.api_error", message: "Claude Code: Output blocked by content filtering policy", severity: "warning" as const, retryable: false,
+    } };
+    notificationStoreMocks.addNotice.mockClear();
+    chatStore.handleStreamEvent({ ...event, runId: "stale" });
+    chatStore.handleStreamEvent({ ...event, sessionId: "s2" });
+    expect(notificationStoreMocks.addNotice).not.toHaveBeenCalled();
+    chatStore.handleStreamEvent(event);
+    expect(notificationStoreMocks.addNotice).toHaveBeenCalledWith("warning", event.notice.message, {
+      code: event.notice.code, operation: "claudeCode:s1:notice-run", replaceOperation: true, sticky: true,
+    });
+    expect(chatStore.isStreaming).toBe(true);
+    expect(chatStore.currentRunId).toBe("notice-run");
+    expect(chatStore.messages).toEqual(before);
+    chatStore.handleStreamEvent({ type: "error", sessionId: "s1", runId: "notice-run", error: {
+      code: "chat.stream_failed", message: "Output blocked; tool result unconfirmed", severity: "error", retryable: false,
+    } });
+    expect(notificationStoreMocks.clearByOperation).toHaveBeenCalledWith("claudeCode:s1:notice-run");
+    expect(chatStore.isStreaming).toBe(false);
+    notificationStoreMocks.addNotice.mockClear();
+    chatStore.handleStreamEvent(event);
+    expect(notificationStoreMocks.addNotice).not.toHaveBeenCalled();
+  });
+
+  it("keeps the run alive through Claude recovery and clears recovery after terminal failure", async () => {
+    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1));
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    onTestFinished(() => { vi.unstubAllGlobals(); });
+    const chatStore = useChatStore();
+    await chatStore.selectSession("s1");
+    chatStore.handleStreamEvent({ type: "runStart", sessionId: "s1", runId: "retry-run" });
+    chatStore.handleStreamEvent({ type: "textDelta", sessionId: "s1", runId: "retry-run", text: "partial", partId: "old-text", renderSeq: 1 });
+    chatStore.handleStreamEvent({ type: "toolCallStart", sessionId: "s1", runId: "retry-run", toolCallId: "write", toolName: "edit", arguments: "{}", partId: "write", renderSeq: 2 });
+    chatStore.handleStreamEvent({ type: "claudeCodePhase", sessionId: "s1", runId: "retry-run", phase: "recovering" });
+    chatStore.handleStreamEvent({ type: "historySynchronized", sessionId: "s1", runId: "retry-run", messages: [{ id: "native", role: "assistant", content: "saved partial", createdAt: 1 }] });
+    expect(chatStore.isStreaming).toBe(true);
+    expect(chatStore.currentRunId).toBe("retry-run");
+    expect(chatStore.claudeCodePhase).toBe("recovering");
+    expect(chatStore.rawStreamText).toBe("");
+    expect(chatStore.liveRenderParts).toEqual([]);
+    expect(chatStore.activeToolCalls).toEqual([]);
+    chatStore.handleStreamEvent({ type: "error", sessionId: "s1", runId: "retry-run", error: { code: "chat.stream_failed", message: "Recovery exhausted", severity: "error", retryable: false } });
+    expect(chatStore.isStreaming).toBe(false);
+    expect(chatStore.currentRunId).toBeNull();
+    expect(chatStore.claudeCodePhase).toBeNull();
+    chatStore.handleStreamEvent({ type: "claudeCodePhase", sessionId: "s1", runId: "retry-run", phase: "starting" });
+    expect(chatStore.claudeCodePhase).toBeNull();
   });
 
   it("marks active chat runs as streaming when runStart arrives from another window", async () => {
@@ -3028,6 +3111,43 @@ describe("chat session panel state", () => {
       pendingInputId: "steering-1", messageId: "committed-user" });
     expect(chatStore.activeQueuedFollowUp?.displayText).toBe("next update");
     expect(chatStore.activeQueuedFollowUp?.canEdit).toBe(true);
+  });
+
+  it("re-opens returned steering and keeps settled leftovers of a closed run editable", async () => {
+    const chatStore = useChatStore();
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+    const input = {
+      id: "steering-1", sessionId: "s1", runId: "run-1", mergeGroupId: "group",
+      status: "delivering", delivery: "immediate", text: "late update", displayText: "late update",
+      createdAt: 1, updatedAt: 1, revision: 2,
+    };
+    chatStore.handleStreamEvent({ type: "pendingInputQueued", sessionId: "s1", runId: "run-1", input });
+    expect(chatStore.activeQueuedFollowUp?.canEdit).toBe(false);
+    // A failed attempt hands the claim back with a newer revision.
+    chatStore.handleStreamEvent({ type: "pendingInputQueued", sessionId: "s1", runId: "run-1",
+      input: { ...input, status: "queued", revision: 3 } });
+    expect(chatStore.activeQueuedFollowUp?.canEdit).toBe(true);
+    expect(chatStore.activeQueuedFollowUp?.isInserting).toBe(true);
+
+    chatStore.handleStreamEvent({ type: "error", sessionId: "s1", runId: "run-1",
+      error: { code: "chat.stream_failed", message: "failed", severity: "error", retryable: false } });
+    // Settlement is published after the terminal event of the now-closed run.
+    chatStore.handleStreamEvent({ type: "pendingInputQueued", sessionId: "s1", runId: "run-1",
+      input: { ...input, status: "retained", revision: 4 } });
+    expect(chatStore.activeQueuedFollowUp).toMatchObject({
+      displayText: "late update",
+      isUndelivered: true,
+      canEdit: true,
+      canInsert: false,
+    });
+
+    sessionServiceMocks.deletePendingChatInput.mockResolvedValue(true);
+    expect(await chatStore.deleteActiveQueuedFollowUp()).toBe(true);
+    expect(sessionServiceMocks.deletePendingChatInput)
+      .toHaveBeenCalledWith("s1", "run-1", "steering-1");
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
   });
 
   it("does not automatically resend an in-flight steering message after cancellation", async () => {

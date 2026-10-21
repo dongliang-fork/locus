@@ -1849,9 +1849,10 @@ const claudeConnection = useClaudeConnectionStatus();
 const claudeModelStore = useModelStore();
 const claudeConnectBusy = ref(false);
 const claudeConnectError = ref("");
-watch(() => [claudeConnection.phase.value, claudePrewarmSettings.value.scope], () => {
-  claudeConnectError.value = "";
+watch(() => [claudeConnection.phase.value, claudePrewarmSettings.value.scope], ([phase, scope], [, previousScope]) => {
+  if (phase === "ready" || scope !== previousScope) claudeConnectError.value = "";
 });
+const claudeError = computed(() => claudeConnectError.value || claudeConnection.error.value);
 const claudeConnecting = computed(() => claudeConnectBusy.value
   || claudeConnection.phase.value === "connecting" || claudeConnection.phase.value === "starting");
 const claudeConnectModel = computed(() => props.selectedModelId?.startsWith("claude_code/") ? props.selectedModelId
@@ -1874,9 +1875,11 @@ async function connectClaude() {
 }
 useClaudePrewarm(() => ({ sessionId: props.sessionId ?? null, modelId: props.selectedModelId ?? "",
   active: props.active !== false, busy: !!props.isStreaming, workspaceRef: props.workspaceRef }));
-const claudeSummary = computed(() => t(`chat.status.claude.${claudeConnection.phase.value}`));
+const claudeSummary = computed(() => t(`chat.status.claude.${claudeError.value && !claudeConnecting.value
+  && claudeConnection.phase.value !== "ready" ? "failed" : claudeConnection.phase.value}`));
 const claudeTone = computed<StatusTone>(() => {
   const phase = claudeConnection.phase.value;
+  if (claudeError.value) return phase === "ready" || claudeConnecting.value ? "warning" : "danger";
   if (phase === "ready") return "success";
   if (phase === "connecting" || phase === "starting") return "warning";
   return "muted";
@@ -2464,8 +2467,8 @@ onUnmounted(() => {
         <span v-if="activeItem.id === 'unity' && unityRestartError" class="chat-status-codeopt-error" role="alert">
           {{ unityRestartError }}
         </span>
-        <span v-if="activeItem.id === 'claude' && claudeConnectError" class="chat-status-codeopt-error">
-          {{ claudeConnectError }}
+        <span v-if="activeItem.id === 'claude' && claudeError" class="chat-status-codeopt-error is-multiline" role="alert">
+          {{ claudeError }}
         </span>
         <details v-if="activeDiagnosticRows.length > 0" class="chat-status-diagnostics">
           <summary>{{ diagnosticsLabel }}</summary>
@@ -2695,6 +2698,14 @@ onUnmounted(() => {
   line-height: 1.4;
   color: var(--status-danger-fg);
   overflow-wrap: anywhere;
+}
+
+.chat-status-codeopt-error.is-multiline {
+  display: block;
+  margin-top: 10px;
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow-y: auto;
 }
 
 .chat-status-detail-list {

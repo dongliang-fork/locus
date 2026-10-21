@@ -13,7 +13,7 @@ export function useClaudePrewarm(context: () => { sessionId: string | null; mode
     const version = generation;
     async function refresh(first: boolean) {
       try { await prewarmClaudeSession(current.sessionId, current.modelId, current.workspaceRef!, first); }
-      catch { /* Background failure stays disconnected; a send reports its actionable error. */ }
+      catch { /* Startup failures are exposed by the shared connection status snapshot. */ }
       finally { if (generation === version) timer = setTimeout(() => void refresh(false), 30_000); }
     }
     // Debounce rapid model/tab selections; the backend owns deduplication and capacity.

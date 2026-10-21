@@ -54,6 +54,29 @@ export function parseClaudeTodoOutput(outputText: string): TodoItem[] | null {
   } catch { return null; }
 }
 
+/** Only acknowledged native snapshots become lists; never hide native errors. */
+export function todoToolItems(name: string, argumentsText: string, outputText: string, status: string): TodoItem[] | null {
+  if (status === "error") return null;
+  if (["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"].includes(name)) {
+    return parseClaudeTodoOutput(outputText);
+  }
+  if (name !== "todowrite") return null;
+  return parseTodoWriteArguments(argumentsText) ?? parseLegacyTodoWriteOutput(outputText) ?? [];
+}
+
+/** Keep native operation messages/warnings separate from its todo snapshot. */
+export function todoToolOutput(name: string, outputText: string): string {
+  if (!["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"].includes(name)) return "";
+  try {
+    const value = JSON.parse(outputText);
+    if (value?.locusTodoSnapshot?.version !== 1) return "";
+    if (typeof value.locusOutput === "string") return value.locusOutput;
+    // Older transcripts kept the native result beside the full task snapshot.
+    if (value.result !== undefined) return typeof value.result === "string" ? value.result : JSON.stringify(value.result, null, 2);
+  } catch { /* Incomplete streaming output is not an acknowledged snapshot. */ }
+  return "";
+}
+
 /** Compatibility for tool results created before todowrite stopped echoing its input. */
 export function parseLegacyTodoWriteOutput(outputText: string): TodoItem[] | null {
   const jsonStart = outputText.indexOf("[");

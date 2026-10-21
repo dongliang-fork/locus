@@ -16,6 +16,7 @@ const mode = ref<'local' | 'ssh'>('local');
 const permissionMode = ref<ClaudePermissionMode>('auto');
 const idleCompaction = ref(false);
 const telemetry = ref(false);
+const autoCompactWindow = ref<number | null>(null);
 const prewarm = ref(false);
 const poolCapacity = ref(1);
 const idleMinutes = ref(15);
@@ -75,13 +76,25 @@ async function updatePermissionMode(value: string) {
   if (busy.value || (value !== 'auto' && value !== 'bypassPermissions')) return;
   await action(async () => { permissionMode.value = (await setClaudePermissionMode(value)).permissionMode; });
 }
-async function updateRuntimeSettings(idle: boolean, telemetryEnabled: boolean) {
+async function updateRuntimeSettings(idle: boolean, telemetryEnabled: boolean, window = autoCompactWindow.value) {
   if (busy.value) return;
   await action(async () => {
-    const saved = await setClaudeRuntimeSettings(idle, telemetryEnabled);
+    const saved = await setClaudeRuntimeSettings(idle, telemetryEnabled, window);
     idleCompaction.value = !!saved.idleCompaction;
     telemetry.value = !!saved.telemetry;
+    autoCompactWindow.value = saved.autoCompactWindow ?? null;
   });
+}
+async function updateAutoCompactWindow(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const value = input.value.trim();
+  const window = value ? Number(value) : null;
+  if (!input.validity.valid || (window !== null && (!Number.isInteger(window) || window < 100_000 || window > 1_000_000))) {
+    error.value = t('settings.claudeCode.autoCompactWindowInvalid');
+  } else if (window !== autoCompactWindow.value) {
+    await updateRuntimeSettings(idleCompaction.value, telemetry.value, window);
+  }
+  input.value = autoCompactWindow.value === null ? '' : String(autoCompactWindow.value);
 }
 async function inspect() {
   if (!valid.value || busy.value) return;
@@ -130,6 +143,7 @@ onMounted(() => action(async () => {
   permissionMode.value = saved.permissionMode;
   idleCompaction.value = !!saved.idleCompaction;
   telemetry.value = !!saved.telemetry;
+  autoCompactWindow.value = saved.autoCompactWindow ?? null;
   prewarm.value = !!saved.prewarm; poolCapacity.value = saved.poolCapacity ?? 1; idleMinutes.value = saved.idleMinutes ?? 15;
   if (saved.remote) {
     address.value = formatClaudeSshAddress(saved.remote);
@@ -223,6 +237,17 @@ onMounted(() => action(async () => {
         { value: 'bypassPermissions', label: 'Bypass', hint: t('settings.claudeCode.bypassModeHint'), disabled: busy },
       ]" @update:model-value="updatePermissionMode" />
     </div>
+    <label class="connection-field">
+      <span>{{ t('settings.claudeCode.autoCompactWindow') }}</span>
+      <div class="connection-compact-window">
+        <input type="number" :value="autoCompactWindow ?? ''" :disabled="busy" min="100000" max="1000000" step="1"
+          :aria-label="t('settings.claudeCode.autoCompactWindow')" aria-describedby="claude-compact-window-hint"
+          :placeholder="t('settings.claudeCode.autoCompactWindowDefault')" @change="updateAutoCompactWindow"
+          @keydown.enter.prevent="($event.target as HTMLInputElement).blur()" />
+        <span>tokens</span>
+      </div>
+    </label>
+    <p id="claude-compact-window-hint" class="connection-hint">{{ t('settings.claudeCode.autoCompactWindowHint') }}</p>
     <div class="connection-field">
       <span>{{ t('settings.claudeCode.idleCompaction') }}</span>
       <BaseCheckbox :model-value="idleCompaction" :disabled="busy" :aria-label="t('settings.claudeCode.idleCompaction')"
@@ -244,6 +269,8 @@ onMounted(() => action(async () => {
 .connection-mode :deep(.base-segmented-item) { min-width: 88px; }
 .connection-mode { flex-shrink: 0; }
 .connection-pool-toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.connection-compact-window { display: flex; align-items: center; gap: 8px; }
+.connection-compact-window input { width: 160px; max-width: 100%; }
 .connection-pool-options { width: 120px; justify-self: start; }
 .connection-server { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border-color); padding-top: 12px; }
 .connection-server .connection-field { flex: 1; min-width: 0; }

@@ -48,11 +48,22 @@ function makeState(overrides?: Partial<StreamState>): StreamState {
 }
 
 describe("reduceStreamEvent", () => {
-  it("replaces recovered history without resetting the current run", () => {
-    const state = makeState({ isStreaming: true });
+  it("keeps Claude activity separate from thinking content and ignores it after streaming ends", () => {
+    const event: StreamEvent = { type: "claudeCodePhase", sessionId: "s1", runId: "run", phase: "thinking" };
+    expect(reduceStreamEvent(makeState({ isStreaming: true }), event)).toEqual([
+      { type: "setClaudeCodePhase", phase: "thinking" },
+    ]);
+    expect(reduceStreamEvent(makeState(), event)).toEqual([]);
+  });
+  it("replaces recovered history and clears interrupted output without ending the current run", () => {
+    const state = makeState({ isStreaming: true, claudeCodePhase: "recovering", rawStreamText: "partial", activeToolCalls: [{ id: "interrupted", name: "python", arguments: "{}", status: "running" }] });
     const messages = [{ id: "native-recovered", role: "assistant" as const, content: "saved answer", createdAt: 1 }];
     const mutations = reduceStreamEvent(state, { type: "historySynchronized", sessionId: "s1", runId: "current", messages });
-    expect(mutations).toEqual([{ type: "replaceMessages", messages }]);
+    expect(mutations).toEqual([
+      { type: "resetRound" }, { type: "clearPendingInputs" },
+      { type: "setClaudeCodePhase", phase: "recovering" },
+      { type: "replaceMessages", messages },
+    ]);
   });
   describe("buildToolResultMessages", () => {
     it("materializes completed tool outputs as hidden tool result messages", () => {
@@ -1253,6 +1264,20 @@ describe("reduceStreamEvent", () => {
   });
 
   describe("askUser", () => {
+    it("preserves multi-question fields for both chat entry points", () => {
+      const questions = [
+        { id: "q1", header: "Targets", question: "Which?", options: [{ label: "A", description: "" }], multiSelect: true, allowCustom: true },
+        { id: "q2", header: "Why", question: "Why?", options: [], multiSelect: false, allowCustom: true },
+      ];
+      const mutations = reduceStreamEvent(makeState({ isStreaming: true }), {
+        runId: "test-run", type: "askUser", sessionId: "s1", questionId: "form", toolCallId: "ask",
+        question: "Which?", options: [], questions,
+      });
+      expect(mutations).toContainEqual({ type: "setQuestion", question: {
+        questionId: "form", toolCallId: "ask", question: "Which?", options: [], questions,
+      } });
+    });
+
     it("sets pending question", () => {
       const state = makeState({ isStreaming: true });
       const event: StreamEvent = { runId: "test-run",

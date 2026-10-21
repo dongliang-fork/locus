@@ -118,6 +118,33 @@ fn reconcile_assistant_parts<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn claude_fork_passive_reconciliation_rechecks_active_run_in_transaction() {
+        for status in ["queued", "starting", "running", "waiting_input", "finishing", "cancelling"] {
+            let root = tempfile::tempdir().unwrap();
+            let store = SessionStore::new(root.path()).unwrap();
+            let id = store.create_session("fork race", None, None, "chat", None).unwrap();
+            let (remote, mut native) = fixture();
+            store.reconcile_claude_native(&id, &remote, &native, &[], None).unwrap();
+            let pending = store.add_message_with_images_asset_refs_signature_and_response(
+                &id, MessageRole::User, "new fork request", None, None, None, None, None,
+                Some(&json!({"backend":"claude_code_cli", "claude_pending_input":{"version":1,"token":Uuid::new_v4()}})),
+            ).unwrap();
+            let expected = store.get_messages(&id).unwrap();
+            native.digest = "b".repeat(64);
+            native.messages[1].content = json!([{"type":"text","text":"changed remote answer"}]);
+            // Simulate a run starting after the caller's idle check / snapshot.
+            store.try_start_run(&id, "active").unwrap();
+            store.update_run_status("active", status, None).unwrap();
+            assert!(!store.reconcile_claude_native_binding(
+                &id, &remote, &native, &expected, None, false, false, false, true,
+            ).unwrap(), "{status}");
+            let after = store.get_messages(&id).unwrap();
+            assert_eq!(serde_json::to_value(&after).unwrap(), serde_json::to_value(&expected).unwrap());
+            assert_eq!(after.last().unwrap().id, pending);
+        }
+    }
+
     fn fixture() -> (SshConfig, NativeSnapshot) {
         let remote: SshConfig = serde_json::from_value(json!({"target":"test@127.0.0.1","port":22242})).unwrap();
         let row = |role, content, key: &str| json!({"key":key,"role":role,"uuids":[Uuid::new_v4().to_string()],"content":content,"timestamp":"2026-10-15T00:00:00Z"});
@@ -393,7 +420,16 @@ impl SessionStore {
         &self, id: &str, remote: &SshConfig, snapshot: &NativeSnapshot,
         expected: &[ChatMessage], pending: Option<&str>,
     ) -> Result<bool, String> {
-        self.reconcile_claude_native_binding(id,remote,snapshot,expected,pending,false,false)
+        self.reconcile_claude_native_binding(id,remote,snapshot,expected,pending,false,false,false,false)
+    }
+    /// Passive view synchronization must yield to a newly started run. Check
+    /// again inside the write transaction, atomically with history replacement.
+    pub(crate) fn reconcile_claude_native_if_idle(
+        &self, id: &str, remote: &SshConfig, snapshot: &NativeSnapshot,
+        expected: &[ChatMessage],
+    ) -> Result<bool, String> {
+        if self.active_run_for_session(id)?.is_some() { return Ok(false); }
+        self.reconcile_claude_native_binding(id,remote,snapshot,expected,None,false,false,false,true)
     }
     /// Remote-authoritative recovery deliberately drops unsubmitted local
     /// history. Only the current, explicitly submitted user input survives.
@@ -404,31 +440,52 @@ impl SessionStore {
             if &bound!=remote { return Err("Remote Claude server does not match the conversation binding".into()); }
             snapshot.validate(native.as_deref())?;
         }
-        self.reconcile_claude_native_binding(id,remote,snapshot,expected,pending,true,true)
+        self.reconcile_claude_native_binding(id,remote,snapshot,expected,pending,true,true,false,false)
+    }
+    /// A transport retry is not an explicit history repair: keep all proven
+    /// unsent inputs (including mid-turn steering and continuation receipts).
+    pub(crate) fn rebuild_claude_native_for_retry(
+        &self, id: &str, remote: &SshConfig, snapshot: &NativeSnapshot,
+        expected: &[ChatMessage], pending: Option<&str>,
+    ) -> Result<bool, String> {
+        if let Some((bound, native)) = self.claude_native_binding(id)? {
+            if &bound != remote { return Err("Remote Claude server does not match the conversation binding".into()); }
+            snapshot.validate(native.as_deref())?;
+        }
+        self.reconcile_claude_native_binding(id, remote, snapshot, expected, pending, true, true, true, false)
     }
     pub(crate) fn restore_claude_native_binding(
         &self,id:&str,remote:&SshConfig,snapshot:&NativeSnapshot,expected:&[ChatMessage],
     )->Result<bool,String> {
-        self.reconcile_claude_native_binding(id,remote,snapshot,expected,None,true,false)
+        self.reconcile_claude_native_binding(id,remote,snapshot,expected,None,true,false,false,false)
     }
     fn reconcile_claude_native_binding(
-        &self,id:&str,remote:&SshConfig,snapshot:&NativeSnapshot,expected:&[ChatMessage],pending:Option<&str>,bind:bool,authoritative:bool,
+        &self,id:&str,remote:&SshConfig,snapshot:&NativeSnapshot,expected:&[ChatMessage],pending:Option<&str>,bind:bool,authoritative:bool,preserve_pending:bool,idle_only:bool,
     )->Result<bool,String> {
         snapshot.validate(None)?;
         self.migrate_claude_queued_inputs(id,remote,snapshot,expected,&self.get_response_request_metadata(id)?)?;
         let metadata = self.get_response_request_metadata(id)?;
-        let pending = if authoritative {
+        let pending = if authoritative && !preserve_pending {
             expected.iter().filter(|m|m.role==MessageRole::User && Some(m.id.as_str())==pending).map(|m|m.id.clone()).collect()
         } else { self.claude_recovery_pending_messages(id,expected,&metadata,pending)? };
         if !authoritative { self.verify_claude_history_origin(id, expected, &metadata, &pending)?; }
-        let notifications = if authoritative { HashSet::new() } else { self.claude_notification_ids(id, expected, &metadata)? };
+        let notifications = if authoritative && !preserve_pending { HashSet::new() } else { self.claude_notification_ids(id, expected, &metadata)? };
         let notification_updates = Self::claude_notification_migration(expected, &metadata, &notifications, snapshot);
-        let archived: HashSet<String> = if !authoritative && snapshot.messages.iter().any(|m|m.compact_summary) {
+        let hidden: HashSet<_> = snapshot.hidden_user_uuids.iter().map(String::as_str).collect();
+        // Older builds imported command echoes as user messages. Remove only
+        // rows whose original native UUIDs are now proven hidden, even if a
+        // later compaction archived them. Never classify local text heuristically.
+        let obsolete: HashSet<_> = expected.iter().filter(|m| m.role == MessageRole::User
+            && metadata.get(&m.id).and_then(|v| v["claude_native"]["uuids"].as_array()).is_some_and(|ids|
+                !ids.is_empty() && ids.iter().all(|id| id.as_str().is_some_and(|id| hidden.contains(id)))))
+            .map(|m| m.id.clone()).collect();
+        let mut archived: HashSet<String> = if !authoritative && snapshot.messages.iter().any(|m|m.compact_summary) {
             let conn=self.conn.lock().map_err(|e|e.to_string())?;
             let mut stmt=conn.prepare("SELECT id FROM messages WHERE session_id=?1 AND include_in_prompt=0").map_err(|e|e.to_string())?;
             let rows=stmt.query_map([id],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
             rows.collect::<Result<_,_>>().map_err(|e|e.to_string())?
         } else { HashSet::new() };
+        archived.retain(|id| !obsolete.contains(id));
         let mut selected = HashSet::new();
         let mut resolved = Vec::new();
         for native in &snapshot.messages {
@@ -440,7 +497,7 @@ impl SessionStore {
                 resolved.push((native.clone(),existing));
                 continue;
             }
-            let candidates = |exact| expected.iter().filter(|m| !notifications.contains(&m.id) && (!pending.contains(&m.id) || pending_input_matches(metadata.get(&m.id), native)) && !selected.contains(&m.id)
+            let candidates = |exact| expected.iter().filter(|m| !obsolete.contains(&m.id) && !notifications.contains(&m.id) && (!pending.contains(&m.id) || pending_input_matches(metadata.get(&m.id), native)) && !selected.contains(&m.id)
                 && (exact || !archived.contains(&m.id))
                 && matches_native(m, metadata.get(&m.id), native, exact)).collect::<Vec<_>>();
             let exact = candidates(true);
@@ -471,7 +528,8 @@ impl SessionStore {
             }
         }
         if !bind && notification_updates.is_empty() && resolved.iter().all(|(native, existing)| existing.is_some_and(|m| metadata.get(&m.id).is_some_and(|v|
-            v["claude_native"]["key"] == native.key && v["claude_native"]["digest"] == snapshot.digest)))
+            v["claude_native"]["key"] == native.key && v["claude_native"]["digest"] == snapshot.digest
+                && v["claude_native"]["cacheAlgorithmVersion"] == 2)))
             && expected.iter().all(|m| notifications.contains(&m.id) || pending.contains(&m.id) || archived.contains(&m.id) || selected.contains(&m.id)) {
             return Ok(false);
         }
@@ -481,7 +539,7 @@ impl SessionStore {
             let message_id = existing.map(|m| m.id.clone()).unwrap_or_else(|| Uuid::new_v5(&Uuid::NAMESPACE_URL,
                 format!("{id}:{}:{}", snapshot.native_id, native.key).as_bytes()).to_string());
             selected.insert(message_id.clone());
-            let mut payload = if authoritative {json!({})} else {metadata.get(&message_id).cloned().unwrap_or_else(|| json!({}))};
+            let mut payload = if authoritative && !preserve_pending {json!({})} else {metadata.get(&message_id).cloned().unwrap_or_else(|| json!({}))};
             if authoritative && pending_input_matches(metadata.get(&message_id),&native) {
                 payload["claude_pending_input"]=metadata[&message_id]["claude_pending_input"].clone();
             }
@@ -491,7 +549,7 @@ impl SessionStore {
             payload["backend"] = json!("claude_code_cli");
             payload["claude_connection"] = json!(remote);
             payload["claude_checkpoint"] = json!({"version":1,"uuid":native.uuids.last(),"sessionId":snapshot.native_id});
-            payload["claude_native"] = json!({"version":1,"key":native.key,"uuids":native.uuids,"digest":snapshot.digest,
+            payload["claude_native"] = json!({"version":1,"cacheAlgorithmVersion":2,"key":native.key,"uuids":native.uuids,"digest":snapshot.digest,
                 "content":native.content,"usage":native.usage,"compactSummary":native.compact_summary,"queuedInput":native.queued_input,"timestamp":native.timestamp});
             if let Some(model) = &native.model {
                 payload["upstream_model"] = json!(model);
@@ -521,6 +579,13 @@ impl SessionStore {
 
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        if idle_only {
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_runs WHERE session_id=?1 AND status IN ('queued','starting','running','waiting_input','finishing','cancelling'))",
+                [id], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if active { return Ok(false); }
+        }
         // Compare the same full-history projection captured by get_messages.
         // Compaction deliberately backdates its prompt summary, but appends
         // its transcript marker by rowid. Timestamp order is not a revision.
@@ -616,6 +681,51 @@ impl SessionStore {
                 }
                 let model = format!("claude_code/{}", native.model.as_deref().unwrap_or("unknown"));
                 tx.execute("INSERT INTO model_usage_events(session_id,model_id,provider,request_kind,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,created_at) VALUES(?1,?2,'Claude Code CLI','completion',?3,?4,?5,?6,0,?7)",params![id,model,counts[0] as i64,counts[1] as i64,counts[2] as i64,counts[3] as i64,timestamp]).map_err(|e|e.to_string())?;
+            }
+        }
+        // Rebuild diagnostics in this same transaction, from API responses (not
+        // local assistant fragments). Reconciliation must not add billing or
+        // notifications a second time, nor compare replay with future live rows.
+        tx.execute("DELETE FROM session_prompt_cache_checks WHERE session_id=?1 AND
+            (provider='Claude Code CLI' OR model_id LIKE 'claude_code/%')", [id]).map_err(|e|e.to_string())?;
+        Self::reset_prompt_cache_baseline(&tx, id)?;
+        let mut cache_user = String::new();
+        for message in expected.iter().filter(|m| archived.contains(&m.id) && !selected.contains(&m.id)) {
+            if is_context_handoff_message(message) {
+                Self::reset_prompt_cache_baseline(&tx, id)?;
+                continue;
+            }
+            if message.role == MessageRole::User { cache_user = message.id.clone(); }
+            if message.role != MessageRole::Assistant { continue; }
+            let payload = &metadata[&message.id];
+            let native = payload.get("claude_native");
+            let usage = if let Some(native) = native {
+                let Some(usage) = native.get("usage").filter(|v| v.is_object()) else { continue; };
+                usage
+            } else { &payload["claude_usage"] };
+            let key = native.and_then(|v| v["key"].as_str()).map(|key| format!("native:{}:{key}", snapshot.native_id))
+                .or_else(|| payload["claude_cache_request"]["key"].as_str().map(str::to_owned));
+            // Old streaming parts can repeat the same response's usage. Without
+            // a response identity, retain an unknown interval, not invented misses.
+            let receipt = if key.is_some() { usage } else { &Value::Null };
+            Self::record_claude_cache_check(&tx, id, key.unwrap_or_else(|| format!("archive:{}", message.id)),
+                cache_user.clone(), payload["upstream_model"].as_str().or_else(|| payload["model"].as_str()).unwrap_or("unknown"),
+                receipt, message.created_at)?;
+        }
+        for native in &snapshot.messages {
+            let local_id = prepared.iter().rev().find(|(part, ..)| part.key == native.key
+                || part.key.strip_prefix(&native.key).is_some_and(|suffix| suffix.starts_with(":part:")))
+                .map(|(_, message_id, ..)| message_id.as_str()).unwrap_or("");
+            if native.compact_summary {
+                Self::reset_prompt_cache_baseline(&tx, id)?;
+            }
+            if native.role == MessageRole::User { cache_user = local_id.to_owned(); }
+            if native.role == MessageRole::Assistant {
+                let occurred_at = native.timestamp.as_deref().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.timestamp()).unwrap_or(timestamp);
+                Self::record_claude_cache_check(&tx, id, format!("native:{}:{}", snapshot.native_id, native.key),
+                    cache_user.clone(), native.model.as_deref().unwrap_or("unknown"),
+                    native.usage.as_ref().unwrap_or(&Value::Null), occurred_at)?;
             }
         }
         let mut pending_position = prepared.len() as i64;

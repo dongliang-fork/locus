@@ -20,7 +20,11 @@ function mount(_component: unknown) {
     text: () => element.textContent?.trim() || '',
     attr: (name: string) => element.getAttribute(name),
     value: () => (element as HTMLInputElement).value,
-    trigger: async (_name: string) => { (element as HTMLElement).click(); await nextTick(); },
+    trigger: async (name: string) => {
+      if (name === 'click') (element as HTMLElement).click();
+      else element.dispatchEvent(new Event(name, { bubbles: true }));
+      await nextTick();
+    },
     setValue: async (value: string) => { (element as HTMLInputElement).value = value; element.dispatchEvent(new Event('input', { bubbles: true })); await nextTick(); },
   });
   return { findAll: (selector: string) => [...host.querySelectorAll(selector)].map(node),
@@ -48,7 +52,7 @@ describe('Claude SSH authorization', () => {
   it('starts with only an address and tests an inline port before asking for setup', async () => {
     const wrapper=mount(ClaudeConnection);await flushPromises();
     await wrapper.findAll('button').find(b=>b.text()==='SSH')!.trigger('click');
-    expect(wrapper.findAll('input')).toHaveLength(1);
+    expect(wrapper.findAll('input:not([type="number"])')).toHaveLength(1);
     expect(wrapper.findAll('details')).toHaveLength(0);
     await wrapper.find('input').setValue('user@server:2222');
     await wrapper.findAll('button').find(b=>b.text().endsWith('.inspect'))!.trigger('click');await flushPromises();
@@ -133,7 +137,7 @@ describe('macOS SSH keychain password', () => {
     vi.mocked(service.getClaudeConnection).mockResolvedValue(saved);
     const wrapper = mount(ClaudeConnection); await flushPromises();
     expect(wrapper.findAll('input[type="password"]')).toHaveLength(0);
-    expect(wrapper.findAll('input')).toHaveLength(1);
+    expect(wrapper.findAll('input:not([type="number"])')).toHaveLength(1);
     expect(service.inspectClaudeSsh).not.toHaveBeenCalled();
     await inspectMac(wrapper);
     expect(wrapper.find('input[type="password"]').value()).toBe('');
@@ -234,20 +238,68 @@ describe('Claude runtime preferences', () => {
     expect(service.setClaudeRuntimeSettings).not.toHaveBeenCalled();
     vi.mocked(service.setClaudeRuntimeSettings).mockResolvedValueOnce({ ...saved, idleCompaction: true, telemetry: false });
     await idle.trigger('click'); await flushPromises();
-    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(true, false);
+    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(true, false, null);
     expect(idle.attr('aria-checked')).toBe('true');
     vi.mocked(service.setClaudeRuntimeSettings).mockResolvedValueOnce({ ...saved, idleCompaction: true, telemetry: true });
     await telemetry.trigger('click'); await flushPromises();
-    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(true, true);
+    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(true, true, null);
     expect(telemetry.attr('aria-checked')).toBe('true');
     expect(service.inspectClaudeSsh).not.toHaveBeenCalled();
+  });
+  it('edits and clears the remote native compaction window while preserving other preferences', async () => {
+    const remote = { target: 'user@server', port: null, identityFile: null, knownHostsFile: null, cliPath: null };
+    const connection = { ...saved, remote, idleCompaction: true, telemetry: true, autoCompactWindow: 200_000 };
+    vi.mocked(service.getClaudeConnection).mockResolvedValueOnce(connection);
+    const wrapper = mount(ClaudeConnection); await flushPromises();
+    const input = wrapper.find('[aria-label="settings.claudeCode.autoCompactWindow"]');
+    expect(input.value()).toBe('200000');
+    expect(input.attr('disabled')).toBeNull();
+    vi.mocked(service.setClaudeRuntimeSettings).mockResolvedValueOnce({ ...connection, autoCompactWindow: 350_000 });
+    await input.setValue('350000'); await input.trigger('change'); await flushPromises();
+    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(true, true, 350_000);
+    expect(input.value()).toBe('350000');
+    // Updating another preference must not silently reset the threshold.
+    vi.mocked(service.setClaudeRuntimeSettings).mockResolvedValueOnce({ ...connection, telemetry: false, autoCompactWindow: 350_000 });
+    await wrapper.find('[aria-label="settings.claudeCode.telemetry"]').trigger('click'); await flushPromises();
+    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(true, false, 350_000);
+    vi.mocked(service.setClaudeRuntimeSettings).mockResolvedValueOnce({ ...connection, telemetry: false, autoCompactWindow: null });
+    await input.setValue(''); await input.trigger('change'); await flushPromises();
+    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(true, false, null);
+    expect(input.value()).toBe('');
+    expect(service.inspectClaudeSsh).not.toHaveBeenCalled();
+    expect(service.authorizeClaudeSsh).not.toHaveBeenCalled();
+  });
+  it.each(['0', '99999', '1000001', '200000.5'])('rejects invalid compaction windows without saving: %s', async value => {
+    const wrapper = mount(ClaudeConnection); await flushPromises();
+    const input = wrapper.find('[aria-label="settings.claudeCode.autoCompactWindow"]');
+    await input.setValue(value); await input.trigger('change'); await flushPromises();
+    expect(service.setClaudeRuntimeSettings).not.toHaveBeenCalled();
+    expect(input.value()).toBe('');
+    expect(wrapper.find('[role="alert"]').text()).toContain('autoCompactWindowInvalid');
+  });
+  it.each([100_000, 1_000_000])('accepts native compaction window boundary %s', async value => {
+    const wrapper = mount(ClaudeConnection); await flushPromises();
+    vi.mocked(service.setClaudeRuntimeSettings).mockResolvedValueOnce({ ...saved, autoCompactWindow: value });
+    const input = wrapper.find('[aria-label="settings.claudeCode.autoCompactWindow"]');
+    await input.setValue(String(value)); await input.trigger('change'); await flushPromises();
+    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(false, false, value);
+    expect(input.value()).toBe(String(value));
+  });
+  it('restores the saved compaction window after a failed save', async () => {
+    vi.mocked(service.getClaudeConnection).mockResolvedValueOnce({ ...saved, autoCompactWindow: 200_000 });
+    const wrapper = mount(ClaudeConnection); await flushPromises();
+    vi.mocked(service.setClaudeRuntimeSettings).mockRejectedValueOnce(new Error('save failed'));
+    const input = wrapper.find('[aria-label="settings.claudeCode.autoCompactWindow"]');
+    await input.setValue('350000'); await input.trigger('change'); await flushPromises();
+    expect(input.value()).toBe('200000');
+    expect(wrapper.find('[role="alert"]').text()).toContain('save failed');
   });
   it('restores saved preferences and leaves them intact when saving fails', async () => {
     vi.mocked(service.getClaudeConnection).mockResolvedValueOnce({ ...saved, idleCompaction: true, telemetry: true });
     const wrapper = mount(ClaudeConnection); await flushPromises();
     vi.mocked(service.setClaudeRuntimeSettings).mockRejectedValueOnce(new Error('save failed'));
     await wrapper.find('[aria-label="settings.claudeCode.telemetry"]').trigger('click'); await flushPromises();
-    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(true, false);
+    expect(service.setClaudeRuntimeSettings).toHaveBeenLastCalledWith(true, false, null);
     expect(wrapper.find('[aria-label="settings.claudeCode.telemetry"]').attr('aria-checked')).toBe('true');
     expect(wrapper.find('[role="alert"]').text()).toContain('save failed');
   });

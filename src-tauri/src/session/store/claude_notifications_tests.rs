@@ -42,6 +42,7 @@ fn native_seed(store: &SessionStore, id: &str) -> (SshConfig, NativeSnapshot, Ve
         task_snapshot: Value::Null,
         incomplete_tail: false,
         pending_tool_ids: vec![],
+        hidden_user_uuids: vec![],
     };
     let mut ids = Vec::new();
     for (role, text) in [
@@ -83,6 +84,7 @@ fn native_seed(store: &SessionStore, id: &str) -> (SshConfig, NativeSnapshot, Ve
             timestamp: None,
             model: None,
             usage: None,
+            stop_reason: None,
             tool_call_id: tool,
             is_error: false,
             compact_summary: false,

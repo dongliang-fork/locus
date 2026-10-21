@@ -2,7 +2,7 @@ use super::*;
 use super::super::native_journal::Journal;
 use serde_json::json;
 
-fn snapshot() -> NativeSnapshot {
+pub(super) fn snapshot() -> NativeSnapshot {
     serde_json::from_value(json!({
         "version": 1, "nativeId": uuid::Uuid::new_v4(), "digest": "a".repeat(64),
         "messages": [
@@ -17,6 +17,66 @@ fn snapshot() -> NativeSnapshot {
 fn record(journal: &Journal, id: &str, tool: &str) {
     journal.begin(&json!({"callId":id, "tool":tool,
         "input":{"path":"Assets/Example.asset", "readonly":true}})).unwrap();
+}
+
+#[test]
+fn recovery_validates_hidden_user_identities_and_accepts_legacy_snapshots() {
+    let mut native=snapshot();
+    assert!(native.hidden_user_uuids.is_empty());
+    assert!(native.validate(None).is_ok());
+    native.hidden_user_uuids=vec![uuid::Uuid::new_v4().to_string()];
+    assert!(native.validate(None).is_ok());
+    native.hidden_user_uuids.push(native.hidden_user_uuids[0].clone());
+    assert!(native.validate(None).is_err());
+    native.hidden_user_uuids=vec![native.messages[0].uuids[0].clone()];
+    assert!(native.validate(None).is_err());
+    native.hidden_user_uuids=vec!["invalid".into()];
+    assert!(native.validate(None).is_err());
+}
+
+#[test]
+fn recovery_removes_old_command_bubbles_including_archived_rows_but_keeps_pending_input() {
+    let root=tempfile::tempdir().unwrap();
+    let store=SessionStore::new(root.path()).unwrap();
+    let id=store.create_session("command display recovery",None,None,"chat",None).unwrap();
+    let remote:ssh::SshConfig=serde_json::from_value(json!({"target":"unused.invalid"})).unwrap();
+    let mut legacy=snapshot();
+    legacy.pending_tool_ids.clear();
+    let output="<local-command-stdout>Compacted</local-command-stdout>";
+    let mut echo=legacy.messages[0].clone();
+    echo.key="old-command".into();echo.uuids=vec![uuid::Uuid::new_v4().to_string()];echo.content=json!(output);
+    let mut summary=echo.clone();
+    summary.key="summary".into();summary.uuids=vec![uuid::Uuid::new_v4().to_string()];
+    summary.content=json!("native summary");summary.compact_summary=true;
+    let mut recent=echo.clone();
+    recent.key="recent-command".into();recent.uuids=vec![uuid::Uuid::new_v4().to_string()];
+    legacy.messages.extend([echo.clone(),summary,recent.clone()]);
+    store.reconcile_claude_native(&id,&remote,&legacy,&[],None).unwrap();
+    let before=store.get_messages(&id).unwrap();
+    let echo_id=before[2].id.clone();
+    assert!(!store.get_messages_for_prompt(&id).unwrap().iter().any(|m|m.id==echo_id));
+    // Identical text entered by a person is not a native echo and must survive.
+    let pending=store.add_message(&id,MessageRole::User,output).unwrap();
+    let mut clean=legacy.clone();
+    clean.messages.retain(|m|m.key!=echo.key && m.key!=recent.key);
+    clean.hidden_user_uuids=vec![echo.uuids[0].clone(),recent.uuids[0].clone()];
+    clean.digest="b".repeat(64);
+    assert!(store.reconcile_claude_native(&id,&remote,&clean,&store.get_messages(&id).unwrap(),Some(&pending)).unwrap());
+    let after=store.get_messages(&id).unwrap();
+    assert_eq!(after.len(),4);
+    assert_eq!(after[0].id,before[0].id);
+    assert_eq!(after[1].id,before[1].id);
+    assert_eq!(after[2].id,before[3].id);
+    // Full-history reads redact the summary into a display marker; inspect
+    // the prompt projection to verify that its actual content was preserved.
+    assert!(store.get_messages_for_prompt(&id).unwrap().iter().any(|m|
+        m.id==after[2].id && m.content.contains("native summary")));
+    assert_eq!(after[3].id,pending);
+    assert_eq!(after[3].content,output);
+    assert!(!after.iter().any(|m|m.id==echo_id || m.id==before[4].id));
+    assert!(!store.reconcile_claude_native(&id,&remote,&clean,&after,Some(&pending)).unwrap());
+    let backups=root.path().join("claude-recovery").join(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL,id.as_bytes()).to_string());
+    assert!(std::fs::read_dir(backups).unwrap().any(|entry|std::fs::read_to_string(entry.unwrap().path()).unwrap().contains(&echo_id)));
 }
 
 #[test]

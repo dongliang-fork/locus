@@ -111,7 +111,7 @@ async fn claude_queued_input_real_ssh_continues_tools_and_the_next_turn() {
                 let stage=args["stage"].as_str().unwrap().to_string();
                 self.executed.push(stage.clone());
                 if stage=="before" {self.ready.store(true,Ordering::SeqCst);return std::future::pending().await;}
-                ClaudeCodeToolResult{output:stage,is_error:false,images:None}
+                ClaudeCodeToolResult{output:stage,is_error:false,images:None,context:Vec::new()}
             })
         }
     }

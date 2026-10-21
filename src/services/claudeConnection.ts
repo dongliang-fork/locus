@@ -12,7 +12,7 @@ export const claudePrewarmSettings = readonly(prewarmSettings);
 function rememberConnection(connection: ClaudeConnection): ClaudeConnection {
   remoteClaudeCode.value = !!connection.remote;
   prewarmSettings.value = { enabled: !!connection.remote && !!connection.prewarm, capacity: connection.poolCapacity ?? 1,
-    idleMinutes: connection.idleMinutes ?? 15, scope: JSON.stringify([connection.remote, connection.permissionMode, !!connection.idleCompaction, !!connection.telemetry]) };
+    idleMinutes: connection.idleMinutes ?? 15, scope: JSON.stringify([connection.remote, connection.permissionMode, !!connection.idleCompaction, !!connection.telemetry, connection.autoCompactWindow ?? null]) };
   // A catalog belongs to one CLI configuration, including the server's
   // configured gateway model. Permission/password changes do not affect it.
   modelCatalogScope.value = connection.remote
@@ -45,6 +45,7 @@ export interface ClaudeConnection {
   permissionMode: ClaudePermissionMode;
   idleCompaction?: boolean;
   telemetry?: boolean;
+  autoCompactWindow?: number | null;
   prewarm?: boolean;
   poolCapacity?: number;
   idleMinutes?: number;
@@ -60,6 +61,7 @@ export interface ClaudeSessionConnection {
   target: string;
   port: number | null;
   latencyMs: number | null;
+  lastError?: string | null;
   pool: {
     state: 'disabled' | 'idle' | 'warming' | 'ready' | 'waiting' | 'retrying';
     capacity: number;
@@ -77,8 +79,8 @@ export const prewarmClaudeSession = (sessionId: string | null, model: string, wo
 export const connectClaudeSession = (model: string, workspaceRef: WorkspaceRef) =>
   ipcInvoke<void>('connect_claude_session', { model, workspaceRef });
 export const setClaudePermissionMode = (mode: ClaudePermissionMode) => ipcInvoke<ClaudeConnection>('set_claude_permission_mode', { mode }).then(rememberConnection);
-export const setClaudeRuntimeSettings = (idleCompaction: boolean, telemetry: boolean) =>
-  ipcInvoke<ClaudeConnection>('set_claude_runtime_settings', { idleCompaction, telemetry }).then(rememberConnection);
+export const setClaudeRuntimeSettings = (idleCompaction: boolean, telemetry: boolean, autoCompactWindow: number | null) =>
+  ipcInvoke<ClaudeConnection>('set_claude_runtime_settings', { idleCompaction, telemetry, autoCompactWindow }).then(rememberConnection);
 export const inspectClaudeSsh = (config: ClaudeSshConfig) => ipcInvoke<ClaudeRemoteInfo>('inspect_claude_ssh', { config });
 export const authorizeClaudeSsh = (config: ClaudeSshConfig, unlockPassword?: string) => ipcInvoke<ClaudeConnection>('authorize_claude_ssh', { config, unlockPassword: unlockPassword ?? null }).then(rememberConnection);
 export const clearClaudeSshUnlockPassword = (config: ClaudeSshConfig) => ipcInvoke<void>('clear_claude_ssh_unlock_password', { config });

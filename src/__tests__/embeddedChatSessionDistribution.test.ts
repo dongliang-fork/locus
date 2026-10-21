@@ -201,6 +201,39 @@ describe("embedded chat session distribution", () => {
     }
   });
 
+  it("restores and isolates Claude phases in workbench sessions without opening thinking", async () => {
+    mocks.loadSession.mockImplementation(async (id: string) => ({
+      id, title: id, sessionType: "chat", parentSessionId: null, createdAt: 1, updatedAt: 1, messages: [],
+      runtime: id === "native-phase" ? {
+        activeRun: { runId: "native-run", sessionId: id, status: "running", startedAt: 1, updatedAt: 1 },
+        activeToolCalls: [], pendingToolConfirms: [], isCompacting: false, claudeCodePhase: "thinking",
+      } : undefined,
+    }));
+    let native!: ReturnType<typeof useEmbeddedChatSession>;
+    let other!: ReturnType<typeof useEmbeddedChatSession>;
+    const app = createApp(defineComponent({
+      setup() {
+        const common = { workspaceRef: { checkoutId: "phase-checkout", expectedGeneration: 1 }, selectedModelId: "model-a", buildRequest: (text: string) => ({ text }) };
+        native = useEmbeddedChatSession({ ...common, sessionKey: "native-phase-pane", initialSessionId: "native-phase" });
+        other = useEmbeddedChatSession({ ...common, sessionKey: "other-phase-pane", initialSessionId: "other-phase" });
+        return () => h("div");
+      },
+    }));
+    app.mount(document.createElement("div"));
+    try {
+      await vi.waitFor(() => expect(native.claudeCodePhase.value).toBe("thinking"));
+      expect(native.isThinking.value).toBe(false);
+      const source = { kind: "workspace" as const, projectId: "project", checkoutId: "phase-checkout", workspaceGeneration: 1, streamRevision: 1 };
+      publishSessionStreamEvent({ event: { type: "claudeCodePhase", sessionId: "native-phase", runId: "native-run", phase: "responding" }, source });
+      expect(native.claudeCodePhase.value).toBe("responding");
+      expect(other.claudeCodePhase.value).toBeNull();
+      publishSessionStreamEvent({ event: { type: "done", sessionId: "native-phase", runId: "native-run", messageId: "answer", fullText: "" }, source: { ...source, streamRevision: 2 } });
+      expect(native.claudeCodePhase.value).toBeNull();
+      publishSessionStreamEvent({ event: { type: "claudeCodePhase", sessionId: "native-phase", runId: "native-run", phase: "thinking" }, source: { ...source, streamRevision: 3 } });
+      expect(native.claudeCodePhase.value).toBeNull();
+    } finally { app.unmount(); }
+  });
+
   it("restores multi agent per session, synchronizes it, and forwards it to each run", async () => {
     mocks.loadSession.mockImplementation(async (id: string) => ({
       id, title: id, sessionType: "chat", parentSessionId: null,
@@ -601,6 +634,87 @@ describe("embedded chat session distribution", () => {
         content: "Hello",
       }),
     ]);
+
+    app.unmount();
+  });
+
+  it("shows inputs settled after a run ends without adopting the ended run", async () => {
+    const sessionId = "settled-input-session";
+    const runId = "settled-input-run";
+    mocks.loadSession.mockResolvedValue({
+      id: sessionId,
+      title: "Settled input",
+      sessionType: "chat",
+      parentSessionId: null,
+      createdAt: 1,
+      updatedAt: 1,
+      messages: [],
+      pendingInputs: [],
+      runtime: {
+        activeRun: { runId, sessionId, status: "running", startedAt: 1, updatedAt: 1 },
+        activeToolCalls: [],
+        pendingToolConfirms: [],
+        isCompacting: false,
+      },
+    });
+    mocks.getSessionUsage.mockResolvedValue(null);
+
+    let pane!: ReturnType<typeof useEmbeddedChatSession>;
+    const Root = defineComponent({
+      setup() {
+        pane = useEmbeddedChatSession({
+          initialSessionId: sessionId,
+          sessionKey: "settled-input-pane",
+          workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 3 },
+          selectedModelId: "model-a",
+          buildRequest: (input: string) => ({ text: input }),
+        });
+        return () => h("div");
+      },
+    });
+    const app = createApp(Root);
+    app.mount(document.createElement("div"));
+    await vi.waitFor(() => expect(pane.isStreaming.value).toBe(true));
+
+    const source = {
+      kind: "workspace" as const,
+      projectId: "project-a",
+      checkoutId: "checkout-a",
+      workspaceGeneration: 3,
+    };
+    const input = {
+      id: "steer-1", sessionId, runId, mergeGroupId: "group", status: "delivering",
+      delivery: "immediate", text: "late update", displayText: "late update",
+      createdAt: 1, updatedAt: 1, revision: 2,
+    };
+    publishSessionStreamEvent({
+      event: { type: "pendingInputQueued", sessionId, runId, input },
+      source: { ...source, streamRevision: 1 },
+    });
+    expect(pane.queuedFollowUp.value?.canEdit).toBe(false);
+
+    publishSessionStreamEvent({
+      event: { type: "done", sessionId, runId, messageId: "answer", fullText: "" },
+      source: { ...source, streamRevision: 2 },
+    });
+    publishSessionStreamEvent({
+      event: {
+        type: "pendingInputQueued",
+        sessionId,
+        runId,
+        input: { ...input, status: "retained", revision: 3 },
+      },
+      source: { ...source, streamRevision: 3 },
+    });
+
+    expect(pane.isStreaming.value).toBe(false);
+    expect(pane.currentRunId.value).toBeNull();
+    expect(pane.queuedFollowUp.value).toMatchObject({
+      displayText: "late update",
+      isUndelivered: true,
+      canEdit: true,
+      canInsert: false,
+    });
 
     app.unmount();
   });
@@ -1290,6 +1404,37 @@ describe("embedded chat session distribution", () => {
       await vi.waitFor(() => expect(session().errorMessage.value).toBe("unverified history"));
       expect(session().errorNotificationHandled.value).toBe(true);
       expect(notices.notices.filter(notice => notice.message === "unverified history")).toHaveLength(1);
+    } finally { app.unmount(); }
+  });
+
+  it("shows and deduplicates nonterminal Claude notices in embedded chat, retaining only the final error on failure", async () => {
+    const id = "native-diagnostic-notice";
+    mocks.loadSession.mockResolvedValue(loadedSession(id));
+    const { app, session } = mountSession(id);
+    try {
+      await vi.waitFor(() => expect(session().isLoading.value).toBe(false));
+      const notices = useNotificationStore();
+      const source = { kind: "workspace" as const, projectId: "project-notice", checkoutId: "checkout-preload", workspaceGeneration: 1, streamRevision: 1 };
+      publishSessionStreamEvent({ event: { type: "runStart", sessionId: id, runId: "run-notice" }, source });
+      const before = [...session().messages.value];
+      const event = { type: "claudeCodeNotice" as const, sessionId: id, runId: "run-notice", notice: {
+        code: "claude_code.model_fallback", message: "Claude Code: Model unavailable; using configured fallback", retryable: false, severity: "warning" as const,
+      } };
+      const operation = `claudeCode:${id}:run-notice`;
+      // Same notice can arrive through both the ordinary and embedded listener.
+      notices.addNotice("warning", event.notice.message, { code: event.notice.code, operation, replaceOperation: true, sticky: true });
+      publishSessionStreamEvent({ event: { ...event, runId: "old" }, source });
+      publishSessionStreamEvent({ event, source });
+      expect(notices.notices.filter(n => n.operation === operation)).toHaveLength(1);
+      expect(session().isStreaming.value).toBe(true);
+      expect(session().messages.value).toEqual(before);
+      expect(session().errorMessage.value).toBeNull();
+      publishSessionStreamEvent({ event: { type: "error", sessionId: id, runId: "run-notice", error: {
+        code: "chat.stream_failed", message: "Native refusal explanation", retryable: false, severity: "error",
+      } }, source });
+      expect(notices.notices.filter(n => n.operation === operation)).toHaveLength(0);
+      expect(notices.notices.some(n => n.message === "Native refusal explanation" && n.level === "error")).toBe(true);
+      expect(session().isStreaming.value).toBe(false);
     } finally { app.unmount(); }
   });
 

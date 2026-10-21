@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, useSlots, watch } from "vue";
 import { FileText } from "lucide";
-import type { AssetRefAttachment, AssistantRenderPart, ChatMessage, ImageAttachment, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
+import type { ClaudeCodePhase, AssetRefAttachment, AssistantRenderPart, ChatMessage, ImageAttachment, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
 import { t } from "../../i18n";
 import {
   collectPendingContinuationToolSegmentItemIds,
@@ -46,8 +46,10 @@ import SessionReference from "./SessionReference.vue";
 import {
   displayUserMessageContent,
   userMessageConsoleEntries,
+  userMessageKnowledgeQuoteEntries,
   userMessageLocalFileEntries,
   type UserConsoleEntryDisplay,
+  type UserKnowledgeQuoteDisplay,
   type UserLocalFileEntryDisplay,
 } from "../../composables/chatUserMessageDisplay";
 import { isToolCollapseTraceEnabled, logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
@@ -122,6 +124,8 @@ const props = withDefaults(defineProps<{
   isStreaming: boolean;
   isCompacting?: boolean;
   isThinking: boolean;
+  claudeCodeMode?: boolean;
+  claudeCodePhase?: ClaudeCodePhase | null;
   showThinkingBlocks?: boolean;
   hasThinking?: boolean;
   thinkingText?: string;
@@ -268,6 +272,16 @@ function messageConsoleEntries(message: ChatMessage): UserConsoleEntryDisplay[] 
 
 function messageLocalFileEntries(message: ChatMessage): UserLocalFileEntryDisplay[] {
   return userMessageLocalFileEntries(message.content);
+}
+
+function messageQuoteEntries(message: ChatMessage): UserKnowledgeQuoteDisplay[] {
+  return userMessageKnowledgeQuoteEntries(message.content);
+}
+
+/** Each excerpt starts with `path:line[-line]`; show that as an openable file reference. */
+function quoteEntryMarkdown(entry: UserKnowledgeQuoteDisplay) {
+  const firstLine = entry.content.split("\n", 1)[0] ?? "";
+  return markdownInlineCode(firstLine.match(/^(.+?:\d+(?:-\d+)?)(?:\s|$)/)?.[1] ?? entry.path);
 }
 
 function consoleEntryClass(entry: UserConsoleEntryDisplay) {
@@ -786,6 +800,7 @@ function hasVisibleMessagePayload(message: ChatMessage) {
     || message.assetRefs?.length
     || (message.role === "user" && messageConsoleEntries(message).length > 0)
     || (message.role === "user" && messageLocalFileEntries(message).length > 0)
+    || (message.role === "user" && messageQuoteEntries(message).length > 0)
     || (message.role === "user" && userMessageDisplayContent(message).trim())
   );
 }
@@ -1038,7 +1053,7 @@ function toolCallsFromInfos(toolCalls: ToolCallInfo[] | undefined) {
 }
 
 function shouldHideThinkingBlocks() {
-  return !props.showThinkingBlocks || displaySettings.hideThinkingBlocks !== false;
+  return props.claudeCodeMode || !props.showThinkingBlocks || displaySettings.hideThinkingBlocks !== false;
 }
 
 function shouldRenderHistoryThinkingBlock(item: Pick<MessageRenderItem, "message">) {
@@ -1064,7 +1079,7 @@ function livePartHasContent(part: Extract<AssistantRenderPart, { kind: "thinking
 }
 
 function shouldRenderTransientThinkingSegment(part: Extract<AssistantRenderPart, { kind: "thinking" }>) {
-  return props.showThinkingBlocks && (!!part.active || (!shouldHideThinkingBlocks() && livePartHasContent(part)));
+  return !props.claudeCodeMode && props.showThinkingBlocks && (!!part.active || (!shouldHideThinkingBlocks() && livePartHasContent(part)));
 }
 
 function shouldRenderItem(item: MessageRenderItem) {
@@ -1074,6 +1089,7 @@ function shouldRenderItem(item: MessageRenderItem) {
     return !!(
       userMessageDisplayContent(item.message)
       || messageLocalFileEntries(item.message).length > 0
+      || messageQuoteEntries(item.message).length > 0
       || (props.showUserImages && item.message.images && item.message.images.length > 0)
       || (props.enableIntentBadges && messageIntentBadges(item.message).length > 0)
     );
@@ -1721,7 +1737,7 @@ const hasRunningTransientToolCall = computed(() => {
 });
 const hasToolCallHandoff = computed(() => hasTransientToolCalls.value && !hasLiveToolCalls.value);
 const hasVisibleActiveThinkingBlock = computed(() =>
-  props.showThinkingBlocks && props.isThinking
+  !props.claudeCodeMode && props.showThinkingBlocks && props.isThinking
   && canonicalLiveRenderParts.value.some((part) => part.kind === "thinking" && part.active),
 );
 const hasVisibleTransientThinkingBlock = computed(
@@ -1733,8 +1749,17 @@ const hasStreamingContent = computed(() =>
   || hasLiveToolCalls.value
   || hasRunningTransientToolCall.value,
 );
+const claudeCodeActivityLabel = computed(() => {
+  if (!props.claudeCodeMode || !props.isStreaming) return "";
+  if (props.isCompacting) return props.compactingLabel;
+  // Text and tool blocks already display output/generation/execution progress.
+  if (props.claudeCodePhase === "responding"
+      || props.claudeCodePhase === "tool-input"
+      || props.claudeCodePhase === "tool-use") return "";
+  return t(`chat.transcript.claudeCode.${props.claudeCodePhase ?? "requesting"}`);
+});
 const isWaitingForResponse = computed(
-  () => shouldShowWaitingPlaceholder({
+  () => !props.claudeCodeMode && shouldShowWaitingPlaceholder({
     isStreaming: props.isStreaming,
     hasStreamingContent: hasStreamingContent.value,
     isThinking: props.showThinkingBlocks && props.isThinking,
@@ -1746,14 +1771,15 @@ const isToolWaitingRowVisible = computed(() => isToolWaitingForResponse.value &&
 const isToolWaitingStatusVisible = computed(() => isToolWaitingForResponse.value && hasToolCallHandoff.value);
 const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);
 const effectiveWaitingLabel = computed(() => props.isCompacting ? props.compactingLabel : props.waitingLabel);
-const hasStandaloneCompactingPlaceholder = computed(() => props.isCompacting && !isWaitingForResponse.value);
+const hasStandaloneCompactingPlaceholder = computed(() => props.isCompacting && !isWaitingForResponse.value && !claudeCodeActivityLabel.value);
 const hasTransientAssistantMessage = computed(
   () =>
     hasStreamingContent.value
     || hasToolCallHandoff.value
     || hasVisibleTransientThinkingBlock.value
     || isWaitingForResponse.value
-    || hasStandaloneCompactingPlaceholder.value,
+    || hasStandaloneCompactingPlaceholder.value
+    || !!claudeCodeActivityLabel.value,
 );
 
 if (transcriptTraceWatchEnabled("waitingLayoutStateChanged")) {
@@ -2414,6 +2440,10 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
     }
   }
 
+  if (claudeCodeActivityLabel.value) {
+    // Status only: unlike a thinking part, this row has no summary or click action.
+    segments.push({ type: "waiting", key: "transient:claude-code", label: claudeCodeActivityLabel.value });
+  }
   if (hasStandaloneCompactingPlaceholder.value || isStandaloneWaitingPlaceholder.value) {
     const isCompactingPlaceholder = props.isCompacting;
     segments.push({
@@ -3002,6 +3032,28 @@ function openImage(src: string) {
                       class="chat-transcript-user-local-file-type"
                     >
                       {{ entry.typeLabel }}
+                    </span>
+                  </div>
+                </div>
+
+                <div
+                  v-if="messageQuoteEntries(item.message).length > 0"
+                  class="chat-transcript-user-local-files chat-transcript-user-quotes"
+                >
+                  <div
+                    v-for="(entry, quoteIdx) in messageQuoteEntries(item.message)"
+                    :key="`${item.id}:quote:${quoteIdx}`"
+                    class="chat-transcript-user-local-file"
+                    :title="entry.content.length > 600 ? `${entry.content.slice(0, 600)}…` : entry.content"
+                  >
+                    <MarkdownRenderer
+                      class="chat-transcript-user-local-file-ref"
+                      :content="quoteEntryMarkdown(entry)"
+                      :workspace-ref="workspaceRef"
+                      enable-file-refs
+                    />
+                    <span class="chat-transcript-user-local-file-type">
+                      {{ entry.source === "file" ? t("chat.documentSelection.label") : t("chat.knowledgeQuote.selection") }}
                     </span>
                   </div>
                 </div>

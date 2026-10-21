@@ -17,7 +17,7 @@ fn interrupted_outcome(outcome: &Value) -> bool {
     let interrupted_text = |value: &Value| value.as_str().is_some_and(|text|
         text == crate::session::history::INTERRUPTED_TOOL_RESULT || text == INTERRUPTED_DISPATCH_MESSAGE);
     let result = &outcome["result"];
-    interrupted_text(&outcome["deny"]) || interrupted_text(result)
+    outcome["interrupted"] == true || interrupted_text(&outcome["deny"]) || interrupted_text(result)
         || interrupted_text(&result["stdout"]) || result["interrupted"] == true
         || result.as_array().is_some_and(|blocks| blocks.iter().any(|block|
             block["type"] == "text" && interrupted_text(&block["text"])))

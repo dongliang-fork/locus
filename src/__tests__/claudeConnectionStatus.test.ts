@@ -73,10 +73,37 @@ describe('shared remote Claude process status', () => {
       expect(pane.visible.value).toBe(true);
       expect(pane.phase.value).toBe('unknown');
       expect(pane.status.value).toBeNull();
+      expect(pane.error.value).toBe('IPC unavailable');
     }
     await vi.advanceTimersByTimeAsync(1000);
     expect(left.phase.value).toBe('ready');
     expect(right.phase.value).toBe('ready');
+    expect(right.error.value).toBe('');
+  });
+
+  it('shares background startup errors throughout retries and clears them on recovery or a server change', async () => {
+    const error = 'Claude plugin validation failed.\nregister.js:116: invalid helper';
+    const failed = { ...ready, phase: 'disconnected' as const, lastError: error,
+      pool: { ...ready.pool, state: 'retrying' as const, ready: 0 } };
+    vi.mocked(service.getClaudeSessionConnection).mockResolvedValue(failed);
+    const left = harness(), right = harness();
+    await settle();
+    expect(left.error.value).toBe(error);
+    expect(right.error.value).toBe(error);
+    vi.mocked(service.getClaudeSessionConnection).mockResolvedValue({ ...failed, phase: 'starting' });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(left.error.value).toBe(error);
+    vi.mocked(service.getClaudeSessionConnection).mockResolvedValue(ready);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(right.error.value).toBe('');
+    vi.mocked(service.getClaudeSessionConnection).mockResolvedValue(failed);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(left.error.value).toBe(error);
+    vi.mocked(service.getClaudeSessionConnection).mockResolvedValue({ ...ready, target: 'server-b' });
+    settings.value = { ...settings.value, scope: 'ssh-b' };
+    expect(left.error.value).toBe('');
+    await settle();
+    expect(right.error.value).toBe('');
   });
 
   it('hides all icons and stops polling in local mode, then resumes once for all panes', async () => {

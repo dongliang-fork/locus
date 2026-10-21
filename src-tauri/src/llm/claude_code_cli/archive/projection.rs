@@ -83,15 +83,22 @@ pub fn project(info:&ArchiveInfo,files:&BTreeMap<String,Vec<u8>>)->Result<Native
     let mut ordered:Vec<_>=nodes.iter().filter(|(id,_)|selected.contains(*id)).collect();
     ordered.sort_by_key(|(_, (index,_))|*index);
     let mut messages:Vec<NativeMessage>=Vec::new();let mut groups=HashMap::new();
+    let mut hidden_user_uuids=Vec::new();
     for (id,(_,row)) in ordered {
-        if row["isMeta"]==true && row["isCompactSummary"]!=true && !queued_input(row)
+        // Select ancestry first: hidden command rows can be parents of real
+        // prompts, summaries, and tool results.
+        if super::super::recovery::hidden_native_user(row) {
+            hidden_user_uuids.push(id.clone());
+            continue;
+        }
+        if row["type"]!="user" && row["isMeta"]==true && row["isCompactSummary"]!=true && !queued_input(row)
             && super::super::recovery::pending_input_token(&super::super::recovery::text_content(&row["message"]["content"])).is_none() {continue;}
         // Claude persists CLI-generated error/interruption notices as synthetic
         // assistant rows. Keep them in the raw archive, not in model replies.
         if row["isApiErrorMessage"]==true || row["message"]["model"]=="<synthetic>" {continue;}
         let content=blocks(&row["message"]["content"]);
         let create=|key:String,role,content:Value|NativeMessage{key,role,uuids:vec![id.clone()],content,
-            timestamp:row["timestamp"].as_str().map(str::to_string),model:None,usage:None,tool_call_id:None,is_error:false,compact_summary:false,queued_input:false,parts:Vec::new()};
+            timestamp:row["timestamp"].as_str().map(str::to_string),model:None,usage:None,stop_reason:None,tool_call_id:None,is_error:false,compact_summary:false,queued_input:false,parts:Vec::new()};
         match row["type"].as_str() {
             Some("attachment") if queued_input(row)=>{
                 let mut entry=create(id.clone(),MessageRole::User,json!(queued_content(row)));
@@ -110,6 +117,7 @@ pub fn project(info:&ArchiveInfo,files:&BTreeMap<String,Vec<u8>>)->Result<Native
                 entry.parts.push(NativeAssistantPart { uuid:id.clone(),content:content.clone(),timestamp:row["timestamp"].as_str().map(str::to_string) });
                 entry.content.as_array_mut().unwrap().extend(content);
                 if row["message"]["usage"].is_object() {entry.usage=Some(row["message"]["usage"].clone());}
+                if let Some(reason) = row["message"]["stop_reason"].as_str() { entry.stop_reason = Some(reason.to_string()); }
             }
             Some("user")=>{
                 let results:Vec<_>=content.iter().filter(|b|b["type"]=="tool_result").collect();
@@ -165,7 +173,7 @@ pub fn project(info:&ArchiveInfo,files:&BTreeMap<String,Vec<u8>>)->Result<Native
     }
     pending.retain(|id|!results.contains(id));let mut pending_tool_ids:Vec<_>=pending.into_iter().collect();pending_tool_ids.sort();
     let mut snapshot=NativeSnapshot{version:1,native_id:info.native_id.clone(),digest:String::new(),messages,
-        task_snapshot:json!({"version":1,"kind":todo_kind,"tasks":tasks,"items":todos}),todos,incomplete_tail:info.incomplete_tail,pending_tool_ids};
+        task_snapshot:json!({"version":1,"kind":todo_kind,"tasks":tasks,"items":todos}),todos,incomplete_tail:info.incomplete_tail,pending_tool_ids,hidden_user_uuids};
     snapshot.digest=digest(&serde_json::to_vec(&snapshot).map_err(|e|e.to_string())?);
     snapshot.validate(Some(&info.native_id))?;
     Ok(snapshot)

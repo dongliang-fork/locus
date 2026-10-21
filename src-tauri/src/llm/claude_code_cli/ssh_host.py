@@ -149,6 +149,13 @@ def cli_auth_status(cli, env):
 
 def apply_runtime_env(env, config):
     settings = config.get("runtimeSettings", {})
+    window = settings.get("autoCompactWindow")
+    if window is not None:
+        if type(window) is not int or not 100_000 <= window <= 1_000_000:
+            raise ValueError("Claude Code auto-compact window must be between 100000 and 1000000 tokens")
+        # Set this on the remote Claude child, not on the local SSH client.
+        # The native override also wins over saved per-model windows.
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window)
     env.pop("DISABLE_NONESSENTIAL_TRAFFIC", None)
     for key in ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING"):
         if settings.get("telemetry", False):
@@ -261,6 +268,20 @@ def prepare(config, mode):
     return cli, source, env, info
 
 
+def validate_plugin(cli, plugin, env):
+    # Reject a broken Mod before starting a TUI that can never report ready.
+    # This command validates code only; it sends no prompt or model request.
+    try:
+        result = subprocess.run([cli, "plugin", "validate", str(plugin)], env={**env, "NO_COLOR": "1"},
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=20)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Claude plugin validation timed out") from None
+    if result.returncode:
+        detail = result.stdout.decode(errors="replace")[-8000:].strip()
+        raise RuntimeError("Claude plugin validation failed." + ("\n" + detail if detail else ""))
+
+
 def options_view(value, view):
     if view == "input":
         result = {key: value.get(key) for key in ("active", "inputId", "terminalText", "imageCount")}
@@ -275,7 +296,7 @@ def options_view(value, view):
 
 
 ASYNC_EVENTS = frozenset(("text", "thinking", "tool_start", "step_start"))
-CONTROL_EVENTS = frozenset(("input_ready", "input_images", "input_staging_error", "input_queued", "input_consumed", "turn_interrupted"))
+CONTROL_EVENTS = frozenset(("input_ready", "input_images", "input_staging_error", "input_queued", "input_consumed", "turn_interrupted", "bridge_health", "bridge_fault"))
 
 
 class OrderedBridgeQueue:
@@ -435,7 +456,22 @@ class Bridge(http.server.BaseHTTPRequestHandler):
                 payload = {"ready": True, "sessionId": payload.get("sessionId"), "model": payload.get("model")}
             if self.path == "/call":
                 record_dispatch(self.server.session_root, self.server.native_id, payload["callId"])
-            if not (self.path == "/event" and payload.get("type") in CONTROL_EVENTS):
+            if self.path == "/event" and payload.get("type") == "bridge_health":
+                with options_lock:
+                    if not options.get("active") or payload.get("runId") != options.get("inputId"):
+                        return self.respond(409, {"error": "Stale Claude bridge health"})
+                if payload.get("state") not in ("running", "complete"):
+                    return self.respond(400, {"error": "Invalid Claude bridge health"})
+                # Health is a disposable sample, not a durable tool outcome.
+                # Awaiting its SSH receipt can strand reportingHealth in the Mod
+                # and suppress all future samples, even after traffic resumes.
+                # Forward every fresh sample without consuming a tool receipt;
+                # only the receiving Rust watchdog can renew the actual lease.
+                frame({"type": "bridge_health", "payload": payload})
+                return self.respond(200, {"ok": True})
+            # Worker restart and fault receipts must bypass a long-running tool
+            # in the ordered lane, otherwise the host cannot retire a lost Mod.
+            if not (self.path == "/ready" or (self.path == "/event" and payload.get("type") in CONTROL_EVENTS)):
                 asynchronous = self.path == "/event" and payload.get("type") in ASYNC_EVENTS
                 if asynchronous:
                     with options_lock:
@@ -650,7 +686,28 @@ def queued_input_content(row):
     return content
 
 
-def canonical_history(rows):
+def hidden_native_user(row):
+    """Display-only classification; mirror recovery.rs and its shared fixtures."""
+    if row.get("type") != "user" or row.get("isCompactSummary") is True:
+        return False
+    content = row.get("message", {}).get("content", [])
+    if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+        return False
+    text = content if isinstance(content, str) else "\n".join(b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)) if isinstance(content, list) else ""
+    pending = re.match(r'^<locus-pending-user id="([0-9a-fA-F-]{36})">\n', text)
+    if pending:
+        uuid.UUID(pending[1])
+        return False
+    if any(row.get(key) is True for key in ("isMeta", "isVisibleInTranscriptOnly", "isVirtual")):
+        return True
+    if (row.get("origin") or {}).get("kind") == "human":
+        return False
+    return text.lstrip().startswith(("<command-name>", "<command-message>", "<command-args>",
+        "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+        "<bash-input>", "<bash-stdout>", "<bash-stderr>", "<bash-exit-code>", "<task-notification>"))
+
+
+def canonical_history(rows, hidden_user_uuids=None):
     """Follow the active native branch, including parallel tool-result siblings.
     Assistant content blocks are separate JSONL rows with one API message id.
     """
@@ -724,7 +781,12 @@ def canonical_history(rows):
         pending_input = re.match(r'^<locus-pending-user id="([0-9a-fA-F-]{36})">\n', text)
         if pending_input:
             uuid.UUID(pending_input[1])
-        if row.get("isMeta") and not row.get("isCompactSummary") and not pending_input:
+        # Retain hidden rows in the ancestry graph, not as human chat bubbles.
+        if hidden_native_user(row):
+            if hidden_user_uuids is not None:
+                hidden_user_uuids.append(node)
+            continue
+        if row["type"] != "user" and row.get("isMeta") and not row.get("isCompactSummary") and not pending_input:
             continue
         if row["type"] == "assistant":
             key = "assistant:" + str(message.get("id") or node)
@@ -738,6 +800,8 @@ def canonical_history(rows):
             entry["content"].extend(content)
             if message.get("usage"):
                 entry["usage"] = message["usage"]
+            if isinstance(message.get("stop_reason"), str):
+                entry["stopReason"] = message["stop_reason"]
         else:
             results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
             if results:
@@ -1056,7 +1120,7 @@ def read_native_history(config):
             if value.get("uuid") and not value.get("isSidechain"):
                 # API request blobs, environment dumps and credentials are not
                 # transferred. Only message ancestry and actual messages matter.
-                row = {k: value[k] for k in ("uuid", "parentUuid", "logicalParentUuid", "subtype", "type", "isSidechain", "isMeta", "isCompactSummary", "isApiErrorMessage", "timestamp", "message") if k in value}
+                row = {k: value[k] for k in ("uuid", "parentUuid", "logicalParentUuid", "subtype", "type", "isSidechain", "isMeta", "isCompactSummary", "isApiErrorMessage", "isVisibleInTranscriptOnly", "isVirtual", "origin", "timestamp", "message") if k in value}
                 if is_queued_input(value):
                     row["attachment"] = value["attachment"]
                     row["rendered"] = value.get("rendered", [])
@@ -1064,7 +1128,8 @@ def read_native_history(config):
     after = path.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise RuntimeError("The remote conversation changed during synchronization; retry before continuing")
-    messages = canonical_history(rows)
+    hidden_user_uuids = []
+    messages = canonical_history(rows, hidden_user_uuids)
     pending_tools, results = set(), set()
     for message in messages:
         if message["role"] == "assistant":
@@ -1113,7 +1178,8 @@ def read_native_history(config):
         raise RuntimeError("The remote conversation changed during synchronization; retry before continuing")
     snapshot = {"version": 1, "nativeId": native_id, "messages": messages, "todos": todos,
                 "taskSnapshot": {"version": 1, "kind": todo_kind, "tasks": tasks, "items": todos},
-                "incompleteTail": incomplete, "pendingToolIds": sorted(pending_tools)}
+                "incompleteTail": incomplete, "pendingToolIds": sorted(pending_tools),
+                "hiddenUserUuids": hidden_user_uuids}
     encoded = json.dumps(snapshot, ensure_ascii=True, separators=(",", ":")).encode()
     if len(encoded) > MAX_FRAME - 65536:
         raise ValueError("The remote history exceeds the recovery transfer limit; no partial history was applied")
@@ -1287,6 +1353,31 @@ class StartupTrustPrompt:
         return None
 
 
+def acquire_session_lease(root, timeout=35):
+    """Fence recovery against a disconnected host that is still flushing rows.
+
+    The watchdog stops an orphan within 25 seconds. Wait for its actual process
+    lease instead of guessing from a local SSH exit or starting two native TUIs.
+    Never kill a process owned by a different connection.
+    """
+    import fcntl
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lease = (root / "session.lock").open("a+b")
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lease
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Claude transport disconnected: Remote Claude session is still shutting down; no input was submitted")
+                time.sleep(0.1)
+    except BaseException:
+        lease.close()
+        raise
+
+
 def run(config):
     global child_pid, options, last_contact
     if config.get("protocol") != PROTOCOL:
@@ -1299,8 +1390,15 @@ def run(config):
     if mode == "history":
         # Reading a saved conversation needs only SSH file permissions. Do not
         # start Claude, inspect its login, unlock a keychain or install anything.
+        if config.get("requireIdle"):
+            key = str(uuid.UUID(config["sessionKey"]))
+            root = Path.home() / ".local/share/locus/claude-ssh/v1/sessions" / key
+            with acquire_session_lease(root):
+                history = read_native_history(config)
+        else:
+            history = read_native_history(config)
         info = {"pythonInstalled": True, "cliSupported": False, "authenticated": False,
-                "platform": sys.platform, "home": str(Path.home()), "history": read_native_history(config)}
+                "platform": sys.platform, "home": str(Path.home()), "history": history}
         frame({"type": "hello", "protocol": PROTOCOL, "info": info})
         return
     unlock_for_connection(config)
@@ -1318,6 +1416,12 @@ def run(config):
         raise RuntimeError("Remote Claude is not logged in. Configure Claude authentication on that server first.")
     key = str(uuid.UUID(config["sessionKey"]))
     root = Path.home() / ".local/share/locus/claude-ssh/v1/sessions" / key
+    with acquire_session_lease(root):
+        return run_session(config, cli, source, env, info, root)
+
+
+def run_session(config, cli, source, env, info, root):
+    global child_pid, options, last_contact
     shared_profile = source if sys.platform == "darwin" else None
     profile, _ = native_storage(root, shared_profile)
     if shared_profile is not None and profile != shared_profile.expanduser().absolute():
@@ -1328,6 +1432,7 @@ def run(config):
     private_write(plugin / ".claude-plugin/plugin.json", json.dumps({"name": "locus", "version": "0.3.0", "description": "Locus SSH local tool bridge"}))
     private_write(plugin / "hooks/hooks.json", '{"modules":["./register.js"]}')
     private_write(plugin / "hooks/register.js", config["modSource"])
+    validate_plugin(cli, plugin, env)
     gateway = bool(env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY"))
     credential = profile / ".credentials.json"
     if shared_profile is None and not gateway and (source / ".credentials.json").is_file():
@@ -1369,7 +1474,8 @@ def run(config):
     if permission_mode not in ("auto", "bypassPermissions"):
         raise ValueError("Invalid Claude permission mode")
     args = [cli, "--plugin-dir", str(plugin), "--setting-sources", "", "--strict-mcp-config",
-            "--allowedTools", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "WebSearch", "ToolSearch",
+            "--allowedTools", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "WebSearch", "WebFetch", "ToolSearch",
+            "--disallowedTools", "mcp__locus__web_fetch",
             "--permission-mode", permission_mode, "--system-prompt-snapshot", "off"]
     if config.get("nativeToolSearch"):
         native_tools = config.get("nativeTools")

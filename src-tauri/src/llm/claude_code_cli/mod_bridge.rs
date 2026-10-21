@@ -16,9 +16,50 @@ pub struct ControlSignals {
     events: std::sync::Mutex<std::collections::VecDeque<Value>>,
     changed: tokio::sync::Notify,
     interruptions: std::sync::atomic::AtomicU64,
+    health: std::sync::Mutex<super::bridge_health::BridgeHealth>,
 }
 impl ControlSignals {
+    pub fn begin_turn(&self, id: &str) {
+        self.health.lock().unwrap_or_else(|e| e.into_inner()).begin_turn(id, std::time::Instant::now());
+    }
+    pub fn health_error(&self, id: &str) -> Option<String> {
+        self.health.lock().unwrap_or_else(|e| e.into_inner()).error(id, std::time::Instant::now())
+    }
     pub fn route(&self, payload:&Value, options:&Arc<std::sync::RwLock<Value>>) -> Option<Value> {
+        if payload["ready"] == true {
+            let id = payload["sessionId"].as_str()?;
+            let active = options.read().unwrap_or_else(|e|e.into_inner())["active"] == true;
+            return match self.health.lock().unwrap_or_else(|e|e.into_inner()).worker_ready(id, active) {
+                Ok(true) => None,
+                Ok(false) => Some(json!({"ok":true})),
+                Err(error) => Some(json!({"deny":error})),
+            };
+        }
+        // A live, scoped hook callback is also proof of Mod liveness. Do this
+        // at ingress, not in the consumer, which can be awaiting a long tool.
+        // Configuration/poll requests and stale/unknown events are not proof.
+        if is_turn_activity(payload) {
+            let options = options.read().unwrap_or_else(|e| e.into_inner());
+            if options["active"] == true && payload["runId"] == options["inputId"] {
+                if let Some(id) = payload["runId"].as_str() {
+                    self.health.lock().unwrap_or_else(|e| e.into_inner()).activity(id, std::time::Instant::now());
+                }
+            }
+        }
+        if matches!(payload["type"].as_str(), Some("bridge_health" | "bridge_fault")) {
+            let options = options.read().unwrap_or_else(|e|e.into_inner());
+            if options["active"] != true || payload["runId"] != options["inputId"] {
+                return Some(json!({"deny":"Stale Claude bridge health"}));
+            }
+            let id = payload["runId"].as_str().unwrap_or_default();
+            let mut health = self.health.lock().unwrap_or_else(|e|e.into_inner());
+            if payload["type"] == "bridge_fault" {
+                health.fault(id, payload["error"].as_str().unwrap_or("Native hook failed"));
+            } else {
+                health.observe(id, payload["state"].as_str().unwrap_or_default(), std::time::Instant::now());
+            }
+            return Some(json!({"ok":true}));
+        }
         if !matches!(payload["type"].as_str(),Some("input_ready"|"input_images"|"input_staging_error"|"input_queued"|"input_consumed"|"turn_interrupted")) {return None;}
         let options=options.read().unwrap_or_else(|e|e.into_inner());
         if options["active"]!=true || payload["runId"]!=options["inputId"] {return Some(json!({"deny":"Stale Claude input control"}));}
@@ -70,6 +111,17 @@ impl ControlSignals {
         loop{let changed=self.changed.notified();if self.interruption_epoch()!=epoch{return;}changed.await;}
     }
 }
+fn is_turn_activity(payload: &Value) -> bool {
+    matches!(payload["type"].as_str(), Some(
+        "input_ready" | "input_images" | "input_staging_error" | "input_queued" | "input_consumed" |
+        "turn_interrupted" | "input_error" | "turn_start" | "step_start" | "phase" | "text" |
+        "thinking" | "assistant" | "interrupted_assistant" | "tool_start" | "tool_result" |
+        "checkpoint" | "usage" | "diagnostic" | "complete" | "compact_start" | "compact_done" |
+        "command_start" | "command"
+    )) || (payload["type"].is_null() && payload["tool"].is_string()
+        && payload["callId"].as_str().is_some_and(|id| !id.is_empty()) && payload["input"].is_object())
+}
+
 type Receipts =
     Arc<tokio::sync::Mutex<std::collections::HashMap<String, oneshot::Receiver<Value>>>>;
 
@@ -240,6 +292,9 @@ async fn handle(
     if payload["protocol"] != 1 {
         return fail(StatusCode::BAD_REQUEST, "Invalid bridge protocol");
     }
+    let payload = if ready {
+        json!({"ready":true,"sessionId":payload["sessionId"],"model":payload["model"]})
+    } else { payload };
     if let Some(reply)=controls.route(&payload,&options) {return Ok(response(StatusCode::OK,reply));}
     if polling {
         let Some(ticket) = payload["ticket"].as_str() else {
@@ -265,7 +320,7 @@ async fn handle(
             options_view(&options.read().unwrap_or_else(|e| e.into_inner()), payload["view"].as_str()),
         ));
     }
-    if payload["protocol"] != 1
+    if (!ready && payload["protocol"] != 1)
         || (!ready
             && !event
             && (!payload["tool"].is_string()
@@ -274,11 +329,6 @@ async fn handle(
     {
         return fail(StatusCode::BAD_REQUEST, "Invalid tool call envelope");
     }
-    let payload = if ready {
-        json!({"ready":true,"sessionId":payload["sessionId"],"model":payload["model"]})
-    } else {
-        payload
-    };
     let (reply, receive) = oneshot::channel();
     if receipts.lock().await.len() >= 64 {
         return fail(
@@ -373,6 +423,83 @@ mod tests {
         let (result, ()) = tokio::join!(wait, fail);
         assert_eq!(result, Err("Native decode failed".into()));
     }
+    #[test]
+    fn current_turn_activity_renews_health_without_consuming_the_event() {
+        let controls = ControlSignals::default();
+        let options = Arc::new(std::sync::RwLock::new(json!({"active":true,"inputId":"run"})));
+        let expired = std::time::Instant::now() - super::super::bridge_health::HEARTBEAT_LEASE;
+        for payload in [
+            json!({"type":"thinking","runId":"run","text":""}),
+            json!({"type":"phase","runId":"run","phase":"thinking"}),
+            json!({"type":"checkpoint","runId":"run"}),
+            json!({"tool":"Write","callId":"tool","input":{},"runId":"run"}),
+        ] {
+            controls.health.lock().unwrap().begin_turn("run", expired);
+            assert!(controls.health_error("run").is_some());
+            assert_eq!(controls.route(&payload, &options), None);
+            assert!(controls.health_error("run").is_none(), "{payload}");
+        }
+        assert!(controls.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_idle_unknown_and_poll_traffic_cannot_renew_health() {
+        let controls = ControlSignals::default();
+        let options = Arc::new(std::sync::RwLock::new(json!({"active":true,"inputId":"run"})));
+        let expired = std::time::Instant::now() - super::super::bridge_health::HEARTBEAT_LEASE;
+        controls.health.lock().unwrap().begin_turn("run", expired);
+        for payload in [
+            json!({"type":"thinking","runId":"old","text":""}),
+            json!({"type":"unknown","runId":"run"}),
+            json!({"type":"bridge_health","runId":"run","state":"unknown"}),
+            json!({"view":"input","runId":"run"}),
+            json!({"ticket":"pending","runId":"run"}),
+            json!({"tool":"Write","callId":"bad","runId":"run"}),
+        ] {
+            controls.route(&payload, &options);
+            assert!(controls.health_error("run").is_some(), "{payload}");
+        }
+        options.write().unwrap()["active"] = json!(false);
+        controls.route(&json!({"type":"text","runId":"run","text":"late"}), &options);
+        assert!(controls.health_error("run").is_some());
+    }
+
+    #[tokio::test]
+    async fn worker_lifecycle_and_health_bypass_an_unfinished_tool_receipt() {
+        let mut bridge = ModBridge::start().await.unwrap();
+        *bridge.options.write().unwrap() = json!({"active":false});
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let ready = json!({"protocol":1,"sessionId":"native","model":"fixture"});
+        let first = client.post(format!("{}/ready", bridge.url)).bearer_auth(&bridge.token).json(&ready).send();
+        let accept = async {
+            let call = bridge.calls.recv().await.unwrap();
+            assert_eq!(call.payload["ready"], true);
+            call.reply.send(json!({"ok":true})).unwrap();
+        };
+        let (response, ()) = tokio::join!(first, accept);
+        assert_eq!(response.unwrap().json::<Value>().await.unwrap(), json!({"ok":true}));
+        bridge.controls.begin_turn("run");
+        *bridge.options.write().unwrap() = json!({"active":true,"inputId":"run"});
+        let pending: Value = client.post(format!("{}/call", bridge.url)).bearer_auth(&bridge.token)
+            .json(&json!({"protocol":1,"tool":"Write","callId":"blocked","input":{}}))
+            .send().await.unwrap().json().await.unwrap();
+        assert!(pending["pending"].is_string());
+        let _unfinished = bridge.calls.recv().await.unwrap();
+        for _ in 0..70 { // health must not evict queued-input/interruption receipts
+            let response: Value = client.post(format!("{}/event", bridge.url)).bearer_auth(&bridge.token)
+                .json(&json!({"protocol":1,"type":"bridge_health","runId":"run","state":"running"}))
+                .send().await.unwrap().json().await.unwrap();
+            assert_eq!(response, json!({"ok":true}));
+        }
+        assert!(bridge.controls.events.lock().unwrap().is_empty());
+        assert!(bridge.controls.health_error("run").is_none());
+        let restarted: Value = client.post(format!("{}/ready", bridge.url)).bearer_auth(&bridge.token).json(&ready)
+            .send().await.unwrap().json().await.unwrap();
+        assert!(restarted["deny"].as_str().unwrap().contains("restarted"));
+        assert!(bridge.controls.health_error("run").is_some());
+        assert!(bridge.calls.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn long_tools_poll_one_submission_without_reexecution() {
         let mut bridge = ModBridge::start().await.unwrap();

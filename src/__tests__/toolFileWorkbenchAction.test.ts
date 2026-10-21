@@ -30,6 +30,48 @@ vi.mock("../components/tool-block-overrides/toolBlockOverrides", () => ({
 
 afterEach(() => { vi.clearAllMocks(); });
 
+describe("native tool output rendering", () => {
+  it("renders legacy writes as summaries and preserves new write metadata", async () => {
+    for (const output of [
+      JSON.stringify({ type: "update", filePath: "plan.md", content: "NEW_BODY", originalFile: "OLD_BODY" }),
+      "Edited plan.md\nKnowledge index: updated",
+    ]) {
+      const host = document.createElement("div");
+      const app = createApp(ToolCallBlock, { initialExpanded: true, toolCall: { id: "write", name: "write", arguments: '{"filePath":"plan.md"}', output, status: "done" } });
+      app.mount(host);
+      try {
+        await nextTick();
+        expect(host.textContent).toContain("Edited plan.md");
+        expect(host.textContent).not.toContain("NEW_BODY");
+        expect(host.textContent).not.toContain("OLD_BODY");
+        if (output.includes("Knowledge index")) expect(host.textContent).toContain("Knowledge index: updated");
+      } finally { app.unmount(); }
+    }
+  });
+
+  it("renders native todo snapshots while preserving operation warnings", async () => {
+    const output = JSON.stringify({ locusTodoSnapshot: { version: 1, items: [{ content: "Task one", status: "completed", priority: "medium" }], tasks: [{ description: "HIDDEN_SYNC_DETAIL" }] }, locusOutput: "Updated task; dependency warning" });
+    const host = document.createElement("div");
+    const app = createApp(ToolCallBlock, { initialExpanded: true, toolCall: { id: "task", name: "TaskUpdate", arguments: "{}", output, status: "done" } });
+    app.mount(host);
+    try {
+      await nextTick();
+      expect(host.textContent).toContain("Task one");
+      expect(host.textContent).toContain("dependency warning");
+      expect(host.textContent).not.toContain("HIDDEN_SYNC_DETAIL");
+      expect(host.textContent).not.toContain("locusTodoSnapshot");
+    } finally { app.unmount(); }
+  });
+
+  it("does not hide failed task results", async () => {
+    const host = document.createElement("div");
+    const app = createApp(ToolCallBlock, { initialExpanded: true, toolCall: { id: "task", name: "TaskUpdate", arguments: "{}", output: "Permission denied", status: "error" } });
+    app.mount(host);
+    try { await nextTick(); expect(host.textContent).toContain("Permission denied"); }
+    finally { app.unmount(); }
+  });
+});
+
 describe("tool file Workbench actions", () => {
   it.each(["read", "edit", "write"])("opens %s in its containing Workbench using the session checkout", async (name) => {
     const workspaceRef = { checkoutId: "session-checkout", expectedGeneration: 7, expectedMaterializationEpoch: 3 };

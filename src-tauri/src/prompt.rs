@@ -1,3 +1,9 @@
+pub mod claude_code_cli {
+    /// Execution semantics for tools bridged from Claude's isolated runtime.
+    pub const TOOL_ENVIRONMENT: &str =
+        include_str!("../../prompt/claude-code-cli-tool-environment.md");
+}
+
 pub mod commit {
     pub const COMMIT_MESSAGE: &str = include_str!("../../prompt/commit-message.md");
 }
@@ -163,6 +169,45 @@ mod tests {
             assert!(
                 !object.contains_key(keyword),
                 "tool `{name}` parameters must not contain top-level `{keyword}`"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_cli_tool_environment_explains_per_call_workspace_scoping() {
+        let prompt = claude_code_cli::TOOL_ENVIRONMENT;
+        for rule in [
+            "Each Bash call starts in the workspace Working directory",
+            "Do not prepend `cd` to that same directory",
+            "the change lasts for that call only",
+            "Relative file-tool paths resolve against the workspace",
+            "Glob/Grep use the workspace when `path` is omitted",
+            "Each Python call also starts in the workspace",
+            "not the injected `project`, SDK checkout binding, or later tool calls",
+            "`worktree` or `workspace_ref`",
+        ] {
+            assert!(
+                prompt.contains(rule),
+                "missing Claude CLI directory rule: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_cli_tool_environment_distinguishes_paths_and_tool_boundaries() {
+        let prompt = claude_code_cli::TOOL_ENVIRONMENT;
+        for rule in [
+            "not executed in the Claude CLI runtime directory",
+            "F:/Project/src/file.cs",
+            "Do not translate them to Linux or Git Bash `/f/...` paths",
+            "File-tool arguments do not expand `~` or shell variables",
+            "Use Bash `ls` for directory listings",
+            "do not assume generated directories are excluded",
+            "Third-party MCP tools follow their own server's environment and path contract",
+        ] {
+            assert!(
+                prompt.contains(rule),
+                "missing Claude CLI tool boundary rule: {rule}"
             );
         }
     }

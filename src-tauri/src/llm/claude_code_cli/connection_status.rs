@@ -19,6 +19,7 @@ pub(crate) struct ConnectionStatus {
     pub target: String,
     pub port: Option<u16>,
     pub latency_ms: Option<f64>,
+    pub last_error: Option<String>,
     pub pool: PoolStatus,
 }
 
@@ -53,7 +54,7 @@ impl Drop for StartupStatus {
 }
 
 fn snapshot(config: &SshConfig, phase: ConnectionPhase) -> ConnectionStatus {
-    ConnectionStatus { phase, target: config.target.clone(), port: config.port, latency_ms: None,
+    ConnectionStatus { phase, target: config.target.clone(), port: config.port, latency_ms: None, last_error: None,
         pool: PoolStatus { state: "disabled", ..Default::default() } }
 }
 
@@ -129,6 +130,7 @@ pub(crate) fn connection_overview(id: Option<&str>, cwd: Option<&str>, model: Op
     let mut result = snapshot(config, selected.map_or(ConnectionPhase::Disconnected, |p| p.phase));
     result.latency_ms = selected.and_then(|p| p.latency_ms);
     result.pool = pool_status(&processes, &pool, settings.prewarm && settings.remote.as_ref() == Some(config), settings.pool_capacity.clamp(1, 4));
+    result.last_error = pool.last_error;
     Some(result)
 }
 
@@ -152,7 +154,7 @@ mod tests {
 
     #[test]
     fn pool_counts_spares_busy_sticky_and_pending_without_counting_dead_processes() {
-        let mut pool = prewarm::PoolSnapshot { spares: ["spare".into(), "booting".into()].into(), pending: vec![], demanded: true, retrying: false };
+        let mut pool = prewarm::PoolSnapshot { spares: ["spare".into(), "booting".into()].into(), pending: vec![], demanded: true, retrying: false, last_error: None };
         let mut processes: Vec<_> = [("spare", ConnectionPhase::Ready, false), ("booting", ConnectionPhase::Starting, true),
             ("busy", ConnectionPhase::Ready, true), ("sticky", ConnectionPhase::Ready, false), ("dead", ConnectionPhase::Disconnected, false)]
             .into_iter().map(|(id, phase, busy)| ProcessStatus { id: id.into(), phase, busy, latency_ms: None }).collect();

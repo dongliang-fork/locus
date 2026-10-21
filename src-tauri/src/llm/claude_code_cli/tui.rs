@@ -17,6 +17,8 @@ pub(crate) use connection_status::connection_status;
 pub(crate) use connection_status::{connection_overview, ConnectionStatus};
 #[path = "prewarm.rs"]
 pub(crate) mod prewarm;
+#[path = "startup_diagnostics.rs"]
+mod startup_diagnostics;
 
 struct Session {
     #[cfg(windows)]
@@ -194,7 +196,7 @@ impl Session {
         let mut next = catalog.clone();
         let delta = next.merge(incoming)?;
         if next != *catalog { next.save(&self.tool_catalog_path)?; }
-        let snapshot = next.tools.clone();
+        let snapshot = next.active_tools();
         *catalog = next;
         Ok((snapshot, delta))
     }
@@ -307,9 +309,10 @@ async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::Perm
     .map_err(|e| e.to_string())?;
     std::fs::write(plugin.join("hooks/register.js"), native_mod_source())
         .map_err(|e| e.to_string())?;
+    startup_diagnostics::validate_plugin(&cli, &plugin, &child_env).await?;
     let bridge = mod_bridge::ModBridge::start().await?;
     *bridge.options.write().unwrap_or_else(|e| e.into_inner()) =
-        json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":&tool_catalog.tools});
+        json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":tool_catalog.active_tools()});
     let mut command = CommandBuilder::new(cli);
     command.cwd(&cwd);
     command.env_clear();
@@ -335,7 +338,8 @@ async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::Perm
         "--setting-sources",
         "",
         "--strict-mcp-config",
-        "--allowedTools", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "WebSearch", "ToolSearch",
+        "--allowedTools", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "WebSearch", "WebFetch", "ToolSearch",
+        "--disallowedTools", "mcp__locus__web_fetch",
         "--permission-mode",
         permission_mode.as_str(),
         "--system-prompt-snapshot",
@@ -439,7 +443,7 @@ async fn start_remote(options: &ClaudeCodeCliOptions, config: &super::ssh::SshCo
     let (bridge, send) = mod_bridge::ModBridge::channel();
     let tool_catalog_path = super::tool_catalog::path(&options.locus_session_id)?;
     let tool_catalog = super::tool_catalog::ToolCatalog::load(&tool_catalog_path, options.native_tool_search)?;
-    let initial = json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":&tool_catalog.tools});
+    let initial = json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":tool_catalog.active_tools()});
     *bridge.options.write().unwrap_or_else(|e| e.into_inner()) = initial.clone();
     let (remote, info) = super::ssh::Transport::start(config, json!({
         "mode":"session", "authorizedSetup":true, "sessionKey":super::ssh::session_key(&options.locus_session_id, config),
@@ -447,7 +451,13 @@ async fn start_remote(options: &ClaudeCodeCliOptions, config: &super::ssh::SshCo
         "model":normalize_claude_model(&options.model), "resume":options.resume_session_id,
         "permissionMode":permission_mode, "runtimeSettings":runtime_settings, "nativeToolSearch":options.native_tool_search,
         "nativeTools":NATIVE_BUILTIN_TOOLS,
-    }), Some((send,bridge.controls.clone(),bridge.options.clone()))).await?;
+    }), Some((send,bridge.controls.clone(),bridge.options.clone()))).await
+        .map_err(|error| {
+            let diagnostic = startup_diagnostics::message("", error.as_bytes());
+            if super::turn_retry::is_disconnected(&error) && !super::turn_retry::is_disconnected(&diagnostic) {
+                super::turn_retry::disconnected(diagnostic)
+            } else { diagnostic }
+        })?;
     let diagnostic = remote.diagnostic.clone();
     Ok(Arc::new(Session {
         #[cfg(windows)] job: None,
@@ -479,6 +489,7 @@ pub(super) async fn run<H: ClaudeCodeHost>(
 pub(super) async fn run_with_inputs<H: ClaudeCodeHost>(
     options:ClaudeCodeCliOptions,user:serde_json::Value,host:&mut H,source:Option<&dyn ClaudeCodeInputSource>,
 ) -> Result<ClaudeCodeTurnResult,String> {
+    host.on_phase(crate::session::models::ClaudeCodePhase::Starting);
     let _history_guard = prewarm::turn_gate(&options.locus_session_id).await?;
     let settings = super::ssh::load_settings()?;
     let permission_mode = settings.permission_mode;
@@ -517,9 +528,12 @@ pub(super) async fn run_with_inputs<H: ClaudeCodeHost>(
     let result = tokio::select! {
         result = run_session(&session, options, user, host, source) => result,
         error = drive_inputs(&session,source) => Err(error),
+        error = watch_bridge_health(&session) => Err(error),
         _ = async {
             while session.alive() { tokio::time::sleep(Duration::from_millis(100)).await; }
-        } => Err("Claude TUI exited during the turn; resume the conversation to continue".into()),
+        } => Err(if session.ready.load(Ordering::SeqCst) {
+            disconnected_error(&session, "Claude TUI exited during the turn")
+        } else { startup_error(&session, "Claude exited before initialization.") }),
     };
     lease.1 = result.is_ok();
     result
@@ -569,6 +583,21 @@ mod connection_lifecycle_tests {
     }
 
     #[test]
+    fn claude_code_phase_ignores_stale_steps_duplicate_sequences_and_unknown_modes() {
+        use crate::session::models::ClaudeCodePhase;
+        let mut sequence = 0;
+        let event = json!({"stepId":2,"sequence":1,"phase":"thinking"});
+        assert_eq!(accept_phase(&event, None, &mut sequence), None);
+        assert_eq!(accept_phase(&event, Some(3), &mut sequence), None);
+        assert_eq!(accept_phase(&event, Some(2), &mut sequence), Some(ClaudeCodePhase::Thinking));
+        assert_eq!(sequence, 1);
+        assert_eq!(accept_phase(&event, Some(2), &mut sequence), None);
+        assert_eq!(accept_phase(&json!({"stepId":2,"sequence":2,"phase":"unknown"}), Some(2), &mut sequence), None);
+        assert_eq!(sequence, 1);
+        assert_eq!(accept_phase(&json!({"stepId":2,"sequence":2,"phase":"responding"}), Some(2), &mut sequence), Some(ClaudeCodePhase::Responding));
+    }
+
+    #[test]
     fn idle_expiration_is_bounded_and_resets_after_use() {
         let used = Instant::now();
         // Unit tests must not inherit the signed-in user's idle setting.
@@ -590,6 +619,21 @@ mod connection_lifecycle_tests {
     }
 }
 
+fn startup_error(session: &Session, summary: &str) -> String {
+    let error = startup_diagnostics::message(summary, &session.diagnostic.lock().unwrap_or_else(|e| e.into_inner()));
+    if !super::turn_retry::startup_rejected(&error) && session.remote.as_ref().is_some_and(|remote|
+        !remote.alive() && super::turn_retry::is_disconnected(&remote.failure())) {
+        return super::turn_retry::disconnected(error);
+    }
+    super::turn_retry::ssh_startup_error(error)
+}
+
+fn disconnected_error(session: &Session, summary: &str) -> String {
+    let reason = session.remote.as_ref().map(|remote| remote.failure())
+        .unwrap_or_else(|| super::turn_retry::disconnected(summary));
+    startup_diagnostics::message(&format!("{reason} ({summary})"), &session.diagnostic.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 async fn await_ready<H: ClaudeCodeHost>(
     session: &Session,
     options: &ClaudeCodeCliOptions,
@@ -603,9 +647,14 @@ async fn await_ready<H: ClaudeCodeHost>(
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !session.ready.load(Ordering::SeqCst) {
-        let callback=tokio::time::timeout_at(deadline,bridge.calls.recv()).await
-            .map_err(|_|"Claude TUI did not initialize. Check Claude login, workspace trust and plugin support.")?
-            .ok_or("Claude bridge ended")?;
+        let callback = tokio::select! {
+            result = tokio::time::timeout_at(deadline, bridge.calls.recv()) => result
+                .map_err(|_| startup_error(session, "Claude TUI did not initialize. Check Claude login, workspace trust and plugin support."))?
+                .ok_or_else(|| startup_error(session, "Claude bridge ended before initialization."))?,
+            _ = async {
+                while session.alive() { tokio::time::sleep(Duration::from_millis(100)).await; }
+            } => return Err(startup_error(session, "Claude exited before initialization.")),
+        };
         if callback.payload["ready"] == true {
             let id = callback.payload["sessionId"].as_str().ok_or("Claude TUI did not identify its native conversation")?;
             if options.resume_session_id.as_deref().is_some_and(|expected| expected != id) {
@@ -626,6 +675,18 @@ async fn await_ready<H: ClaudeCodeHost>(
     Ok(())
 }
 
+fn accept_phase(
+    message: &serde_json::Value,
+    step: Option<u64>,
+    sequence: &mut u64,
+) -> Option<crate::session::models::ClaudeCodePhase> {
+    if step.is_none() || message["stepId"].as_u64() != step { return None; }
+    let next = message["sequence"].as_u64().filter(|next| *next > *sequence)?;
+    let phase = serde_json::from_value(message["phase"].clone()).ok()?;
+    *sequence = next;
+    Some(phase)
+}
+
 async fn run_session<H: ClaudeCodeHost>(
     session: &Session,
     options: ClaudeCodeCliOptions,
@@ -640,6 +701,7 @@ async fn run_session<H: ClaudeCodeHost>(
     let paths = prepared.paths(&session.attachment_root, &input_id);
     let prompt = prepared.prompt(&paths);
     let (tools, _) = session.merge_tools(&options.tools)?;
+    session.controls.begin_turn(&input_id);
     let configuration = json!({"transport":"tui","active":true,"inputId":input_id,"prompt":prompt,
         "systemPrompt":options.system_prompt,"model":normalize_claude_model(&options.model),"effort":options.effort.as_deref().filter(|e|*e!="none"),"tools":tools,
         "control":user["locusControl"],"messageId":user["locusMessageId"],"pendingUsers":user["locusPendingUsers"],
@@ -660,16 +722,17 @@ async fn run_session<H: ClaudeCodeHost>(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let mut calls = HashMap::<String, serde_json::Value>::new();
-    let mut completed = std::collections::HashSet::new();
+    let mut tools = super::turn_tools::TurnTools::default();
     let mut started = false;
-    let mut diagnostic = String::new();
+    let mut activity_step = None;
+    let mut activity_sequence = 0;
+    let mut diagnostics = super::diagnostics::TurnDiagnostics::default();
     let startup = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let callback = tokio::select! {
-            callback=bridge.calls.recv()=>callback.ok_or("Claude bridge closed")?,
+            callback=bridge.calls.recv()=>callback.ok_or_else(|| disconnected_error(session, "Claude bridge closed"))?,
             _=tokio::time::sleep(Duration::from_secs(1))=>{
-                if !session.alive(){return Err("Claude TUI exited during the turn".into());}
+                if !session.alive(){return Err(disconnected_error(session, "Claude TUI exited during the turn"));}
                 if !started && tokio::time::Instant::now()>startup{return Err("Claude TUI did not accept the Locus input".into());}
                 continue;
             }
@@ -693,17 +756,30 @@ async fn run_session<H: ClaudeCodeHost>(
                 host.on_checkpoint(message)?;
             },
             "compact_start" | "compact_done" => host.on_compaction(message)?,
-            "diagnostic" => { diagnostic = message["text"].as_str().unwrap_or_default().to_string(); },
+            "diagnostic" => {
+                if let Some(notice) = diagnostics.record(message) { host.on_diagnostic(notice); }
+            },
             "input_error" => return Err(message["error"].as_str().unwrap_or("Claude input failed").into()),
             "input_ready" => {},
             "step_start" => {
+                diagnostics.start_step();
+                activity_step = message["stepId"].as_u64();
+                activity_sequence = 0;
+                host.on_step_started(activity_step.unwrap_or(0))?;
+                host.on_phase(crate::session::models::ClaudeCodePhase::Requesting);
                 if let Some(model) = message["model"].as_str().filter(|value| !value.trim().is_empty()) {
                     host.on_model_resolved(model)?;
                 }
             }
+            "phase" => {
+                // A render callback may finish after the next model request starts.
+                if let Some(phase) = accept_phase(message, activity_step, &mut activity_sequence) {
+                    host.on_phase(phase);
+                }
+            }
             "usage" => {
                 result.upstream_model = message["usage"]["model"].as_str().filter(|value| !value.trim().is_empty()).map(str::to_owned);
-                host.on_step_usage(&message["usage"], &message["context"], &message["timing"])?;
+                host.on_step_usage(&message["usage"], &message["context"], &message["timing"], message["stepId"].as_u64().unwrap_or(0))?;
             }
             "turn_start" | "command_start" => {
                 started = true;
@@ -716,23 +792,33 @@ async fn run_session<H: ClaudeCodeHost>(
             "thinking" => {
                 host.on_thinking_delta(message["text"].as_str().unwrap_or_default().into())
             }
-            "tool_start" => host.on_tool_call_start(
-                message["id"].as_str().unwrap_or_default().into(),
-                native_tools::locus_name(&tool_name(message["name"].as_str().unwrap_or_default()))
-                    .into(),
-            ),
+            "tool_start" => {
+                let id = message["id"].as_str().unwrap_or_default();
+                tools.start(id);
+                host.on_tool_call_start(id.into(),
+                    native_tools::locus_name(&tool_name(message["name"].as_str().unwrap_or_default())).into());
+            }
             "assistant" | "interrupted_assistant" => {
-                if let Some(blocks) = message["message"]["content"].as_array() {
-                    for block in blocks {
+                let mut projected = message.clone();
+                if let Some(blocks) = projected["message"]["content"].as_array_mut() {
+                    let mut had_tools = false;
+                    let mut has_new_tool = false;
+                    for block in std::mem::take(blocks) {
                         if block["type"] == "tool_use" {
-                            calls.insert(
-                                block["id"].as_str().unwrap_or_default().into(),
-                                block.clone(),
-                            );
+                            had_tools = true;
+                            if !tools.announce(&block)? { continue; }
+                            has_new_tool = true;
                         }
+                        blocks.push(block);
+                    }
+                    // A lost receipt can make a Mod catch re-observe the same
+                    // envelope. Persist neither its tool row nor its text twice.
+                    if had_tools && !has_new_tool {
+                        let _ = callback.reply.send(json!({"ok":true}));
+                        continue;
                     }
                 }
-                if let Some(parsed) = parse_assistant_message(&message) {
+                if let Some(parsed) = parse_assistant_message(&projected) {
                     if message["type"]=="interrupted_assistant" {host.on_interrupted_message(parsed)?;}
                     else {
                         result.final_text = parsed.text.clone();
@@ -741,18 +827,8 @@ async fn run_session<H: ClaudeCodeHost>(
                 }
             }
             "complete" => {
-                if calls.keys().any(|id| !completed.contains(id)) {
-                    return Err("Claude did not return every tool result. Verify local state before continuing; no result was fabricated and no remote fallback was executed.".into());
-                }
-                if message["isAborted"] == true {
-                    return Err("Claude turn was interrupted".into());
-                }
-                if message["reason"] == "error" || message["reason"] == "refusal" {
-                    return Err(format!(
-                        "Claude turn ended: {}. {}",
-                        message["reason"],
-                        if diagnostic.is_empty() {message["answer"].as_str().unwrap_or_default()} else {&diagnostic}
-                    ));
+                if let Some(error) = diagnostics.completion_error(message, tools.has_pending()) {
+                    return Err(error);
                 }
                 // The final text comes only from structured model messages.
                 // A completion/status envelope is never conversation content.
@@ -775,11 +851,13 @@ async fn run_session<H: ClaudeCodeHost>(
             }
             "tool_result" => {
                 let id = message["id"].as_str().unwrap_or_default();
-                if calls.contains_key(id) && completed.insert(id.to_string()) {
+                if tools.complete(id)? {
                     host.on_external_tool_result(
                         id,
-                        message["output"].as_str().unwrap_or_default().into(),
-                        message["isError"] == true,
+                        crate::tool::ToolResult {
+                            output: message["output"].as_str().unwrap_or_default().into(),
+                            is_error: message["isError"] == true,
+                        }.into(),
                     )
                     .await?;
                 }
@@ -795,20 +873,20 @@ async fn run_session<H: ClaudeCodeHost>(
                 }
                 if message.get("agentId").is_some_and(|value| !value.is_null()) {
                     reply = json!({"callId":id,"deny":"Native subagent execution is not enabled"});
-                } else if !calls.get(id).is_some_and(|call| {
+                } else if !tools.calls.get(id).is_some_and(|call| {
                     call["name"] == name
                         && native_tools::same_operation(id, name, &call["input"], &message["input"])
                 }) {
                     reply = json!({"callId":id,"deny":"Call does not match the current assistant message"});
-                } else if !completed.insert(id.to_string()) {
+                } else if !tools.complete(id)? {
                     reply = json!({"callId":id,"deny":"Duplicate tool call was not executed"});
                 } else {
                     match session.journal.begin(message) {
                         Err(error) => reply = json!({"callId":id,"deny":error}),
                         Ok(Some(previous)) => {
                             reply = previous;
-                            if let Some(output) = reply.get("result") {
-                                host.on_external_tool_result(id,output.as_str().map(str::to_string).unwrap_or_else(||output.to_string()),false).await?;
+                            if reply.get("result").is_some() {
+                                host.on_external_tool_result(id, super::native_output::replay(name, &reply)).await?;
                             }
                         }
                         Ok(None) => {
@@ -820,10 +898,11 @@ async fn run_session<H: ClaudeCodeHost>(
                                         output=host.execute_tool(id,name,message["input"].clone())=>output,
                                     };
                                 reply = if output.is_error || output.output == crate::session::history::INTERRUPTED_TOOL_RESULT {
-                                    json!({"callId":id,"deny":output.output})
+                                    json!({"callId":id,"deny":output.text_with_context()})
                                 } else {
                                     json!({"callId":id,"result":mcp_tool_result_content(&output)})
                                 };
+                                reply["locusOutput"] = json!(output.text_with_context());
                             } else {
                                 match native_tools::adapt(id, &tool_name(name), &message["input"]) {
                                     Ok(native) => {
@@ -841,6 +920,7 @@ async fn run_session<H: ClaudeCodeHost>(
                                             &output,
                                             scope.result(),
                                         );
+                                        reply["locusOutput"] = json!(output.text_with_context());
                                     }
                                     Err(error) => reply = json!({"callId":id,"deny":error}),
                                 }
@@ -860,7 +940,7 @@ async fn run_session<H: ClaudeCodeHost>(
                     }
                 }
                 if let Some(deny) = reply["deny"].as_str() {
-                    host.on_external_tool_result(id, deny.to_string(), true)
+                    host.on_external_tool_result(id, crate::tool::ToolResult { output: deny.to_string(), is_error: true }.into())
                         .await?;
                 }
             }
@@ -895,6 +975,30 @@ async fn submit_native_input(
     tokio::time::timeout(Duration::from_secs(30), controls.wait_input("input_ready", input_id, None)).await
         .map_err(|_| "Claude could not prepare the native input box")??;
     write("\r")
+}
+
+async fn watch_bridge_health(session: &Session) -> String {
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let id = {
+            let options = session.options.read().unwrap_or_else(|e| e.into_inner());
+            (options["active"] == true).then(|| options["inputId"].as_str().map(str::to_owned)).flatten()
+        };
+        if let Some(error) = id.as_deref().and_then(|id| session.controls.health_error(id)) {
+            session.recovery_required.store(true, Ordering::SeqCst);
+            // TurnLease retires the process; the next submission reconciles the
+            // native archive. Do not classify this as an automatic tool retry.
+            let transport = match session.remote.as_ref() {
+                Some(remote) => match remote.latency_ms() {
+                    Some(ms) => format!("SSH transport heartbeat is responsive (last RTT {ms:.0} ms)."),
+                    None => "No recent SSH transport heartbeat is available; hook failure and transport loss cannot be distinguished.".into(),
+                },
+                None => "Local Claude bridge.".into(),
+            };
+            eprintln!("[Claude] bridge health failed: {error} {transport}");
+            return format!("{error} {transport}");
+        }
+    }
 }
 
 async fn drive_inputs(session:&Session,source:Option<&dyn ClaudeCodeInputSource>)->String {
@@ -940,7 +1044,7 @@ async fn drive_inputs(session:&Session,source:Option<&dyn ClaudeCodeInputSource>
 }
 
 fn interrupted_tool()->ClaudeCodeToolResult {
-    ClaudeCodeToolResult{output:super::native_journal::INTERRUPTED_DISPATCH_MESSAGE.into(),is_error:true,images:None}
+    ClaudeCodeToolResult{output:super::native_journal::INTERRUPTED_DISPATCH_MESSAGE.into(),is_error:true,images:None,context:Vec::new()}
 }
 
 pub(super) fn tool_name(name: &str) -> String {

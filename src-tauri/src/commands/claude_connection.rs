@@ -121,9 +121,9 @@ pub fn set_claude_permission_mode(mode: PermissionMode) -> Result<ConnectionSett
 }
 
 #[tauri::command]
-pub fn set_claude_runtime_settings(idle_compaction: bool, telemetry: bool) -> Result<ConnectionSettings, String> {
+pub fn set_claude_runtime_settings(idle_compaction: bool, telemetry: bool, auto_compact_window: Option<u32>) -> Result<ConnectionSettings, String> {
     let mut settings = ssh::load_settings()?;
-    settings.runtime = crate::llm::claude_code_cli::runtime_settings::RuntimeSettings { idle_compaction, telemetry };
+    settings.runtime = crate::llm::claude_code_cli::runtime_settings::RuntimeSettings { idle_compaction, telemetry, auto_compact_window };
     ssh::save_settings(&settings)?;
     crate::llm::claude_code_cli::tui::retire_outdated_runtime_settings(settings.runtime);
     get_claude_connection()

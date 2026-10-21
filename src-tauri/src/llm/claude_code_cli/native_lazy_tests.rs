@@ -44,7 +44,7 @@ impl ClaudeCodeHost for Host {
                 _ => panic!("ToolSearch must execute in Claude, not in Locus: {name}"),
             }
             self.executed.push(name.into());
-            ClaudeCodeToolResult { output: format!("LOCAL_OK_{name}"), is_error: false, images: None }
+            ClaudeCodeToolResult { output: format!("LOCAL_OK_{name}"), is_error: false, images: None, context: Vec::new() }
         })
     }
 }

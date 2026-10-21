@@ -735,6 +735,7 @@ onUnmounted(() => {
       :can-resume-interrupted="chatStore.canResumeInterrupted"
       :is-compacting="chatStore.isCompacting"
       :is-thinking="chatStore.isThinking"
+      :claude-code-phase="chatStore.claudeCodePhase"
       :has-thinking="chatStore.hasStreamingThinking"
       :thinking-order="chatStore.thinkingOrder"
       :thinking-duration="chatStore.thinkingDuration"

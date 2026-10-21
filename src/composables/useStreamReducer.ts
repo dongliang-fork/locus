@@ -6,12 +6,13 @@ import {
 } from "./assistantRenderParts";
 import { INTERRUPTED_TOOL_RESULT, resolveToolCallDisplayShape } from "./toolCallBatches";
 import { parseClaudeTodoOutput, parseLegacyTodoWriteOutput, parseTodoWriteArguments } from "./todoWrite";
-import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
+import type { ClaudeCodePhase, StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
 
 export interface StreamState {
   messages: ChatMessage[];
   streamingText: string;
   rawStreamText: string;
+  claudeCodePhase?: ClaudeCodePhase | null;
   streamingThinking: string;
   streamSequence: number;
   streamingTextOrder: number;
@@ -43,6 +44,7 @@ export type StreamMutation =
   | { type: "deactivateLiveThinkingParts"; duration?: number }
   | { type: "updateLiveToolPart"; toolCallId: string; updates: Partial<ToolCallInfo> }
   | { type: "clearLiveRenderParts" }
+  | { type: "setClaudeCodePhase"; phase: ClaudeCodePhase | null }
   | { type: "setThinking"; value: boolean; startTime?: number }
   | { type: "updateThinkingDuration"; duration: number }
   | { type: "addToolCall"; toolCall: ToolCallDisplay }
@@ -503,6 +505,13 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       }
       break;
 
+    case "claudeCodePhase":
+      if (state.isStreaming) {
+        mutations.push({ type: "setClaudeCodePhase", phase: event.phase });
+        if (event.phase === "recovering") mutations.push({ type: "clearPendingInputs" });
+      }
+      break;
+
     case "thinkingDelta":
       if (isEventRenderPartMaterialized(state, event, "thinking")) break;
       markThinkingOrder(event.order);
@@ -787,6 +796,11 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       break;
 
     case "historySynchronized":
+      // Native recovery supersedes the interrupted stream. Keep the active run
+      // and recovery phase, but do not render its old text/tools a second time.
+      mutations.push({ type: "resetRound" });
+      mutations.push({ type: "clearPendingInputs" });
+      mutations.push({ type: "setClaudeCodePhase", phase: state.claudeCodePhase ?? null });
       mutations.push({ type: "replaceMessages", messages: event.messages });
       break;
 
@@ -813,6 +827,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           toolCallId: event.toolCallId,
           question: event.question,
           options: event.options,
+          ...(event.questions?.length ? { questions: event.questions } : {}),
         },
       });
       break;

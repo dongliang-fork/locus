@@ -33,7 +33,8 @@ export function summarizeToolSearchDescription(description: string): string {
  */
 export function parseToolSearchOutput(output: string): ToolSearchOutputSummary | null {
   try {
-    const value: unknown = JSON.parse(output);
+    const parsed: unknown = JSON.parse(output);
+    const value = isRecord(parsed) && isRecord(parsed.result) ? parsed.result : parsed;
     if (!isRecord(value) || !Array.isArray(value.tools)) return null;
 
     const tools = value.tools.flatMap((tool): ToolSearchToolSummary[] => {

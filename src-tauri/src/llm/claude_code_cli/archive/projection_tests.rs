@@ -9,6 +9,17 @@ fn fixture(rows:&[Value])->(ArchiveInfo,BTreeMap<String,Vec<u8>>) {
      BTreeMap::from([("transcript.jsonl".into(),raw)]))
 }
 #[test]
+fn claude_archive_preserves_native_completion_reason_without_inventing_one() {
+    let mut answer = row(2, "assistant", Some(1), json!("done"));
+    answer["message"]["stop_reason"] = json!("end_turn");
+    let (info, files) = fixture(&[row(1, "user", None, json!("request")), answer.clone()]);
+    assert_eq!(project(&info, &files).unwrap().messages[1].stop_reason.as_deref(), Some("end_turn"));
+    answer["message"]["stop_reason"] = Value::Null;
+    let (info, files) = fixture(&[row(1, "user", None, json!("request")), answer]);
+    assert!(project(&info, &files).unwrap().messages[1].stop_reason.is_none());
+}
+
+#[test]
 fn claude_archive_keeps_consumed_queued_input_with_media_even_as_the_last_record() {
     let queued=json!({"uuid":uuid::Uuid::from_u128(3),"parentUuid":uuid::Uuid::from_u128(2),"type":"attachment","isMeta":true,
         "attachment":{"type":"queued_command","prompt":"read thoroughly","humanTurn":true,"origin":{"kind":"human"}},
@@ -130,4 +141,25 @@ fn claude_archive_excludes_cli_diagnostics_without_filtering_actual_model_text()
     assert_eq!(projected.messages[1].uuids,vec![uuid::Uuid::from_u128(6).to_string()]);
     assert_eq!(projected.messages[1].content[0]["text"],"Run /model to pick a different model.");
     assert_eq!(files["transcript.jsonl"],before);
+}
+
+#[test]
+fn claude_archive_filters_native_user_artifacts_without_breaking_ancestry() {
+    let cases: Vec<Value> = serde_json::from_str(include_str!("../../../../tests/fixtures/claude_native_user_visibility.json")).unwrap();
+    for case in cases {
+        let mut candidate=case["row"].clone();
+        let candidate_id=uuid::Uuid::from_u128(2).to_string();
+        candidate["uuid"]=json!(candidate_id);
+        candidate["parentUuid"]=json!(uuid::Uuid::from_u128(1));
+        let (info,files)=fixture(&[row(1,"user",None,json!("before")),candidate,
+            row(3,"user",Some(2),json!("after"))]);
+        let before=files["transcript.jsonl"].clone();
+        let snapshot=project(&info,&files).unwrap();
+        let hidden=case["hidden"].as_bool().unwrap();
+        assert_eq!(snapshot.messages.iter().any(|m|m.uuids.contains(&candidate_id)),!hidden,"{}",case["name"]);
+        assert_eq!(snapshot.hidden_user_uuids.contains(&candidate_id),hidden,"{}",case["name"]);
+        assert_eq!(snapshot.messages.first().unwrap().content[0]["text"],"before");
+        assert_eq!(snapshot.messages.last().unwrap().content[0]["text"],"after");
+        assert_eq!(files["transcript.jsonl"],before);
+    }
 }

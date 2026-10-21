@@ -17,6 +17,9 @@ use crate::session::models::{ImageData, ToolCallInfo};
 use crate::tool::ToolResult;
 
 mod mod_bridge;
+mod bridge_health;
+mod turn_tools;
+mod diagnostics;
 pub(crate) mod runtime_settings;
 mod attachments;
 pub(crate) mod fork;
@@ -27,12 +30,17 @@ mod native_integration_tests;
 mod native_feature_tests;
 #[cfg(test)]
 mod native_lazy_tests;
+#[cfg(test)]
+mod native_search_tests;
 pub(crate) mod native_tools;
 pub(crate) mod native_scope;
 pub(crate) mod native_executor;
+pub(crate) mod native_grep;
+pub(crate) mod native_output;
 pub(crate) mod tui;
 pub(crate) mod ssh;
 pub(crate) mod recovery;
+pub(crate) mod turn_retry;
 pub(crate) mod archive;
 mod native_journal;
 pub(crate) mod tool_catalog;
@@ -98,7 +106,7 @@ const DISALLOWED_CLAUDE_BUILTINS: &[&str] = &[
 // Native mode exposes only builtins whose execution the Mod actually adapts.
 // Unsupported feature-flagged tools (e.g. Artifact) otherwise change schemas
 // across CLI restarts and invalidate an unrelated conversation's prefix.
-pub(super) const NATIVE_BUILTIN_TOOLS: &str = "Read,Write,Edit,Bash,Glob,Grep,TaskOutput,TaskStop,AskUserQuestion,TodoWrite,TaskCreate,TaskGet,TaskList,TaskUpdate,ToolSearch,WebSearch";
+pub(super) const NATIVE_BUILTIN_TOOLS: &str = "Read,Write,Edit,Bash,Glob,Grep,TaskOutput,TaskStop,AskUserQuestion,TodoWrite,TaskCreate,TaskGet,TaskList,TaskUpdate,ToolSearch,WebSearch,WebFetch";
 
 fn claude_session_map() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -188,6 +196,21 @@ pub struct ClaudeCodeToolResult {
     pub output: String,
     pub is_error: bool,
     pub images: Option<Vec<ImageData>>,
+    /// Supplemental model context is independent of display/protocol output.
+    pub context: Vec<String>,
+}
+
+impl ClaudeCodeToolResult {
+    pub(crate) fn text_with_context(&self) -> String {
+        let mut output = self.output.clone();
+        for context in &self.context {
+            if !context.is_empty() && !output.contains(context) {
+                if !output.is_empty() { output.push_str("\n\n"); }
+                output.push_str(context);
+            }
+        }
+        output
+    }
 }
 
 impl From<ToolResult> for ClaudeCodeToolResult {
@@ -196,6 +219,7 @@ impl From<ToolResult> for ClaudeCodeToolResult {
             output: result.output,
             is_error: result.is_error,
             images: None,
+            context: Vec::new(),
         }
     }
 }
@@ -224,7 +248,10 @@ pub trait ClaudeCodeHost {
     fn on_compaction(&mut self, _event: &serde_json::Value) -> Result<(), String> { Ok(()) }
     fn on_session_started(&mut self, _session_id: &str) -> Result<(), String> { Ok(()) }
     fn on_model_resolved(&mut self, _model: &str) -> Result<(), String> { Ok(()) }
-    fn on_step_usage(&mut self, _usage: &serde_json::Value, _context: &serde_json::Value, _timing: &serde_json::Value) -> Result<(), String> { Ok(()) }
+    fn on_step_started(&mut self, _step_id: u64) -> Result<(), String> { Ok(()) }
+    fn on_step_usage(&mut self, _usage: &serde_json::Value, _context: &serde_json::Value, _timing: &serde_json::Value, _step_id: u64) -> Result<(), String> { Ok(()) }
+    fn on_phase(&mut self, _phase: crate::session::models::ClaudeCodePhase) {}
+    fn on_diagnostic(&mut self, _notice: crate::error::AppError) {}
     fn on_text_delta(&mut self, delta: String);
     fn on_thinking_delta(&mut self, delta: String);
     fn on_tool_call_start(&mut self, tool_call_id: String, tool_name: String);
@@ -232,8 +259,7 @@ pub trait ClaudeCodeHost {
     fn on_external_tool_result<'a>(
         &'a mut self,
         _id: &'a str,
-        _output: String,
-        _is_error: bool,
+        _result: ClaudeCodeToolResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
@@ -795,6 +821,7 @@ fn parse_assistant_message(message: &serde_json::Value) -> Option<ClaudeCodeAssi
                                 order: None,
                                 server_tool,
                                 server_tool_output: None,
+                                server_tool_result: None,
                                 outcome: None,
                                 recorded_output: None,
                                 nested_tool_calls: None,
@@ -818,7 +845,7 @@ fn parse_assistant_message(message: &serde_json::Value) -> Option<ClaudeCodeAssi
 fn mcp_tool_result_content(result: &ClaudeCodeToolResult) -> Vec<serde_json::Value> {
     let mut content = vec![json!({
         "type": "text",
-        "text": result.output,
+        "text": result.text_with_context(),
     })];
 
     if let Some(images) = result.images.as_ref() {
@@ -1010,6 +1037,7 @@ mod tests {
     fn mcp_tool_result_content_includes_images() {
         let result = ClaudeCodeToolResult {
             output: "captured".to_string(),
+            context: vec!["Background task completed".into()],
             is_error: false,
             images: Some(vec![ImageData {
                 capture: None,
@@ -1021,7 +1049,7 @@ mod tests {
         let content = mcp_tool_result_content(&result);
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "captured");
+        assert_eq!(content[0]["text"], "captured\n\nBackground task completed");
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["data"], "aW1hZ2U=");
         assert_eq!(content[1]["mimeType"], "image/png");
