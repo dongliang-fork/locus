@@ -12,6 +12,7 @@ pub(super) fn allows_observation(tool_name: &str, args: &Value) -> bool {
         | "ask_user_question"
         | "todowrite"
         | "web_fetch"
+        | "web.run"
         | "code_find_references"
         | "code_goto_definition"
         | "code_symbol_search"

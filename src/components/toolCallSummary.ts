@@ -192,6 +192,14 @@ export function buildToolCallArgsSummary(
     const args = JSON.parse(argumentsText);
     if (!args || typeof args !== "object" || Array.isArray(args)) return "";
 
+    if ((toolName === "ask_user_question" || toolName === "AskUserQuestion") && Array.isArray(args.questions)) {
+      const summary = args.questions.map((question: unknown) => (
+        question && typeof question === "object" && !Array.isArray(question)
+          ? getStringArg(question as ToolCallArguments, ["header", "question"]) : ""
+      )).filter(Boolean).join(" · ");
+      return summary.length <= 80 ? summary : summary.slice(0, 77) + "...";
+    }
+
     if (toolName === "tool_search" && Array.isArray(args.wire_names)) {
       return args.wire_names
         .filter((name: unknown): name is string => typeof name === "string" && name.length > 0)
@@ -269,8 +277,17 @@ export function buildToolCallArgsSummary(
       return desc.slice(0, 57) + "...";
     }
 
-    if (toolName === "web_fetch") {
+    if (toolName === "web_fetch" || toolName === "WebFetch") {
       return getStringArg(args, ["url"]);
+    }
+
+    if (toolName === "web.run") {
+      for (const [command, key] of [["search_query", "q"], ["image_query", "q"], ["open", "ref_id"], ["find", "pattern"], ["click", "ref_id"], ["screenshot", "ref_id"], ["finance", "ticker"], ["weather", "location"], ["sports", "league"], ["time", "utc_offset"]]) {
+        const operations = args[command];
+        if (!Array.isArray(operations)) continue;
+        const details = operations.map(operation => operation && typeof operation[key] === "string" ? operation[key] : "").filter(Boolean);
+        if (details.length) return details.slice(0, 3).join(", ") + (details.length > 3 ? ", …" : "");
+      }
     }
 
     for (const v of Object.values(args)) {

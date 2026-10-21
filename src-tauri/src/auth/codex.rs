@@ -319,6 +319,15 @@ pub struct CodexAuthState {
 }
 
 impl CodexAuthState {
+    #[cfg(test)]
+    pub(crate) fn for_test(access_token: &str, account_id: &str) -> Self {
+        Self { tokens: Some(CodexTokenData {
+            access_token: access_token.into(), refresh_token: String::new(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 3_600_000,
+            account_id: Some(account_id.into()), validation_failed: false, validation_error: None,
+        }) }
+    }
+
     pub fn new(_data_dir: &std::path::Path) -> Self {
         let tokens = Self::load_from_keychain();
 

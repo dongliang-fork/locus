@@ -2,6 +2,16 @@ import { describe, expect, it } from "vitest";
 import { buildToolCallArgsSummary } from "../components/toolCallSummary";
 
 describe("toolCallSummary", () => {
+  it("summarizes native web.run commands using the existing tool row", () => {
+    expect(buildToolCallArgsSummary("web.run", JSON.stringify({ response_length: "long", open: [{ ref_id: "https://example.com/" }] }))).toBe("https://example.com/");
+    expect(buildToolCallArgsSummary("web.run", JSON.stringify({ search_query: [{ q: "Unity" }, { q: "C#" }] }))).toBe("Unity, C#");
+    expect(buildToolCallArgsSummary("web.run", JSON.stringify({ find: [{ ref_id: "turn0search0", pattern: "rendering" }] }))).toBe("rendering");
+    expect(buildToolCallArgsSummary("web.run", JSON.stringify({ open: [null] }))).toBe("");
+  });
+  it("summarizes native WebFetch by URL even when its extraction prompt comes first", () => {
+    const url = "https://example.com/a/long/path/that/should/not/be/truncated/in/the/tool/summary";
+    expect(buildToolCallArgsSummary("WebFetch", JSON.stringify({ prompt: "Extract the title", url }))).toBe(url);
+  });
   it("summarizes patch targets and move destinations without exposing the patch body", () => {
     const patch = "*** Begin Patch\n*** Update File: F:/Project/Assets/Old.cs\n*** Move to: F:/Project/Assets/New.cs\n@@\n-old\n+new\n*** Add File: F:/Project/new.txt\n+*** Delete File: pretend.txt\n*** Delete File: F:/Project/old.txt\n*** End Patch";
     expect(buildToolCallArgsSummary("apply_patch", JSON.stringify({ patch }), { workingDir: "F:/Project" }))
