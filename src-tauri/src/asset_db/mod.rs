@@ -2294,6 +2294,65 @@ mod tests {
     }
 
     #[test]
+    fn full_scan_makes_known_non_yaml_files_searchable_and_ranks_filename_prefix_first() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        let yaml: &[u8] = b"%YAML 1.1\n--- !u!114 &11400000\nMonoBehaviour:\n  m_Name: Profile\n";
+        write_asset_with_guid(
+            &root,
+            "Assets/Characters/Elora/Elora_KalanActions_CombatProfile.asset",
+            yaml,
+            "deadbeefdeadbeefdeadbeefdeadbe21",
+        );
+        write_asset_with_guid(
+            &root,
+            "Assets/Characters/C003_Kalan/AttackCombo/A_Kalan_Kalan_Attack1.glb",
+            b"glTF",
+            "deadbeefdeadbeefdeadbeefdeadbe22",
+        );
+        write_asset_with_guid(
+            &root,
+            "Assets/UI/Kalan_Hud.uss",
+            b".hud {}",
+            "deadbeefdeadbeefdeadbeefdeadbe23",
+        );
+        write_asset_with_guid(
+            &root,
+            "Assets/Kalan_Notes.bin",
+            b"\x00",
+            "deadbeefdeadbeefdeadbeefdeadbe24",
+        );
+
+        let mut graph = AssetDb::open(&root).expect("open asset db");
+        graph.full_scan(|_| {}).expect("scan asset db");
+
+        let rows = graph
+            .search_assets_for_command("A_Kalan", &[types::AssetRoot::Assets], 50)
+            .expect("search a_kalan");
+        let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(
+            paths.first().copied(),
+            Some("Assets/Characters/C003_Kalan/AttackCombo/A_Kalan_Kalan_Attack1.glb"),
+            "filename-prefix match must lead: {paths:?}"
+        );
+        assert!(paths.contains(&"Assets/Characters/Elora/Elora_KalanActions_CombatProfile.asset"));
+        assert_eq!(rows[0].kind, AssetKind::Model);
+
+        let rows = graph
+            .search_assets_for_command("kalan_hud", &[types::AssetRoot::Assets], 50)
+            .expect("search uss");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, AssetKind::OtherFile);
+
+        // Extensions outside the known list stay unsearchable MetaOnly rows.
+        let rows = graph
+            .search_assets_for_command("kalan_notes", &[types::AssetRoot::Assets], 50)
+            .expect("search unknown ext");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn full_scan_indexes_build_dirs_and_skips_unity_ignored_names() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let root = temp.path().join("project");

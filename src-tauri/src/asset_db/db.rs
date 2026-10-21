@@ -29,7 +29,12 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// quoting style — `m_Name: '[Managers] '`), so indexed object names, FTS
 /// terms, ref paths and binding annotations parsed by older builds carry
 /// literal `'` quotes and must be re-derived.
-pub const ASSET_DB_VERSION: u32 = 13;
+///
+/// v14: glTF models, Shader Graph files and known text / UI Toolkit /
+/// assembly-definition files (`AssetKind::OtherFile`) are classified from
+/// their extension instead of `MetaOnly`, which makes them searchable. Older
+/// DBs stored those rows as unsearchable `MetaOnly` and must be rebuilt.
+pub const ASSET_DB_VERSION: u32 = 14;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -603,6 +608,7 @@ fn asset_kind_type_aliases(kind: AssetKind) -> &'static [&'static str] {
         AssetKind::Audio => &["audio", "sound"],
         AssetKind::Shader => &["shader"],
         AssetKind::Model => &["model", "fbx", "mesh"],
+        AssetKind::OtherFile => &["otherfile", "file"],
     }
 }
 

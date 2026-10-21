@@ -439,36 +439,9 @@ fn is_unity_asset_path(rel_path: &str) -> bool {
         return true;
     }
 
-    matches!(
-        ext.as_str(),
-        "cs" | "png"
-            | "jpg"
-            | "jpeg"
-            | "tga"
-            | "psd"
-            | "tif"
-            | "tiff"
-            | "bmp"
-            | "gif"
-            | "exr"
-            | "hdr"
-            | "wav"
-            | "mp3"
-            | "ogg"
-            | "aif"
-            | "aiff"
-            | "shader"
-            | "cginc"
-            | "hlsl"
-            | "glsl"
-            | "compute"
-            | "fbx"
-            | "obj"
-            | "blend"
-            | "dae"
-            | "3ds"
-            | "max"
-    )
+    // Non-YAML kinds share the classifier used by the scanner, so a newly
+    // indexed extension also receives content-only change events.
+    AssetKind::non_yaml_kind_from_ext(&ext).is_some()
 }
 
 /// Whether a workspace-relative path (forward slashes) lives inside the
@@ -3676,9 +3649,16 @@ mod tests {
         // watcher used to flip it to OtherYaml.
         write_asset(
             &root,
-            "Assets/Note.txt",
+            "Assets/Blob.bin",
             b"hello",
             "deadbeefdeadbeefdeadbeefdeadbe02",
+        );
+        // Known non-YAML extension: both paths classify it from the extension.
+        write_asset(
+            &root,
+            "Assets/Readme.md",
+            b"# Readme",
+            "deadbeefdeadbeefdeadbeefdeadbe04",
         );
         // Folder asset: exists_on_disk must survive the watcher, which used
         // to test is_file() and mark directories as missing.
@@ -3703,14 +3683,17 @@ mod tests {
         };
 
         let before = snapshot(&state);
-        assert_eq!(before["Assets/Note.txt"], (AssetKind::MetaOnly, true));
+        assert_eq!(before["Assets/Blob.bin"], (AssetKind::MetaOnly, true));
+        assert_eq!(before["Assets/Readme.md"], (AssetKind::OtherFile, true));
         assert_eq!(before["Assets/Folder"], (AssetKind::MetaOnly, true));
 
-        process_dirty_asset("Assets/Note.txt", &root, &state, &stop, false).expect("process txt");
+        process_dirty_asset("Assets/Blob.bin", &root, &state, &stop, false).expect("process bin");
+        process_dirty_asset("Assets/Readme.md", &root, &state, &stop, false).expect("process md");
         process_dirty_asset("Assets/Folder", &root, &state, &stop, false).expect("process folder");
 
         let after = snapshot(&state);
-        assert_eq!(after["Assets/Note.txt"], (AssetKind::MetaOnly, true));
+        assert_eq!(after["Assets/Blob.bin"], (AssetKind::MetaOnly, true));
+        assert_eq!(after["Assets/Readme.md"], (AssetKind::OtherFile, true));
         assert_eq!(after["Assets/Folder"], (AssetKind::MetaOnly, true));
     }
 

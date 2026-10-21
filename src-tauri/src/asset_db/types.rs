@@ -52,6 +52,10 @@ pub enum AssetKind {
     Audio = 10,
     Shader = 11,
     Model = 12,
+    /// Non-YAML file Unity imports from a known text, UI Toolkit or assembly
+    /// definition extension. Content is not parsed; the extension stays
+    /// available as a type term (`t:json`, `t:uss`).
+    OtherFile = 13,
 }
 
 impl AssetKind {
@@ -63,13 +67,7 @@ impl AssetKind {
             "mat" => Self::Material,
             "anim" => Self::Animation,
             "controller" => Self::Controller,
-            "cs" => Self::Script,
-            "png" | "jpg" | "jpeg" | "tga" | "psd" | "tif" | "tiff" | "bmp" | "gif" | "exr"
-            | "hdr" => Self::Texture,
-            "wav" | "mp3" | "ogg" | "aif" | "aiff" => Self::Audio,
-            "shader" | "cginc" | "hlsl" | "glsl" | "compute" => Self::Shader,
-            "fbx" | "obj" | "blend" | "dae" | "3ds" | "max" => Self::Model,
-            _ => Self::OtherYaml,
+            _ => Self::non_yaml_kind_from_ext(ext).unwrap_or(Self::OtherYaml),
         }
     }
 
@@ -84,8 +82,13 @@ impl AssetKind {
             "png" | "jpg" | "jpeg" | "tga" | "psd" | "tif" | "tiff" | "bmp" | "gif" | "exr"
             | "hdr" => Some(Self::Texture),
             "wav" | "mp3" | "ogg" | "aif" | "aiff" => Some(Self::Audio),
-            "shader" | "cginc" | "hlsl" | "glsl" | "compute" => Some(Self::Shader),
-            "fbx" | "obj" | "blend" | "dae" | "3ds" | "max" => Some(Self::Model),
+            "shader" | "cginc" | "hlsl" | "glsl" | "compute" | "shadergraph" | "shadersubgraph" => {
+                Some(Self::Shader)
+            }
+            "fbx" | "obj" | "blend" | "dae" | "3ds" | "max" | "glb" | "gltf" => Some(Self::Model),
+            // Unity TextAsset formats, UI Toolkit documents and assembly definitions.
+            "txt" | "md" | "json" | "xml" | "csv" | "bytes" | "html" | "htm" | "yaml" | "yml"
+            | "fnt" | "uss" | "tss" | "uxml" | "asmdef" | "asmref" => Some(Self::OtherFile),
             _ => None,
         }
     }
@@ -105,6 +108,7 @@ impl AssetKind {
             10 => Self::Audio,
             11 => Self::Shader,
             12 => Self::Model,
+            13 => Self::OtherFile,
             _ => Self::OtherYaml,
         }
     }
@@ -127,6 +131,7 @@ impl AssetKind {
             Self::Audio => "audio",
             Self::Shader => "shader",
             Self::Model => "model",
+            Self::OtherFile => "otherFile",
         }
     }
 }
