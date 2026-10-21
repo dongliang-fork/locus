@@ -470,7 +470,8 @@ export interface PendingSessionInput {
   sessionId: string;
   runId: string;
   mergeGroupId: string;
-  status: "queued" | "delivering" | "accepted" | "restored" | string;
+  /** `retained` inputs are kept for the user and never sent automatically. */
+  status: "queued" | "delivering" | "retained" | "accepted" | "restored" | string;
   delivery?: "after_run" | "immediate" | string;
   text: string;
   displayText: string;
@@ -482,6 +483,8 @@ export interface PendingSessionInput {
   messageId?: string | null;
   createdAt: number;
   updatedAt: number;
+  /** Monotonic queue state version; orders command replies and stream events. */
+  revision?: number;
 }
 
 export interface SessionDetail {
@@ -573,11 +576,14 @@ export interface SessionEventRecord {
   createdAt: number;
 }
 
+export type ClaudeCodePhase = "starting" | "recovering" | "requesting" | "thinking" | "tool-input" | "tool-use" | "responding";
+
 export interface SessionRuntimeSnapshot {
   activeRun: SessionRunSummary;
   activeToolCalls: ToolCallDisplay[];
   streamingText?: string;
   streamingThinking?: string;
+  claudeCodePhase?: ClaudeCodePhase | null;
   liveRenderParts?: AssistantRenderPart[];
   streamSequence?: number;
   streamingTextOrder?: number;
@@ -688,8 +694,13 @@ export type ReasoningReplayField =
 
 export type RemoteCompactionMode = "disabled" | "codex_v2";
 
+/** `openrouter:web_search` engines; "auto" is stored as null (OpenRouter default). */
+export type OpenRouterSearchEngine = "native" | "exa" | "parallel" | "firecrawl" | "perplexity";
+
 export interface CustomEndpointServerTools {
   webSearch: boolean;
+  /** OpenRouter endpoints only; null or absent keeps OpenRouter's automatic engine. */
+  webSearchEngine?: OpenRouterSearchEngine | null;
 }
 
 /** Legacy single-model endpoint shape; still used by test_custom_endpoint. */
@@ -1019,15 +1030,26 @@ export interface SessionContextToolUsage {
 }
 
 export interface SessionCacheInvalidation {
+  eventId: string;
+  requestSequence: number;
+  algorithmVersion: number;
   messageId: string;
   message: string;
   modelId: string;
   baselineTokens: number;
   inputTokens: number;
   cacheReadTokens: number;
+  cacheWriteTokens: number | null;
   excessInputTokens: number;
   reason: string;
   occurredAt: number;
+}
+
+export interface SessionCacheDetection {
+  checkedRequests: number;
+  unavailableRequests: number;
+  baselineRequests: number;
+  legacyChecks: number;
 }
 
 export interface SessionTimingUsage {
@@ -1049,6 +1071,7 @@ export interface SessionContextUsageReport {
   breakdown: SessionContextBreakdown;
   tools: SessionContextToolUsage[];
   cacheInvalidations: SessionCacheInvalidation[];
+  cacheDetection?: SessionCacheDetection;
   timing: SessionTimingUsage;
   usage: TokenUsage;
 }
@@ -1204,6 +1227,8 @@ export type StreamEvent = {
   | { type: "pendingInputDeleted"; sessionId: string; pendingInputId: string }
   | { type: "pendingInputAccepted"; sessionId: string; pendingInputId: string; messageId: string }
   | { type: "textDelta"; sessionId: string; text: string; order?: number; partId?: string; renderSeq?: number }
+  | { type: "claudeCodePhase"; sessionId: string; phase: ClaudeCodePhase }
+  | { type: "claudeCodeNotice"; sessionId: string; notice: AppErrorPayload }
   | { type: "thinkingDelta"; sessionId: string; text: string; order?: number; partId?: string; renderSeq?: number }
   | {
       type: "toolCallStart";
@@ -1280,6 +1305,7 @@ export type StreamEvent = {
       cacheWriteTokens: number;
       cacheInvalidated?: boolean;
       cacheBaselineTokens?: number;
+      cacheExcessInputTokens?: number;
       cacheInvalidationReason?: string;
       totalInputTokens: number;
       totalOutputTokens: number;
@@ -1299,6 +1325,7 @@ export type StreamEvent = {
       toolCallId: string;
       question: string;
       options: AskOption[];
+      questions?: AskQuestion[];
     }
   | {
       type: "toolConfirm";
@@ -1378,11 +1405,30 @@ export interface UnityPluginInstallPlan {
   unityProcessIds: number[];
 }
 
+export interface AskQuestion {
+  id: string;
+  question: string;
+  header: string;
+  options: AskOption[];
+  multiSelect: boolean;
+  allowCustom: boolean;
+  customLabel?: string;
+  customDescription?: string;
+}
+
+export interface QuestionnaireAnswer {
+  version: 1;
+  answers: { id: string; selected: string[]; customText: string }[];
+}
+
+export type QuestionAnswerPayload = string | QuestionnaireAnswer;
+
 export interface PendingQuestion {
   questionId: string;
   toolCallId: string;
   question: string;
   options: AskOption[];
+  questions?: AskQuestion[];
 }
 
 export interface PendingToolConfirm {

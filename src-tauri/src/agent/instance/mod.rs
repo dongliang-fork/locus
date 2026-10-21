@@ -3,6 +3,7 @@ mod async_resume;
 mod backend;
 mod claude_code_cli;
 mod codex_steering;
+mod codex_web;
 mod custom_codex;
 mod codex_patch;
 mod compaction;
@@ -4721,6 +4722,11 @@ impl AgentInstance {
         if !self.multi_agent_enabled || self.subagent_tool_suppressed {
             allowed.remove("subagent");
         }
+        // Native providers own web retrieval. This also closes legacy tool_load and
+        // tool_call paths instead of only hiding the model-facing MCP alias.
+        if matches!(self.backend, LlmBackend::ClaudeCodeCli | LlmBackend::OpenAiCodex { .. }) {
+            allowed.remove("web_fetch");
+        }
         allowed
     }
 
@@ -5723,6 +5729,7 @@ impl AgentInstance {
             breakdown,
             tools,
             cache_invalidations,
+            cache_detection: Default::default(),
             timing,
             usage,
         }
@@ -6289,12 +6296,12 @@ impl AgentInstance {
             let tool_search_description = (renderer == LazyToolRenderer::CodexNative)
                 .then(|| self.codex_tool_search_description(&plan))
                 .flatten();
-            return PreparedRequestTools {
+            return self.with_codex_web_tool(PreparedRequestTools {
                 request_tool_names: plan.all_names(),
                 deferred_count: plan.deferred.len(),
                 api_tools,
                 tool_search_description,
-            };
+            });
         }
 
         let active_skill_tool_names = self.active_skill_tool_names(selected_skill_tool_names);
@@ -6302,12 +6309,12 @@ impl AgentInstance {
             .build_request_tool_names_for_mode_and_skills(dynamic_mode, &active_skill_tool_names)
             .await;
         let api_tools = self.build_api_tools(&request_tool_names).await;
-        PreparedRequestTools {
+        self.with_codex_web_tool(PreparedRequestTools {
             request_tool_names,
             deferred_count: 0,
             api_tools,
             tool_search_description: None,
-        }
+        })
     }
 
     /// Stable description for the codex `tool_search` declaration. It names
@@ -8565,7 +8572,7 @@ impl AgentInstance {
                 .await?;
                 Ok(LlmCallResult {
                     text: resp.text,
-                    citations: Vec::new(),
+                    citations: resp.citations,
                     tool_calls: resp.tool_calls,
                     finish_reason: resp.finish_reason,
                     end_turn: None,
@@ -8630,7 +8637,7 @@ impl AgentInstance {
                 .await
                 {
                     Ok(resp) => resp,
-                    Err(error) if !error.contains("steering outcome unknown") && is_codex_unauthorized_error(&error) => {
+                    Err(error) if is_codex_unauthorized_error(&error) => {
                         eprintln!(
                             "[OpenAI Codex] received unauthorized response, refreshing auth and retrying once"
                         );
@@ -8736,6 +8743,11 @@ impl AgentInstance {
                             }
                             _ => None,
                         };
+                        let web_search_tool =
+                            crate::llm::web_search::WebSearchTool::for_chat_endpoint(
+                                server_tools,
+                                endpoint,
+                            );
                         let resp = chat_completions::stream_chat(
                             api_key,
                             api_model,
@@ -8750,6 +8762,7 @@ impl AgentInstance {
                                 reasoning_replay_field: *reasoning_replay_field,
                                 thinking_toggle,
                                 max_output_tokens: request_options.max_output_tokens,
+                                web_search: web_search_tool.as_ref(),
                             },
                             self.debug,
                             on_text_delta,
@@ -8840,6 +8853,11 @@ impl AgentInstance {
                             request_options.thinking_level(custom_reasoning_effort.as_deref()),
                         )
                         .flatten();
+                        let web_search_tool =
+                            crate::llm::web_search::WebSearchTool::for_messages_endpoint(
+                                server_tools,
+                                endpoint,
+                            );
                         let resp = anthropic::stream_chat_native(
                             api_key,
                             api_model,
@@ -8849,7 +8867,7 @@ impl AgentInstance {
                             endpoint.as_str(),
                             thinking_level,
                             *replay_reasoning_content,
-                            server_tools.web_search,
+                            web_search_tool.as_ref(),
                             Some(&self.session_id),
                             "Custom(Anthropic)",
                             self.debug,
@@ -8861,7 +8879,7 @@ impl AgentInstance {
                         .await?;
                         Ok(LlmCallResult {
                             text: resp.text,
-                            citations: Vec::new(),
+                            citations: resp.citations,
                             tool_calls: resp.tool_calls,
                             finish_reason: resp.finish_reason,
                             end_turn: None,
@@ -8870,7 +8888,7 @@ impl AgentInstance {
                             output_tokens: resp.output_tokens,
                             cache_read_tokens: resp.cache_read_tokens,
                             cache_write_tokens: resp.cache_write_tokens,
-                            cost_usd: 0.0,
+                            cost_usd: resp.cost_usd,
                             raw_request: resp.raw_request,
                             raw_response: resp.raw_response,
                             thinking_text: resp.thinking_text,
@@ -8895,6 +8913,23 @@ impl AgentInstance {
         }
     }
 
+    /// Provider request/response captures (persisted attempts and the
+    /// in-memory raw rounds) are debug-mode diagnostics: they repeat the full
+    /// history on every iteration. Outside debug mode only the gap is recorded
+    /// so context exports do not claim full capture coverage.
+    fn skip_context_capture(&self, store: &SessionStore) -> bool {
+        if self.debug {
+            return false;
+        }
+        if let Err(error) = store.mark_context_capture_gap(&self.session_id) {
+            eprintln!(
+                "[Agent {}] failed to record context capture gap: session={} error={}",
+                self.id, self.session_id, error
+            );
+        }
+        true
+    }
+
     async fn record_captured_attempt(
         &self,
         store: &SessionStore,
@@ -8907,6 +8942,9 @@ impl AgentInstance {
         response: &str,
         error_message: Option<&str>,
     ) {
+        if self.skip_context_capture(store) {
+            return;
+        }
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -8962,6 +9000,10 @@ impl AgentInstance {
         error_message: Option<&str>,
         used_previous_response_id: Option<bool>,
     ) {
+        // Checked before building the request JSON, which clones the history.
+        if self.skip_context_capture(store) {
+            return;
+        }
         let completed = status == "completed";
         let request = raw_request
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
@@ -9126,7 +9168,9 @@ impl AgentInstance {
             return;
         }
 
-        let priced_rounds = if matches!(&self.backend, LlmBackend::OpenRouter { .. }) {
+        let priced_rounds = if matches!(&self.backend, LlmBackend::OpenRouter { .. })
+            || response.cost_usd > 0.0
+        {
             1
         } else {
             0
@@ -9173,6 +9217,7 @@ impl AgentInstance {
                         cache_write_tokens: response.cache_write_tokens,
                         cache_invalidated: false,
                         cache_baseline_tokens: 0,
+                        cache_excess_input_tokens: 0,
                         cache_invalidation_reason: None,
                         total_input_tokens: totals.total_input_tokens,
                         total_output_tokens: totals.total_output_tokens,
@@ -10324,7 +10369,9 @@ impl AgentInstance {
         if let Err(error) = result {
             let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> = app_handle.state();
             match queue_state.lock() {
-                Ok(mut queue) => queue.restore_claimed(claimed_inputs),
+                Ok(mut queue) => {
+                    queue.restore_claimed(claimed_inputs);
+                }
                 Err(restore_error) => {
                     eprintln!(
                         "[Agent {}] failed to restore claimed pending inputs after error: {}",
@@ -10621,11 +10668,6 @@ impl AgentInstance {
                 clear_started_at,
             );
             let run_result: Result<String, String> = async {
-        let _session_budget = if self.subagent_depth == 0 {
-            if let Some(policy) = app_handle.try_state::<Arc<crate::resource_policy::ResourcePolicyStore>>() {
-                Some(policy.acquire_session(self.cancel_waiter()).await?)
-            } else { None }
-        } else { None };
         // Notify frontend of the new run_id
         eprintln!(
             "[Agent {}] emitting RunStart for session {} run {}",
@@ -10935,10 +10977,12 @@ impl AgentInstance {
         // Claude's native history does not yet contain an interrupted input
         // that failed before submission. Resume that durable user row instead
         // of hiding it behind another empty continuation row.
+        let claude_pending_input = matches!(&self.backend, LlmBackend::ClaudeCodeCli)
+            .then(claude_code_cli::pending_input_metadata);
         let (current_message_id, resumed_claude_message) = claude_code_cli::persist_turn_user_message(
             store, &self.session_id,
             matches!(&self.backend, LlmBackend::ClaudeCodeCli) && internal_system_reminder.is_some(),
-            || store.add_message_with_images_asset_refs_and_signature(
+            || store.add_message_with_images_asset_refs_signature_and_response(
             &self.session_id,
             MessageRole::User,
             &actual_user_text,
@@ -10947,6 +10991,7 @@ impl AgentInstance {
             user_intent_signature.as_deref(),
             current_prompt_prefix,
             user_prompt_suffix.as_deref(),
+            claude_pending_input.as_ref(),
         ))?;
         if let Some(first_user_message_id) = first_user_message_id.as_deref() {
             store.update_message_prompt_prefix(
@@ -11010,7 +11055,7 @@ impl AgentInstance {
                 // Claude's PTY cwd is an isolated runtime directory. Promote
                 // the actual tool host environment into its system prompt;
                 // the Mod separately removes CLI's own environment attachment.
-                parts.push("All filesystem and process tools execute in the Locus client environment below. Use its OS, shell and workspace paths. The Claude CLI runtime directory is not the project directory. Do not translate Windows drive paths to Linux paths.");
+                parts.push(crate::prompt::claude_code_cli::TOOL_ENVIRONMENT.trim());
                 if !prompt_parts.env_prompt.is_empty() {
                     parts.push(prompt_parts.env_prompt.as_str());
                 }
@@ -11314,6 +11359,11 @@ impl AgentInstance {
                 effective_input_tokens
             );
 
+            let cache_request = crate::session::store::PromptCacheRequest::new(
+                format!("live:{run_id}:{iteration}"),
+                Some(messages.iter().rev().find(|message| message.role == MessageRole::User && message.tool_call_id.is_none())
+                    .map(|message| message.id.clone()).unwrap_or_default()),
+            );
             const LLM_RETRIES: u32 = 2;
             let mut response = None;
             let mut response_model_active_duration_ms = 0u64;
@@ -11709,7 +11759,7 @@ impl AgentInstance {
                             break;
                         }
 
-                        let is_retryable = !e.contains("steering outcome unknown") && is_retryable_llm_error(&e);
+                        let is_retryable = is_retryable_llm_error(&e);
                         let attempt_had_output = attempt_emitted_output.load(Ordering::Relaxed);
 
                         if is_retryable && !attempt_had_output && llm_attempt < LLM_RETRIES {
@@ -11836,7 +11886,9 @@ impl AgentInstance {
             if response.input_tokens > 0 || response.output_tokens > 0
                 || response.cache_read_tokens > 0 || response.cache_write_tokens > 0
             {
-                let priced_rounds = if matches!(&self.backend, LlmBackend::OpenRouter { .. }) {
+                let priced_rounds = if matches!(&self.backend, LlmBackend::OpenRouter { .. })
+                    || response.cost_usd > 0.0
+                {
                     1
                 } else {
                     0
@@ -11854,21 +11906,16 @@ impl AgentInstance {
                     + response.cache_write_tokens
                     + response.output_tokens;
                 let context_limit = self.context_limit();
-                match store.record_model_usage_with_cache_check(
-                    &self.session_id,
-                    &self.effective_model,
-                    &usage_provider,
-                    "completion",
-                    response.input_tokens as u64,
-                    response.output_tokens as u64,
-                    response_model_active_duration_ms,
-                    response.cache_read_tokens as u64,
-                    response.cache_write_tokens as u64,
-                    response.cost_usd,
-                    priced_rounds,
-                    Some(context_tokens),
-                    Some(context_limit),
-                ) {
+                match store.record_model_usage_request(crate::session::store::ModelUsageRecord {
+                    session_id: self.session_id.clone(), model_id: self.effective_model.clone(),
+                    provider: usage_provider.clone(), request_kind: "completion".into(),
+                    input_tokens: response.input_tokens as u64, output_tokens: response.output_tokens as u64,
+                    model_active_duration_ms: response_model_active_duration_ms,
+                    cache_read_tokens: response.cache_read_tokens as u64, cache_write_tokens: response.cache_write_tokens as u64,
+                    cost_usd: response.cost_usd, priced_rounds,
+                    context_tokens: Some(context_tokens), context_limit: Some(context_limit),
+                    cache_request: Some(cache_request),
+                }) {
                     Ok((totals, cache_check)) => {
                         let cache_invalidated = cache_check
                             .as_ref()
@@ -11899,6 +11946,7 @@ impl AgentInstance {
                             cache_write_tokens: response.cache_write_tokens,
                             cache_invalidated,
                             cache_baseline_tokens,
+                            cache_excess_input_tokens: cache_check.as_ref().map(|check| check.excess_input_tokens).unwrap_or(0),
                             cache_invalidation_reason,
                             total_input_tokens: totals.total_input_tokens,
                             total_output_tokens: totals.total_output_tokens,
@@ -13276,16 +13324,19 @@ impl AgentInstance {
                     return Ok(String::new());
                 }
 
-                run_steering.persist_ready(false)?;
+                let delivered_steering = run_steering.persist_ready(false)?;
                 if codex_turn_state.as_ref().is_some_and(codex::TurnState::has_steering_continuation) {
                     continue 'agent_loop;
                 }
+                // A rejected or abandoned steer is delivered after this round;
+                // the model must answer it even if its own response was final.
                 if self.drain_queued_pending_inputs(
                     app_handle,
                     store,
                     &run_id,
                     env_prompt_prefix.as_deref(),
-                )? {
+                )? || delivered_steering
+                {
                     store.update_run_status(&run_id, "running", None)?;
                     continue 'agent_loop;
                 }
@@ -13310,7 +13361,9 @@ impl AgentInstance {
                 continue;
             }
 
-            if !model_needs_follow_up {
+            // A rejected steer is saved after this response and must be answered.
+            let needs_follow_up = model_needs_follow_up || run_steering.has_ready(false);
+            if !needs_follow_up {
                 store.close_run_pending_input_queue(&run_id)?;
             }
             let pending_inputs = {
@@ -13325,7 +13378,7 @@ impl AgentInstance {
                     queue.claim_immediate(&self.session_id, &run_id)
                 }
             };
-            if model_needs_follow_up || !pending_inputs.is_empty() || !store.pending_agent_messages(&self.session_id)?.is_empty() {
+            if needs_follow_up || !pending_inputs.is_empty() || !store.pending_agent_messages(&self.session_id)?.is_empty() {
                 let thinking_opt = if response.thinking_text.is_empty() {
                     None
                 } else {
@@ -13568,6 +13621,7 @@ impl AgentInstance {
                 | "list"
                 | "ask_user_question"
                 | "todowrite"
+                | "web.run"
                 | "unity_lock"
                 | "unity_release"
                 | "unity_ref_search"
@@ -14737,6 +14791,7 @@ impl AgentInstance {
                 crate::PendingQuestionResponse {
                     session_id: wait_target.session_id.clone(),
                     run_id: wait_target.run_id.clone(),
+                    form: None,
                     tx,
                 },
             );
@@ -14953,6 +15008,7 @@ impl AgentInstance {
                 crate::PendingQuestionResponse {
                     session_id: wait_target.session_id.clone(),
                     run_id: wait_target.run_id.clone(),
+                    form: None,
                     tx,
                 },
             );
@@ -15577,6 +15633,10 @@ impl AgentInstance {
             });
         }
 
+        if tc.name == codex::web::TOOL_NAME {
+            return self.execute_codex_web(store, args).await;
+        }
+
         if !self.tool_supported_by_model(&tc.name) {
             return ExecutedToolResult::from_tool_result(ToolResult {
                 output: no_vision_endpoint_error(),
@@ -16053,23 +16113,6 @@ impl AgentInstance {
             ))
             .await
         } else if tc.name == "ask_user_question" {
-            if let Some(scope)=crate::llm::claude_code_cli::native_scope::current().filter(|scope|scope.call.tool=="AskUserQuestion") {
-                let mut answers=serde_json::Map::new();
-                for question in scope.call.input["questions"].as_array().into_iter().flatten() {
-                    let mut question=question.clone();
-                    // AskUserCard treats the last entry as the free-text field.
-                    // Preserve every native choice and append that field explicitly.
-                    let mut options=question["options"].as_array().cloned().unwrap_or_default();
-                    options.push(serde_json::json!({"label":"其他","description":"输入回答"}));
-                    question["options"]=serde_json::json!(options);
-                    let answer=self.await_tool_result(Box::pin(self.execute_ask(app_handle,&tc.id,&question,run_id))).await;
-                    if answer.is_error{return answer;}
-                    answers.insert(question["question"].as_str().unwrap_or_default().into(),serde_json::json!(answer.output.strip_prefix("User answered: ").unwrap_or(&answer.output)));
-                }
-                let result=serde_json::json!({"questions":scope.call.input["questions"],"answers":answers});
-                scope.set_result(result.clone());
-                return ExecutedToolResult::from_tool_result(ToolResult{output:result.to_string(),is_error:false});
-            }
             self.await_tool_result(Box::pin(self.execute_ask(app_handle, &tc.id, args, run_id)))
                 .await
         } else if tc.name == "todowrite" {
@@ -18017,45 +18060,21 @@ impl AgentInstance {
         args: &serde_json::Value,
         run_id: &str,
     ) -> ToolResult {
-        let question = args
-            .get("question")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if question.is_empty() {
-            return ToolResult {
-                output: "Missing required parameter: question".to_string(),
-                is_error: true,
-            };
-        }
-
-        let options: Vec<crate::commands::AskOption> = args
-            .get("options")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|item| crate::commands::AskOption {
-                        label: item
-                            .get("label")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        description: item
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                    .filter(|o| !o.label.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if options.is_empty() {
-            return ToolResult {
-                output: "At least one option is required".to_string(),
-                is_error: true,
-            };
+        let native = crate::llm::claude_code_cli::native_scope::current()
+            .filter(|scope| scope.call.tool == "AskUserQuestion");
+        let form = match crate::user_question::QuestionForm::parse(args) {
+            Ok(form) => form,
+            Err(output) => return ToolResult { output, is_error: true },
+        };
+        let first = &form.questions[0];
+        // Keep the legacy projection for existing notification consumers and
+        // older runtime snapshots. Updated UIs use the full questions array.
+        let mut options = first.options.clone();
+        if first.allow_custom {
+            options.push(crate::commands::AskOption {
+                label: first.custom_label.clone().unwrap_or_else(|| "Other".into()),
+                description: first.custom_description.clone().unwrap_or_else(|| "Enter a custom answer".into()),
+            });
         }
 
         let question_id = uuid::Uuid::new_v4().to_string();
@@ -18071,6 +18090,7 @@ impl AgentInstance {
                 crate::PendingQuestionResponse {
                     session_id: wait_target.session_id.clone(),
                     run_id: wait_target.run_id.clone(),
+                    form: Some(form.clone()),
                     tx,
                 },
             );
@@ -18083,8 +18103,9 @@ impl AgentInstance {
                 session_id: wait_target.session_id.clone(),
                 question_id: question_id.clone(),
                 tool_call_id: tool_call_id.to_string(),
-                question: question.clone(),
-                options: options.clone(),
+                question: first.question.clone(),
+                options,
+                questions: form.questions.clone(),
             },
         );
 
@@ -18101,11 +18122,14 @@ impl AgentInstance {
 
         match answer_result {
             Some(Ok(answer)) => {
-                eprintln!("[Agent {}] ask tool: got user answer: {}", self.id, answer);
-                ToolResult {
-                    output: format!("User answered: {}", answer),
-                    is_error: false,
+                let answers = match form.answers(&answer) {
+                    Ok(answers) => answers,
+                    Err(output) => return ToolResult { output, is_error: true },
+                };
+                if let Some(scope) = native {
+                    scope.set_result(form.native_result(&scope.call.input, &answers));
                 }
+                ToolResult { output: form.display(&answers), is_error: false }
             }
             Some(Err(_)) => ToolResult {
                 output: "Question was cancelled".to_string(),
@@ -18919,7 +18943,7 @@ impl AgentInstance {
                         None => {
                             return ToolResult {
                                 output: format!(
-                                    "Unknown type '{}' in type_filter. Valid types: scene, prefab, material, animation, controller, genericAsset, script, texture, audio, shader, model, otherYaml, metaOnly",
+                                    "Unknown type '{}' in type_filter. Valid types: scene, prefab, material, animation, controller, genericAsset, script, texture, audio, shader, model, otherFile, otherYaml, metaOnly",
                                     part
                                 ),
                                 is_error: true,
@@ -19184,6 +19208,7 @@ impl AgentInstance {
             "audio" | "sound" => Some(AssetKind::Audio),
             "shader" => Some(AssetKind::Shader),
             "model" | "mesh" | "fbx" => Some(AssetKind::Model),
+            "otherfile" | "file" => Some(AssetKind::OtherFile),
             _ => None,
         }
     }
@@ -21669,6 +21694,7 @@ impl AgentInstance {
                                             as u32,
                                         cache_invalidated: false,
                                         cache_baseline_tokens: 0,
+                                        cache_excess_input_tokens: 0,
                                         cache_invalidation_reason: None,
                                         total_input_tokens: parent_totals.total_input_tokens,
                                         total_output_tokens: parent_totals.total_output_tokens,
@@ -21751,6 +21777,7 @@ impl AgentInstance {
                                         as u32,
                                     cache_invalidated: false,
                                     cache_baseline_tokens: 0,
+                                    cache_excess_input_tokens: 0,
                                     cache_invalidation_reason: None,
                                     total_input_tokens: parent_totals.total_input_tokens,
                                     total_output_tokens: parent_totals.total_output_tokens,
@@ -22041,6 +22068,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -22259,6 +22287,7 @@ mod tests {
             arguments: arguments.to_string(),
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -22693,6 +22722,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -22704,6 +22734,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: Some(crate::commands::ToolCallOutcome::Done),
             recorded_output: Some("ok".to_string()),
             nested_tool_calls: None,
@@ -23684,6 +23715,44 @@ PrefabInstance:
         test_agent_instance_with_prompts(working_dir, "", "")
     }
 
+    #[tokio::test]
+    async fn context_attempts_are_captured_only_in_debug_mode() {
+        let database = tempdir().expect("create database directory");
+        let store = SessionStore::new(database.path()).expect("initialize session store");
+        let session_id = store
+            .create_session("Capture", None, None, "chat", None)
+            .expect("create session");
+        let mut instance = test_agent_instance(String::new());
+        instance.session_id = session_id.clone();
+        assert!(!store.session_has_context_capture_gap(&session_id).unwrap());
+
+        instance
+            .record_captured_attempt(
+                &store, "run-off", "normal", 1, 1, "completed",
+                serde_json::json!({"model": "test-model"}), "ok", None,
+            )
+            .await;
+        instance
+            .record_raw_attempt(
+                &store, "run-off", "normal", 2, 1, &["system"], &[], &[], 10,
+                "completed", None, "ok", None, None,
+            )
+            .await;
+        assert!(store.list_context_attempts(&session_id).unwrap().is_empty());
+        assert!(instance.raw_store.lock().await.is_empty());
+        assert!(store.session_has_context_capture_gap(&session_id).unwrap());
+
+        instance.debug = true;
+        instance
+            .record_raw_attempt(
+                &store, "run-on", "normal", 1, 1, &["system"], &[], &[], 10,
+                "completed", None, "ok", None, None,
+            )
+            .await;
+        assert_eq!(store.list_context_attempts(&session_id).unwrap().len(), 1);
+        assert_eq!(instance.raw_store.lock().await[&session_id].len(), 1);
+    }
+
     #[test]
     fn prompt_prefix_cache_identity_tracks_remote_cache_route() {
         let mut instance = test_agent_instance(String::new());
@@ -24552,7 +24621,7 @@ PrefabInstance:
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::ClaudeCodeCli,
+            crate::agent::instance::LlmBackend::OpenRouter { api_key: String::new(), base_url: None },
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(ToolRegistry::with_builtins()),
@@ -24574,6 +24643,7 @@ PrefabInstance:
     async fn claude_cli_native_skill_activation_keeps_eager_plan_and_guidance_stable() {
         let temp = tempfile::tempdir().unwrap();
         let mut instance = native_plan_test_instance(&temp);
+        instance.backend = super::LlmBackend::ClaudeCodeCli;
         let renderer = instance.refresh_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::Native, true);
         assert_eq!(renderer, LazyToolRenderer::ClaudeCliNative);
         let before = instance.build_native_request_tool_plan(renderer, &HashSet::new()).await;
@@ -25498,7 +25568,7 @@ PrefabInstance:
                 source: "test".to_string(),
             }),
             "session-test",
-            crate::agent::instance::LlmBackend::ClaudeCodeCli,
+            crate::agent::instance::LlmBackend::OpenRouter { api_key: String::new(), base_url: None },
             false,
             Arc::new(AgentDefRegistry::load(None, None)),
             Arc::new(ToolRegistry::with_builtins()),

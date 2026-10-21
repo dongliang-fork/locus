@@ -14,7 +14,7 @@ import {
   showInFolder,
 } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
-import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, ManagedLocalFileAttachment, SkillManifest, UserIntentMeta, SessionContextExportRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus, KnowledgeDocumentType, SessionTurnPreview } from "../types";
+import type { ClaudeCodePhase, ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, QuestionAnswerPayload, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, ManagedLocalFileAttachment, SkillManifest, UserIntentMeta, SessionContextExportRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus, KnowledgeDocumentType, SessionTurnPreview } from "../types";
 import type { ChangedFile, ToolCallDisplay } from "../types";
 import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
@@ -25,6 +25,8 @@ import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue";
 import QueuedFollowUpImages from "./chat/QueuedFollowUpImages.vue";
 import RichChatInput from "./chat/RichChatInput.vue";
 import BackgroundTasksIndicator from "./chat/BackgroundTasksIndicator.vue";
+import { isWorktreeCreationRunning } from "./chat/worktreeCreationJobs";
+import { workspaceGitHead } from "../services/workspaceGitHead";
 import TokenUsageBar from "./chat/TokenUsageBar.vue";
 import SessionContextUsageWindow from "./SessionContextUsageWindow.vue";
 import AskUserCard from "./chat/AskUserCard.vue";
@@ -107,6 +109,7 @@ import {
   writeChatMessageClipboard,
   type UserMessageDraft,
 } from "../composables/chatMessageDraft";
+import type { LiveSelectionQuote } from "../composables/documentSelection";
 import { emptyComposerIntent } from "../composables/chatInputIntents";
 import { isMessageFromActiveStream } from "../composables/chatMessageFork";
 import { selectionTextAtPoint } from "../composables/chatSelectionContext";
@@ -132,6 +135,7 @@ interface ScopedQueuedFollowUp {
   canInsert: boolean;
   canEdit?: boolean;
   isInserting: boolean;
+  isUndelivered?: boolean;
 }
 
 const chatChangesStore = useChatChangesStore();
@@ -169,8 +173,10 @@ const isViewingSubagent = computed(() => {
 const activeQueuedFollowUp = computed(() => (
   props.scopedSession ? props.queuedFollowUp ?? null : chatStore.activeQueuedFollowUp
 ));
+// Undelivered inputs outlive their run and need the user's decision.
 const showQueuedFollowUp = computed(() =>
-  !!activeQueuedFollowUp.value && props.isStreaming,
+  !!activeQueuedFollowUp.value
+  && (props.isStreaming || activeQueuedFollowUp.value.isUndelivered === true),
 );
 const showCompactQueued = computed(() =>
   (props.scopedSession ? !!props.compactQueued : chatStore.isCompactQueued)
@@ -274,6 +280,7 @@ const props = defineProps<{
   canResumeInterrupted?: boolean;
   isCompacting: boolean;
   isThinking: boolean;
+  claudeCodePhase?: ClaudeCodePhase | null;
   hasThinking: boolean;
   thinkingOrder?: number;
   thinkingDuration: number;
@@ -339,6 +346,8 @@ const props = defineProps<{
   currentRunId?: string | null;
   composerValue?: string;
   composerDraftStateKey?: string;
+  /** Live document selection offered to the composer (new-session tabs only). */
+  liveSelectionQuote?: LiveSelectionQuote | null;
   referenceDropAvailable?: boolean;
   referenceDropActive?: boolean;
   managedNativeDrops?: boolean;
@@ -361,6 +370,18 @@ const props = defineProps<{
   loadSessionTurnPreview?: (messageId: string) => Promise<SessionTurnPreview | null>;
   loadSessionHistoryThroughMessage?: (messageId: string) => Promise<boolean>;
 }>();
+
+// A worktree created in the background is adopted by this composer; sending
+// before then would start the chat in the source workspace.
+const worktreeOwnerKey = computed(() => props.composerDraftStateKey
+  ?? (props.workspaceRef ? `checkout:${props.workspaceRef.checkoutId}` : undefined));
+const worktreeCreationPending = computed(() => isWorktreeCreationRunning(worktreeOwnerKey.value));
+// The branch this chat runs on; known from Git requests other surfaces already made.
+const worktreeBranch = computed(() => {
+  if (!displaySettings.worktreeEnabled || !props.workspaceRef) return "";
+  const head = workspaceGitHead(props.workspaceRef);
+  return head?.refName?.replace(/^refs\/heads\//, "") || head?.hash?.slice(0, 8) || "";
+});
 
 const turnNavigationUserMessageIds = computed(() => (
   props.scopedSession ? props.sessionUserMessageIds ?? [] : chatStore.sessionUserMessageIds
@@ -414,7 +435,7 @@ const emit = defineEmits<{
   exportSessionContext: [request: SessionContextExportRequest];
   reviewSessionContext: [request: SessionContextExportRequest];
   removeManagedComposerFile: [fileId: string];
-  answerQuestion: [answer: string];
+  answerQuestion: [answer: QuestionAnswerPayload, questionId?: string];
   answerToolConfirm: [questionId: string, answer: string];
   answerAllToolConfirms: [questionIds: string[], answer: string];
   insertQueuedFollowUp: [];
@@ -1467,8 +1488,8 @@ function doMessageReview() {
   emit("reviewSessionContext", { sessionId, messageId });
 }
 
-function handleQuestionAnswer(answer: string) {
-  emit("answerQuestion", answer);
+function handleQuestionAnswer(answer: QuestionAnswerPayload, questionId: string) {
+  emit("answerQuestion", answer, questionId);
 }
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
@@ -3165,8 +3186,17 @@ async function handleExitPlanMode() {
   await handleRequestPlanMode(false);
 }
 
+async function composerBeforeSend(): Promise<boolean> {
+  // Returning false keeps the draft, unlike dropping the payload after send.
+  if (worktreeCreationPending.value) {
+    notificationStore.addNotice("warning", t("worktrees.selector.sendBlocked"));
+    return false;
+  }
+  return claudeTransfer.beforeSend();
+}
+
 function handleComposerSend(payload: ChatComposerSendPayload) {
-  if (worktreeBusy.value || props.workspaceChanging) return;
+  if (worktreeBusy.value || props.workspaceChanging || worktreeCreationPending.value) return;
   emit("send", payload.text, payload.images, payload.assetRefs, {
     displayText: payload.displayText,
     mode: payload.mode ?? undefined,
@@ -3559,6 +3589,8 @@ onUnmounted(() => {
           :is-streaming="isStreaming"
           :is-compacting="isCompacting"
           :is-thinking="isThinking"
+          :claude-code-mode="selectedModelId.startsWith('claude_code/')"
+          :claude-code-phase="claudeCodePhase"
           :show-thinking-blocks="!selectedModelId.startsWith('claude_code/')"
           :has-thinking="hasThinking"
           :thinking-order="thinkingOrder"
@@ -3626,7 +3658,11 @@ onUnmounted(() => {
     >
       <div v-if="showQueuedFollowUp" class="queued-follow-up-bar">
         <span class="queued-follow-up-label">
-          {{ activeQueuedFollowUp?.isInserting ? t('chat.input.queuedFollowUpInserting') : t('chat.input.queuedFollowUp') }}
+          {{ activeQueuedFollowUp?.isUndelivered
+            ? t('chat.input.queuedFollowUpUndelivered')
+            : activeQueuedFollowUp?.isInserting
+              ? t('chat.input.queuedFollowUpInserting')
+              : t('chat.input.queuedFollowUp') }}
         </span>
         <QueuedFollowUpImages :images="activeQueuedFollowUp?.images" />
         <span class="queued-follow-up-text ui-select-text">{{ activeQueuedFollowUp?.displayText }}</span>
@@ -3804,7 +3840,7 @@ onUnmounted(() => {
           ref="composerPanelRef"
           v-model="inputText"
           :disabled="worktreeBusy || workspaceChanging || claudeTransferBusy"
-          :before-send="claudeTransfer.beforeSend"
+          :before-send="composerBeforeSend"
           :selected-agent-id="selectedAgentId"
           :skills="skills"
           :managed-local-files="managedLocalFiles"
@@ -3819,6 +3855,7 @@ onUnmounted(() => {
           :compact="inputControlsCollapsed"
           :asset-ref-sync-key="composerAssetRefSyncKey"
           :draft-state-key="composerDraftStateKey"
+          :live-selection-quote="liveSelectionQuote"
           :workspace-ref="workspaceRef"
           :workspace-root="workingDir"
           :plan-mode-active="planModeActive"
@@ -3873,6 +3910,8 @@ onUnmounted(() => {
               :worktree-enabled="displaySettings.worktreeEnabled"
               :worktree-locked="!!activeSessionId || messages.length > 0 || isStreaming"
               :select-worktree="selectWorktree"
+              :worktree-owner-key="worktreeOwnerKey"
+              :worktree-branch="worktreeBranch"
               :disabled="isStreaming || workspaceChanging"
               @worktree-busy="worktreeBusy = $event"
               @select-agent="emit('selectAgent', $event)"
@@ -4829,6 +4868,8 @@ onUnmounted(() => {
 }
 
 /* ── Ask User Card ── */
+/* Shared shell for AskUserCard and ToolConfirmCard; each card lays out its
+   own content in scoped styles. */
 
 :deep(.ask-user-card) {
   margin: 0 48px 12px;
@@ -4844,91 +4885,6 @@ onUnmounted(() => {
 
 :deep(.tool-confirm-batch-card) {
   margin: 0 48px 12px;
-}
-
-:deep(.ask-question) {
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1.5;
-  margin-bottom: 12px;
-  color: var(--text-color);
-  white-space: pre-wrap;
-}
-
-:deep(.ask-options) {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-:deep(.ask-option-btn) {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  text-align: left;
-  min-height: 0;
-  padding: 10px 14px;
-}
-
-:deep(.ask-option-label) {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-color);
-}
-
-:deep(.ask-option-desc) {
-  font-size: 12px;
-  color: var(--text-secondary);
-  line-height: 1.4;
-}
-
-:deep(.ask-custom) {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-:deep(.ask-custom-label) {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-
-:deep(.ask-custom-input-row) {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-
-:deep(.ask-custom-input) {
-  flex: 1;
-  padding: 8px 12px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-size: 13px;
-  font-family: inherit;
-  outline: none;
-  transition: border-color 0.15s;
-}
-
-:deep(.ask-custom-input:focus) {
-  border-color: var(--accent-color);
-}
-
-:deep(.ask-custom-input::placeholder) {
-  color: var(--text-secondary);
-}
-
-:deep(.ask-custom-send) {
-  width: 32px;
-  height: 32px;
-  font-size: 16px;
-  font-weight: 600;
-  flex-shrink: 0;
-  padding: 0;
 }
 
 :deep(.tool-confirm-card) {

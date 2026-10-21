@@ -5,7 +5,7 @@ import json
 import unittest
 import urllib.request
 from typing import Literal
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import locus
 from locus._models import Run
@@ -699,6 +699,16 @@ class SdkCoverageTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(locus.LocusRunError):
             failed_run.raise_for_error()
+
+    async def test_run_answer_preserves_structured_questionnaires_and_approval_strings(self) -> None:
+        client = _SdkSurfaceClient()
+        client.rpc = AsyncMock(return_value={"answered": True})
+        run = Run(run_id="run-1", session_id="session-1", client=client)
+        answer = {"version": 1, "answers": [{"id": "q1", "selected": ["A", "B"], "customText": "C"}]}
+        await run.answer("question-group", answer)
+        client.rpc.assert_awaited_with("runs.answer", {"questionId": "question-group", "answer": answer})
+        await run.answer("approval", "approved")
+        client.rpc.assert_awaited_with("runs.answer", {"questionId": "approval", "answer": "approved"})
 
     async def test_event_stream_drains_terminal_events(self) -> None:
         run = Run(run_id="run-1", session_id="session-1", client=_RunEventClient())

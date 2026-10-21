@@ -1,7 +1,11 @@
 import { ipcInvoke } from "./ipc";
+import { normalizeAppError } from "./errors";
+import { questionDraft, clearQuestionDraft } from "../composables/questionnaire";
 import type { WorkspaceRef } from "./project";
 import type {
   SessionSummary,
+  PendingQuestion,
+  QuestionAnswerPayload,
   SessionDetail,
   SessionMessagePage,
   SessionTurnPreview,
@@ -347,8 +351,25 @@ export function getTodos(sessionId: string): Promise<TodoSnapshot> {
   return ipcInvoke<TodoSnapshot>("get_todos", { sessionId });
 }
 
-export function answerQuestion(questionId: string, answer: string): Promise<void> {
+export function answerQuestion(questionId: string, answer: QuestionAnswerPayload): Promise<void> {
   return ipcInvoke("answer_question", { questionId, answer });
+}
+
+export async function submitQuestionForm(question: PendingQuestion, answer: QuestionAnswerPayload): Promise<boolean> {
+  const draft = questionDraft(question);
+  if (draft.submitting) return false;
+  draft.submitting = true;
+  draft.error = "";
+  try {
+    await answerQuestion(question.questionId, answer);
+    clearQuestionDraft(question.questionId);
+    return true;
+  } catch (error) {
+    draft.error = normalizeAppError(error).message;
+    return false;
+  } finally {
+    draft.submitting = false;
+  }
 }
 
 export function exportSessionContext(

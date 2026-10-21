@@ -960,7 +960,8 @@ class Run:
         payload = await self.client.rpc("runs.cancel", {"runId": self.run_id})
         return RunStatus.from_payload(payload)
 
-    async def answer(self, question_id: str, answer: str) -> None:
+    async def answer(self, question_id: str, answer: str | dict[str, Any]) -> None:
+        """Submit a complete questionnaire envelope, or a legacy/approval string."""
         await self.client.rpc(
             "runs.answer",
             {"questionId": question_id, "answer": answer},

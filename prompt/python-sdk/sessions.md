@@ -145,4 +145,22 @@ await run.cancel()
 await run.answer("question-id", "approved")
 ```
 
+For a questionnaire, submit all answers together using the group `questionId`
+and each item's stable `id` from the `askUser` event's `questions` array:
+
+```python
+await run.answer("question-group-id", {
+    "version": 1,
+    "answers": [
+        {"id": "q1", "selected": ["Option A", "Option B"], "customText": "Additional detail"},
+        {"id": "q2", "selected": [], "customText": "A text-only answer"},
+    ],
+})
+```
+
+Multiple selections are allowed only when that question has `multiSelect=true`.
+For single-select questions, send one selected label or custom text, not both.
+Invalid or incomplete answers leave the form pending so it can be corrected.
+String answers remain supported for legacy single questions and tool/plan approvals.
+
 Pass `workspace_ref=workspace_ref` when starting or continuing a run to pin it to the injected checkout generation.

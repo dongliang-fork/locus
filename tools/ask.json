@@ -1,32 +1,38 @@
 {
-  "description": "Ask for missing information that materially changes the target, scope, or result. Resolve answers available from context or focused investigation first; ordinary implementation choices can follow project conventions.\n\nProvide a specific question and at most 3 concise options. The last option must allow custom input; the preceding options cover the most likely choices. Use labels of 1-5 words. Reuse prior answers and authorization.",
+  "description": "Ask for missing information that materially changes the target, scope, or result. Resolve answers available from context or focused investigation first; ordinary implementation choices can follow project conventions. Reuse prior answers and authorization.\n\nAsk 1–4 related questions in one form. Give each a concise header and up to 4 real choices with short labels. Set multiSelect=true only when several choices may apply together. Custom input is provided separately by default: do not add an Other option. The user can review and revise all answers before submitting the form once. Use an empty options array for a text-only question.",
   "parameters": {
     "type": "object",
     "properties": {
-      "question": {
-        "type": "string",
-        "description": "The complete question to ask the user. Be specific about what you need to know and why."
-      },
-      "options": {
+      "questions": {
         "type": "array",
-        "description": "At most 3 options; the final option allows custom text input.",
-        "maxItems": 3,
+        "description": "Related questions to collect in one submission. Stable question IDs are assigned automatically.",
+        "minItems": 1,
+        "maxItems": 4,
         "items": {
           "type": "object",
           "properties": {
-            "label": {
-              "type": "string",
-              "description": "Short display text for this option (1-5 words)"
+            "question": { "type": "string", "description": "The complete question, explaining what information is needed and why." },
+            "header": { "type": "string", "description": "Short label identifying this question in the form navigation." },
+            "options": {
+              "type": "array",
+              "description": "Up to 4 actual choices. Do not include a custom-input placeholder; use an empty array for free text.",
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "label": { "type": "string", "description": "Unique choice label, ideally 1–5 words." },
+                  "description": { "type": "string", "description": "Brief explanation of this choice." }
+                },
+                "required": ["label", "description"]
+              }
             },
-            "description": {
-              "type": "string",
-              "description": "Brief explanation of what this option means or will do"
-            }
+            "multiSelect": { "type": "boolean", "description": "Whether multiple choices and custom input may be combined. Defaults to false." },
+            "allowCustom": { "type": "boolean", "description": "Allow a separate custom answer. Defaults to true; must remain true for text-only questions." }
           },
-          "required": ["label", "description"]
+          "required": ["question", "options"]
         }
       }
     },
-    "required": ["question", "options"]
+    "required": ["questions"]
   }
 }

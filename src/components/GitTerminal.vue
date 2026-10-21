@@ -1,9 +1,10 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
-import { answerQuestion as answerSessionQuestion, cancelChat, chat } from "../services/session";
+import { answerQuestion as answerSessionQuestion, submitQuestionForm, cancelChat, chat } from "../services/session";
 import { gitExecute } from "../services/git";
-import type { StreamEvent, ModelOption, PendingQuestion, PendingToolConfirm } from "../types";
+import type { StreamEvent, ModelOption, PendingQuestion, PendingToolConfirm, QuestionAnswerPayload } from "../types";
+import AskUserCard from "./chat/AskUserCard.vue";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import StreamingMarkdownRenderer from "./chat/StreamingMarkdownRenderer.vue";
 import { t } from "../i18n";
@@ -111,7 +112,6 @@ const thinking = ref(false);
 const nativeRunning = ref(false);
 const pendingQuestion = ref<PendingQuestion | null>(null);
 const pendingToolConfirm = ref<PendingToolConfirm | null>(null);
-const askCustomAnswer = ref("");
 const toolConfirmFeedback = ref("");
 const scrollEl = ref<HTMLElement | null>(null);
 const inputEl = ref<HTMLInputElement | null>(null);
@@ -122,13 +122,6 @@ let activeToolExec: ToolExec | null = null;
 const hasRunningTool = computed(() =>
   lines.value.some(l => l.type === "tool" && l.toolExec?.status === "running")
 );
-
-const pendingQuestionOptions = computed(() => pendingQuestion.value?.options ?? []);
-const pendingQuestionQuickOptions = computed(() => pendingQuestionOptions.value.slice(0, -1));
-const pendingQuestionCustomOption = computed(() => {
-  const options = pendingQuestionOptions.value;
-  return options.length > 0 ? options[options.length - 1] : null;
-});
 
 interface TerminalMetaRow {
   label: string;
@@ -320,7 +313,6 @@ async function runNative(text: string) {
   thinking.value = false;
   pendingQuestion.value = null;
   pendingToolConfirm.value = null;
-  askCustomAnswer.value = "";
   toolConfirmFeedback.value = "";
   nativeRunning.value = true;
   activeToolExec = null;
@@ -381,7 +373,6 @@ async function submit() {
   nativeRunning.value = false;
   pendingQuestion.value = null;
   pendingToolConfirm.value = null;
-  askCustomAnswer.value = "";
   toolConfirmFeedback.value = "";
   pendingSessionId = null;
   activeToolExec = null;
@@ -408,7 +399,6 @@ async function submit() {
     nativeRunning.value = false;
     pendingQuestion.value = null;
     pendingToolConfirm.value = null;
-    askCustomAnswer.value = "";
     toolConfirmFeedback.value = "";
     lines.value.push({
       id: "err_" + Date.now(),
@@ -428,27 +418,12 @@ async function cancel() {
   }
 }
 
-async function answerPendingQuestion(answer: string) {
+async function answerPendingQuestion(answer: QuestionAnswerPayload, questionId: string) {
   const question = pendingQuestion.value;
-  if (!question) return;
-  pendingQuestion.value = null;
-  askCustomAnswer.value = "";
-  try {
-    await answerSessionQuestion(question.questionId, answer);
-  } catch (e) {
-    lines.value.push({
-      id: "err_" + Date.now(),
-      type: "error",
-      content: normalizeAppError(e).message,
-    });
-    scrollToBottom();
+  if (!question || question.questionId !== questionId) return;
+  if (await submitQuestionForm(question, answer)) {
+    if (pendingQuestion.value?.questionId === question.questionId) pendingQuestion.value = null;
   }
-}
-
-function answerPendingQuestionCustom() {
-  const answer = askCustomAnswer.value.trim();
-  if (!answer) return;
-  answerPendingQuestion(answer);
 }
 
 async function answerPendingToolConfirm(answer: string) {
@@ -579,12 +554,12 @@ function handleStreamEvent(event: StreamEvent) {
       flushStreamingText();
       pendingToolConfirm.value = null;
       toolConfirmFeedback.value = "";
-      askCustomAnswer.value = "";
       pendingQuestion.value = {
         questionId: event.questionId,
         toolCallId: event.toolCallId,
         question: event.question,
         options: event.options,
+        questions: event.questions,
       };
       scrollToBottom(true);
       break;
@@ -593,7 +568,6 @@ function handleStreamEvent(event: StreamEvent) {
       thinking.value = false;
       flushStreamingText();
       pendingQuestion.value = null;
-      askCustomAnswer.value = "";
       toolConfirmFeedback.value = "";
       pendingToolConfirm.value = {
         questionId: event.questionId,
@@ -606,7 +580,6 @@ function handleStreamEvent(event: StreamEvent) {
     case "inputAnswered":
       if (pendingQuestion.value?.questionId === event.questionId) {
         pendingQuestion.value = null;
-        askCustomAnswer.value = "";
       }
       if (pendingToolConfirm.value?.questionId === event.questionId) {
         pendingToolConfirm.value = null;
@@ -643,7 +616,6 @@ function handleStreamEvent(event: StreamEvent) {
       nativeRunning.value = false;
       pendingQuestion.value = null;
       pendingToolConfirm.value = null;
-      askCustomAnswer.value = "";
       toolConfirmFeedback.value = "";
       activeToolExec = null;
       currentRunId.value = null;
@@ -658,7 +630,6 @@ function handleStreamEvent(event: StreamEvent) {
       nativeRunning.value = false;
       pendingQuestion.value = null;
       pendingToolConfirm.value = null;
-      askCustomAnswer.value = "";
       toolConfirmFeedback.value = "";
       activeToolExec = null;
       currentRunId.value = null;
@@ -673,7 +644,6 @@ function handleStreamEvent(event: StreamEvent) {
       nativeRunning.value = false;
       pendingQuestion.value = null;
       pendingToolConfirm.value = null;
-      askCustomAnswer.value = "";
       toolConfirmFeedback.value = "";
       activeToolExec = null;
       currentRunId.value = null;
@@ -862,7 +832,6 @@ watch(
     nativeRunning.value = false;
     pendingQuestion.value = null;
     pendingToolConfirm.value = null;
-    askCustomAnswer.value = "";
     toolConfirmFeedback.value = "";
     pendingSessionId = null;
     activeToolExec = null;
@@ -932,40 +901,7 @@ defineExpose({ pushOutput });
         @click.stop
         @keydown.stop
       >
-        <div class="term-inline-heading">
-          <span class="term-inline-prefix">?</span>
-          <span class="term-inline-title ui-select-text">{{ pendingQuestion.question }}</span>
-        </div>
-        <div v-if="pendingQuestionQuickOptions.length" class="term-inline-options">
-          <button
-            v-for="(option, index) in pendingQuestionQuickOptions"
-            :key="`${option.label}-${index}`"
-            type="button"
-            class="term-inline-option"
-            @click="answerPendingQuestion(option.label)"
-          >
-            <span class="term-inline-option-label">{{ option.label }}</span>
-            <span v-if="option.description" class="term-inline-option-desc">{{ option.description }}</span>
-          </button>
-        </div>
-        <div v-if="pendingQuestionCustomOption" class="term-inline-input-row">
-          <span class="term-inline-input-label">{{ pendingQuestionCustomOption.label }}</span>
-          <input
-            v-model="askCustomAnswer"
-            class="term-inline-input"
-            type="text"
-            :placeholder="pendingQuestionCustomOption.description"
-            @keydown.enter="answerPendingQuestionCustom"
-          />
-          <button
-            type="button"
-            class="term-inline-button is-primary"
-            :disabled="!askCustomAnswer.trim()"
-            @click="answerPendingQuestionCustom"
-          >
-            {{ t("common.send") }}
-          </button>
-        </div>
+        <AskUserCard :question="pendingQuestion" @answer="answerPendingQuestion" />
       </div>
 
       <div
