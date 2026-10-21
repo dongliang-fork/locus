@@ -1124,6 +1124,31 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(maybeNotifyStreamEventMock).not.toHaveBeenCalled();
   });
 
+  it.each([99999, undefined])("uses backend cache-miss amounts without recomputing from Input (%s)", async (amount) => {
+    const eventModule = await import("@tauri-apps/api/event");
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+    vi.mocked(eventModule.listen).mockImplementation(async (name, handler) => {
+      handlers.set(name as string, handler as (event: { payload: any }) => void);
+      return vi.fn<() => void>();
+    });
+    chatStoreMock.sessions = [{ id: "session-1", title: "Greeting" }];
+    displaySettingsMock.cacheInvalidationWarningsEnabled = true;
+    const useAppBootstrap = await loadUseAppBootstrap();
+    await useAppBootstrap().registerListeners();
+    handlers.get("stream-event")?.({ payload: {
+      type: "usageUpdate", runId: "run-cache", sessionId: "session-1",
+      inputTokens: 5, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 101000,
+      cacheInvalidated: true, cacheBaselineTokens: 100000, cacheExcessInputTokens: amount,
+      cacheInvalidationReason: "uncached_prefix_exceeds_threshold",
+      totalInputTokens: 5, totalOutputTokens: 10, totalCacheReadTokens: 0, totalCacheWriteTokens: 101000,
+      timedOutputTokens: 10, modelActiveDurationMs: 100, totalCostUsd: 0, pricedRounds: 0,
+      contextTokens: 101005, contextLimit: 200000,
+    } });
+    expect(notificationStoreMock.addNotice).toHaveBeenCalledWith("warning",
+      `notifications.cacheInvalidationWarning: Greeting chat.contextStats.cacheReason.uncachedPrefixExceeded 100000 ${amount ?? "chat.contextStats.unavailable"}`,
+      { code: "prompt_cache_miss", operation: "prompt-cache-miss:run-cache", replaceOperation: true });
+  });
+
   it("warns once for a server-reported cache invalidation", async () => {
     const eventModule = await import("@tauri-apps/api/event");
     const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
@@ -1155,6 +1180,7 @@ describe("useAppBootstrap onboarding completion", () => {
         cacheWriteTokens: 0,
         cacheInvalidated: true,
         cacheBaselineTokens: 142,
+        cacheExcessInputTokens: 142,
         cacheInvalidationReason: "model_changed",
         totalInputTokens: 900,
         totalOutputTokens: 10,

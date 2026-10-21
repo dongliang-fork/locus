@@ -17,6 +17,7 @@ pub(crate) struct ModelUsageRecord {
     pub priced_rounds: u64,
     pub context_tokens: Option<u32>,
     pub context_limit: Option<u32>,
+    pub cache_request: Option<PromptCacheRequest>,
 }
 
 pub(super) struct UsageWriteError {
@@ -48,6 +49,7 @@ impl ModelUsageRecord {
     fn apply(
         &self,
         writer: &Arc<SessionWriter>,
+        best_effort: bool,
     ) -> Result<(TokenUsage, Option<PromptCacheCheckOutcome>), UsageWriteError> {
         SessionStore::record_model_usage_on_conn(
             writer,
@@ -64,21 +66,31 @@ impl ModelUsageRecord {
             self.priced_rounds,
             self.context_tokens,
             self.context_limit,
-            true,
+            self.cache_request.as_ref(),
+            best_effort,
         )
     }
 }
 
 impl SessionStore {
+    pub(crate) fn record_model_usage_request(&self, record: ModelUsageRecord)
+        -> Result<(TokenUsage, Option<PromptCacheCheckOutcome>), String>
+    {
+        record.apply(&self.conn, false).map_err(|error| error.message)
+    }
+
     /// The caller retains the raw receipt independently of these aggregates.
     /// Retry only a known-uncommitted BUSY/LOCKED result, within this callback:
     /// never replay an old delta after native history reconciliation.
     pub(crate) fn record_model_usage_best_effort(
         &self,
-        record: ModelUsageRecord,
+        mut record: ModelUsageRecord,
     ) -> Option<(TokenUsage, Option<PromptCacheCheckOutcome>)> {
+        if record.cache_request.is_none() {
+            record.cache_request = Some(PromptCacheRequest::new(Uuid::new_v4().to_string(), None));
+        }
         for attempt in 0..3 {
-            match record.apply(&self.conn) {
+            match record.apply(&self.conn, true) {
                 Ok(usage) => return Some(usage),
                 Err(error) if error.retryable && attempt < 2 => {
                     // apply has released the writer and rolled back the failed

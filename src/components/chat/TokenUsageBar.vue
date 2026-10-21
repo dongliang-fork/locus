@@ -58,8 +58,13 @@ const contextTooltip = computed(() => {
       contextPercent.value.toFixed(1),
     ),
   ];
+  // Only provider-reported cost is shown; Locus never estimates one.
   if (hasPrice.value) {
     parts.push(t("chat.tokenUsage.cost", formatUsd(u.totalCostUsd)));
+  } else if (
+    u.totalInputTokens + u.totalOutputTokens + u.totalCacheReadTokens + u.totalCacheWriteTokens > 0
+  ) {
+    parts.push(t("chat.tokenUsage.costNotReported"));
   }
   return parts.join(" · ");
 });

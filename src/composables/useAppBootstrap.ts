@@ -105,21 +105,13 @@ function cacheInvalidationReasonLabel(reason?: string): string {
       return t("chat.contextStats.cacheReason.modelChanged");
     case "provider_changed":
       return t("chat.contextStats.cacheReason.providerChanged");
+    case "uncached_prefix_exceeds_threshold":
+      return t("chat.contextStats.cacheReason.uncachedPrefixExceeded");
     case "input_growth_exceeds_context_threshold":
       return t("chat.contextStats.cacheReason.inputGrowthExceeded");
     default:
       return t("chat.contextStats.cacheReason.unknown");
   }
-}
-
-function cacheExcessInputTokens(
-  event: Extract<StreamEvent, { type: "usageUpdate" }>,
-): number {
-  const baselineTokens = event.cacheBaselineTokens ?? 0;
-  const effectiveContextTokens =
-    event.inputTokens + event.cacheReadTokens + event.cacheWriteTokens;
-  const contextGrowthTokens = Math.max(0, effectiveContextTokens - baselineTokens);
-  return Math.max(0, event.inputTokens - contextGrowthTokens);
 }
 
 function formatWorkspaceSwitchDetail(detail?: Record<string, unknown>): string {
@@ -653,7 +645,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
           sessionDiagnosticLabel(payload.sessionId),
           cacheInvalidationReasonLabel(payload.cacheInvalidationReason),
           payload.cacheBaselineTokens ?? 0,
-          cacheExcessInputTokens(payload),
+          payload.cacheExcessInputTokens ?? t("chat.contextStats.unavailable"),
         ),
         {
           code: "prompt_cache_miss",

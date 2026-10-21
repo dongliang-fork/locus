@@ -15,6 +15,7 @@ fn usage(id: &str) -> ModelUsageRecord {
         priced_rounds: 0,
         context_tokens: Some(130),
         context_limit: Some(200000),
+        cache_request: None,
     }
 }
 

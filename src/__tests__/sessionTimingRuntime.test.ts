@@ -71,6 +71,36 @@ afterEach(() => {
 });
 
 describe("session timing statistics", () => {
+  it("shows coverage separately from an empty cache-miss list", async () => {
+    report.cacheDetection = { checkedRequests: 3, unavailableRequests: 2, baselineRequests: 1, legacyChecks: 4 };
+    await mount();
+    const section = root.querySelector(".context-cache-section")!;
+    expect(section.textContent).toContain("已比较 3 次 · 数据不足 2 次 · 建立基线／上下文重置 1 次 · 旧版记录 4 次");
+    expect(section.textContent).toContain("不代表所有请求都命中缓存");
+  });
+
+  it("renders several missed requests for the same user and preserves unknown legacy writes", async () => {
+    const base = { messageId: "same-user", message: "long task", modelId: "claude_code/test", baselineTokens: 100000,
+      inputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 101000, excessInputTokens: 100000,
+      reason: "uncached_prefix_exceeds_threshold", occurredAt: 1700000000, algorithmVersion: 2 };
+    report.cacheInvalidations = [
+      { ...base, eventId: "request-2", requestSequence: 2 },
+      { ...base, eventId: "request-3", requestSequence: 3 },
+      { ...base, eventId: "legacy:1", requestSequence: 1, algorithmVersion: 1, cacheWriteTokens: null,
+        reason: "input_growth_exceeds_context_threshold" },
+    ];
+    await mount();
+    const rows = root.querySelectorAll(".context-cache-table tbody tr");
+    expect(rows).toHaveLength(3);
+    expect(rows[0].textContent).toContain("请求 #2");
+    expect(rows[1].textContent).toContain("请求 #3");
+    expect(rows[0].textContent).toContain("异常未复用量超过上轮上下文的 80%");
+    expect(rows[0].querySelector(".context-cache-counts")?.textContent).toMatch(/5\s*\/\s*0\s*\/\s*101,000/);
+    expect(rows[2].textContent).toContain("旧版检测");
+    expect(rows[2].querySelector(".context-cache-counts")?.textContent).toContain("—");
+    expect(root.querySelector(".context-cache-coverage")?.textContent).toContain("检测覆盖情况不可用");
+  });
+
   it("shows all three durations immediately below token usage with their definitions", async () => {
     await mount();
     const timing = root.querySelector(".context-timing-section")!;

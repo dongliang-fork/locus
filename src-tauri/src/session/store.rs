@@ -45,6 +45,8 @@ mod archive_storage;
 mod captures;
 mod connections;
 mod usage_retry;
+mod prompt_cache;
+pub(crate) use prompt_cache::{PromptCacheRequest, PromptCacheCheckOutcome, claude_prompt_usage_complete};
 #[cfg(test)]
 mod isolation_tests;
 use connections::{SessionWriter, SessionReaders};
@@ -71,23 +73,6 @@ pub(crate) struct SessionPromptPrefixCache {
     pub env_prompt: String,
     pub synthesized_at: i64,
     pub last_remote_response_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PromptCacheCheckOutcome {
-    pub baseline_tokens: u64,
-    pub input_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub excess_input_tokens: u64,
-    pub invalidated: bool,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServerPromptUsageBaseline {
-    model_id: String,
-    provider: String,
-    effective_context_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -926,7 +911,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 51;
+    const SCHEMA_VERSION: i32 = 53;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1011,28 +996,11 @@ impl SessionStore {
     pub fn create_export_snapshot(&self) -> Result<Self, String> {
         self.event_writer.flush()?;
 
-        let source =
-            Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| {
-                    format!("Failed to open session database for export snapshot: {}", e)
-                })?;
-        source
-            .busy_timeout(Duration::from_secs(10))
-            .map_err(|e| format!("Failed to configure export snapshot timeout: {}", e))?;
-        let mut destination = Connection::open_in_memory()
-            .map_err(|e| format!("Failed to create in-memory export snapshot: {}", e))?;
-        {
-            let backup = rusqlite::backup::Backup::new(&source, &mut destination)
-                .map_err(|e| format!("Failed to initialize session export snapshot: {}", e))?;
-            backup
-                .run_to_completion(128, Duration::from_millis(2), None)
-                .map_err(|e| format!("Failed to copy session database for export: {}", e))?;
-        }
-        destination
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(|e| format!("Failed to configure session export snapshot: {}", e))?;
-
-        let conn = Arc::new(SessionWriter::new(destination, PathBuf::new()));
+        // Do not copy the database: an online backup of the whole file scales
+        // with every stored session (tens of GB) and restarts whenever a live
+        // run writes, so export/fork never finished. A pinned WAL read
+        // transaction is the same point-in-time view at no copy cost.
+        let conn = Arc::new(SessionWriter::pinned_read_snapshot(&self.db_path)?);
         let event_writer = Arc::new(SessionEventWriter::new(conn.clone()));
         Ok(Self {
             conn,
@@ -1503,8 +1471,34 @@ impl SessionStore {
         if current < 51 {
             Self::migrate(conn,51,"persist authoritative Claude resume identities",Self::migrate_claude_native_identity)?;
         }
-        debug_assert_eq!(Self::SCHEMA_VERSION, 51, "add a new migration block above");
+        if current < 52 {
+            Self::migrate(conn, 52, "detect prompt-cache misses per request including cache writes", Self::migrate_request_cache_checks)?;
+        }
+        if current < 53 {
+            Self::migrate(conn, 53, "drop context attempt captures recorded outside debug mode", Self::migrate_drop_context_attempt_captures)?;
+        }
+        debug_assert_eq!(Self::SCHEMA_VERSION, 53, "add a new migration block above");
         Ok(())
+    }
+
+    /// Provider captures are now recorded only in debug mode. Older clients
+    /// captured every attempt (tens of GB of mostly repeated history), so park
+    /// them for the background purge and mark every existing session as lacking
+    /// captures so exports report it instead of claiming full coverage.
+    /// Deleting inline took about a minute for 17 GB before any window existed;
+    /// renaming is O(1) and the purge reports progress to the frontend.
+    fn migrate_drop_context_attempt_captures(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(&format!(
+            "DROP INDEX IF EXISTS idx_session_context_attempts_session;
+             DROP INDEX IF EXISTS idx_session_context_attempts_run;
+             ALTER TABLE session_context_attempts RENAME TO {legacy};",
+            legacy = maintenance::LEGACY_CONTEXT_ATTEMPTS_TABLE
+        ))?;
+        Self::create_context_attempt_schema(conn)?;
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO session_context_capture_gaps (session_id)
+             SELECT id FROM sessions;",
+        )
     }
 
     /// Older clients did not persist canonical response items. Mark their
@@ -2030,25 +2024,7 @@ impl SessionStore {
     }
 
     fn create_prompt_cache_check_schema(conn: &Connection) -> rusqlite::Result<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS session_prompt_cache_checks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                message_id TEXT NOT NULL,
-                message TEXT NOT NULL,
-                model_id TEXT NOT NULL,
-                baseline_tokens INTEGER NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                cache_read_tokens INTEGER NOT NULL,
-                excess_input_tokens INTEGER NOT NULL,
-                invalidated INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                UNIQUE(session_id, message_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_session_prompt_cache_checks_session
-                ON session_prompt_cache_checks(session_id, created_at DESC, id DESC);",
-        )
+        Self::create_request_cache_check_schema(conn)
     }
 
     fn create_context_attempt_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -4006,21 +3982,9 @@ impl SessionStore {
                 )
                 .map_err(|e| format!("Failed to copy token usage into fork: {}", e))?;
 
-                conn.execute(
-                    "INSERT INTO session_prompt_cache_checks (
-                        session_id, message_id, message, model_id, baseline_tokens,
-                        input_tokens, cache_read_tokens, excess_input_tokens,
-                        invalidated, reason, created_at
-                     )
-                     SELECT ?1, message_id, message, model_id, baseline_tokens,
-                        input_tokens, cache_read_tokens, excess_input_tokens,
-                        invalidated, reason, created_at
-                     FROM session_prompt_cache_checks
-                     WHERE session_id = ?2
-                     ORDER BY id ASC",
-                    params![new_id, source_id],
-                )
-                .map_err(|e| format!("Failed to copy prompt cache checks into fork: {}", e))?;
+                for check in Self::prompt_cache_checks_with_conn(&conn, source_id)? {
+                    Self::insert_prompt_cache_check(&conn, &new_id, &check)?;
+                }
 
                 conn.execute(
                     "INSERT INTO todos (session_id, position, content, status, priority)
@@ -4099,7 +4063,6 @@ impl SessionStore {
         );
         let multi_agent_enabled = snapshot.get_session_multi_agent_enabled(source_id)?;
         type SnapshotUsageRow = (i64, i64, i64, i64, i64, i64, f64, i64, i64, i64);
-        type SnapshotCacheCheckRow = (String, String, String, i64, i64, i64, i64, i64, String, i64);
         type SnapshotTodoRow = (i64, String, String, String);
 
         let (session, messages, usage, cache_checks, todos) = {
@@ -4186,35 +4149,7 @@ impl SessionStore {
                 .optional()
                 .map_err(|e| format!("Failed to read fork snapshot usage: {}", e))?;
 
-            let mut cache_check_stmt = conn
-                .prepare(
-                    "SELECT message_id, message, model_id, baseline_tokens,
-                            input_tokens, cache_read_tokens, excess_input_tokens,
-                            invalidated, reason, created_at
-                     FROM session_prompt_cache_checks
-                     WHERE session_id = ?1
-                     ORDER BY id ASC",
-                )
-                .map_err(|e| format!("Failed to prepare fork snapshot cache checks: {}", e))?;
-            let cache_checks = cache_check_stmt
-                .query_map(params![source_id], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query fork snapshot cache checks: {}", e))?
-                .collect::<Result<Vec<SnapshotCacheCheckRow>, _>>()
-                .map_err(|e| format!("Failed to read fork snapshot cache check: {}", e))?;
-            drop(cache_check_stmt);
+            let cache_checks = Self::prompt_cache_checks_with_conn(&conn, source_id)?;
 
             let mut todo_stmt = conn
                 .prepare(
@@ -4359,27 +4294,7 @@ impl SessionStore {
                 .map_err(|e| format!("Failed to copy snapshot token usage into fork: {}", e))?;
             }
             for cache_check in cache_checks {
-                conn.execute(
-                    "INSERT INTO session_prompt_cache_checks (
-                        session_id, message_id, message, model_id, baseline_tokens,
-                        input_tokens, cache_read_tokens, excess_input_tokens,
-                        invalidated, reason, created_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                    params![
-                        new_id,
-                        cache_check.0,
-                        cache_check.1,
-                        cache_check.2,
-                        cache_check.3,
-                        cache_check.4,
-                        cache_check.5,
-                        cache_check.6,
-                        cache_check.7,
-                        cache_check.8,
-                        cache_check.9,
-                    ],
-                )
-                .map_err(|e| format!("Failed to copy snapshot cache check: {}", e))?;
+                Self::insert_prompt_cache_check(&conn, &new_id, &cache_check)?;
             }
             for todo in todos {
                 conn.execute(
@@ -5330,6 +5245,18 @@ impl SessionStore {
         .map_err(|e| format!("Failed to query context capture coverage: {}", e))
     }
 
+    /// Records that a provider attempt of this session was not captured, so
+    /// exports report reconstructed/partial coverage instead of "full".
+    pub fn mark_context_capture_gap(&self, session_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO session_context_capture_gaps (session_id) VALUES (?1)",
+            params![session_id],
+        )
+        .map(|_| ())
+        .map_err(|e| format!("Failed to record context capture gap: {}", e))
+    }
+
     pub fn session_tree_ids(&self, root_session_id: &str) -> Result<Vec<String>, String> {
         let conn = self.read_conn()?;
         let mut stmt = conn
@@ -6173,20 +6100,6 @@ impl SessionStore {
             crate::sqlite_maint::VACUUM_MIN_FREE_BYTES,
             crate::sqlite_maint::VACUUM_MIN_FREE_RATIO,
         )
-    }
-
-    /// Fire-and-forget [`Self::vacuum_if_fragmented`] on a dedicated thread;
-    /// the connection mutex serializes it against normal store traffic. Used
-    /// after startup and after session deletion.
-    pub fn spawn_vacuum_if_fragmented(self: Arc<Self>) {
-        std::thread::spawn(move || match self.vacuum_if_fragmented() {
-            Ok(Some(freed_bytes)) => eprintln!(
-                "[Locus] session db vacuum reclaimed {} MB",
-                freed_bytes / (1024 * 1024)
-            ),
-            Ok(None) => {}
-            Err(error) => eprintln!("[Locus] session db vacuum failed: {}", error),
-        });
     }
 
     /// All session ids across every workspace, including archived sessions.
@@ -7792,160 +7705,6 @@ impl SessionStore {
         Ok(())
     }
 
-    fn latest_completion_server_baseline_with_conn(
-        conn: &Connection,
-        session_id: &str,
-    ) -> Result<Option<ServerPromptUsageBaseline>, String> {
-        conn.query_row(
-            "SELECT model_id, provider,
-                    input_tokens + cache_read_tokens + cache_write_tokens
-             FROM model_usage_events
-             WHERE session_id = ?1 AND request_kind = 'completion'
-             ORDER BY id DESC
-             LIMIT 1",
-            params![session_id],
-            |row| {
-                Ok(ServerPromptUsageBaseline {
-                    model_id: row.get(0)?,
-                    provider: row.get(1)?,
-                    effective_context_tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                })
-            },
-        )
-        .optional()
-        .map_err(|e| format!("Failed to load previous server prompt usage: {}", e))
-    }
-
-    fn record_prompt_cache_check_with_conn(
-        conn: &Connection,
-        session_id: &str,
-        model_id: &str,
-        provider: &str,
-        previous: Option<&ServerPromptUsageBaseline>,
-        input_tokens: u64,
-        cache_read_tokens: u64,
-        cache_write_tokens: u64,
-    ) -> Result<Option<PromptCacheCheckOutcome>, String> {
-        let message = conn
-            .query_row(
-                "SELECT id, content
-                 FROM messages
-                 WHERE session_id = ?1
-                   AND role = 'user'
-                   AND tool_call_id IS NULL
-                   AND include_in_prompt = 1
-                 ORDER BY rowid DESC
-                 LIMIT 1",
-                params![session_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(|e| format!("Failed to find cache-check message: {}", e))?;
-        let Some((message_id, message)) = message else {
-            return Ok(None);
-        };
-
-        let already_checked = conn
-            .query_row(
-                "SELECT 1
-                 FROM session_prompt_cache_checks
-                 WHERE session_id = ?1 AND message_id = ?2",
-                params![session_id, message_id],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|e| format!("Failed to query prompt cache check: {}", e))?
-            .is_some();
-        if already_checked {
-            return Ok(None);
-        }
-
-        let baseline_tokens = previous
-            .map(|value| value.effective_context_tokens)
-            .unwrap_or(0);
-        let effective_context_tokens = input_tokens
-            .saturating_add(cache_read_tokens)
-            .saturating_add(cache_write_tokens);
-        let context_growth_tokens = effective_context_tokens.saturating_sub(baseline_tokens);
-        let excess_input_tokens = input_tokens.saturating_sub(context_growth_tokens);
-        let input_exceeds_context_threshold =
-            u128::from(excess_input_tokens) * 5 > u128::from(baseline_tokens) * 4;
-        let (invalidated, reason) = match previous {
-            None => (false, "no_baseline"),
-            Some(previous) if previous.model_id != model_id => (true, "model_changed"),
-            Some(previous) if previous.provider != provider => (true, "provider_changed"),
-            Some(_) if baseline_tokens == 0 => (false, "no_baseline"),
-            Some(_) if input_exceeds_context_threshold => {
-                (true, "input_growth_exceeds_context_threshold")
-            }
-            Some(_) => (false, "cache_reused"),
-        };
-        conn.execute(
-            "INSERT OR IGNORE INTO session_prompt_cache_checks (
-                session_id, message_id, message, model_id, baseline_tokens,
-                input_tokens, cache_read_tokens, excess_input_tokens,
-                invalidated, reason, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                session_id,
-                message_id,
-                message,
-                model_id,
-                baseline_tokens as i64,
-                input_tokens as i64,
-                cache_read_tokens as i64,
-                excess_input_tokens as i64,
-                invalidated as i64,
-                reason,
-                Self::now_ts(),
-            ],
-        )
-        .map_err(|e| format!("Failed to record prompt cache check: {}", e))?;
-        Ok(Some(PromptCacheCheckOutcome {
-            baseline_tokens,
-            input_tokens,
-            cache_read_tokens,
-            excess_input_tokens,
-            invalidated,
-            reason: reason.to_string(),
-        }))
-    }
-
-    pub fn list_cache_invalidations(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<SessionCacheInvalidation>, String> {
-        let conn = self.read_conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT message_id, message, model_id, baseline_tokens,
-                        input_tokens, cache_read_tokens, excess_input_tokens,
-                        reason, created_at
-                 FROM session_prompt_cache_checks
-                 WHERE session_id = ?1 AND invalidated = 1
-                 ORDER BY created_at DESC, id DESC",
-            )
-            .map_err(|e| format!("Failed to prepare cache invalidation query: {}", e))?;
-        let rows = stmt
-            .query_map(params![session_id], |row| {
-                Ok(SessionCacheInvalidation {
-                    message_id: row.get(0)?,
-                    message: row.get(1)?,
-                    model_id: row.get(2)?,
-                    baseline_tokens: row.get::<_, i64>(3)? as u64,
-                    input_tokens: row.get::<_, i64>(4)? as u64,
-                    cache_read_tokens: row.get::<_, i64>(5)? as u64,
-                    excess_input_tokens: row.get::<_, i64>(6)? as u64,
-                    reason: row.get(7)?,
-                    occurred_at: row.get(8)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query cache invalidations: {}", e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read cache invalidation row: {}", e))?;
-        Ok(rows)
-    }
-
     pub fn record_token_usage(
         &self,
         session_id: &str,
@@ -8049,7 +7808,7 @@ impl SessionStore {
         context_tokens: Option<u32>,
         context_limit: Option<u32>,
     ) -> Result<(TokenUsage, Option<PromptCacheCheckOutcome>), String> {
-        Self::record_model_usage_on_conn(&self.conn, session_id, model_id, provider, request_kind, input_tokens, output_tokens, model_active_duration_ms, cache_read_tokens, cache_write_tokens, cost_usd, priced_rounds, context_tokens, context_limit, false).map_err(|error| error.message)
+        Self::record_model_usage_on_conn(&self.conn, session_id, model_id, provider, request_kind, input_tokens, output_tokens, model_active_duration_ms, cache_read_tokens, cache_write_tokens, cost_usd, priced_rounds, context_tokens, context_limit, None, false).map_err(|error| error.message)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8068,6 +7827,7 @@ impl SessionStore {
         priced_rounds: u64,
         context_tokens: Option<u32>,
         context_limit: Option<u32>,
+        cache_request: Option<&PromptCacheRequest>,
         best_effort: bool,
     ) -> Result<(TokenUsage, Option<PromptCacheCheckOutcome>), UsageWriteError> {
         let model_id = model_id.trim();
@@ -8081,11 +7841,12 @@ impl SessionStore {
         let _timeout = if best_effort { Some(UsageBusyTimeout::new(&conn)?) } else { None };
         let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| UsageWriteError::transaction(e, "begin"))?;
-        let previous_completion = if request_kind == "completion" {
-            Self::latest_completion_server_baseline_with_conn(&tx, session_id)?
-        } else {
-            None
-        };
+        let default_request = PromptCacheRequest::new(Uuid::new_v4().to_string(), None);
+        let cache_request = cache_request.unwrap_or(&default_request);
+        if request_kind == "completion" && Self::prompt_cache_request_exists(&tx, session_id, &cache_request.key)? {
+            let usage = Self::get_token_usage_with_conn(&tx, session_id)?;
+            return Ok((usage, None));
+        }
         let (timed_output_tokens, model_active_duration_ms) =
             if output_tokens > 0 && model_active_duration_ms > 0 {
                 (output_tokens, model_active_duration_ms)
@@ -8134,15 +7895,9 @@ impl SessionStore {
         )
         .map_err(|e| format!("Failed to record model usage event: {}", e))?;
         let cache_check = if request_kind == "completion" {
-            Self::record_prompt_cache_check_with_conn(
-                &tx,
-                session_id,
-                model_id,
-                provider,
-                previous_completion.as_ref(),
-                input_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
+            Self::record_request_cache_check(
+                &tx, session_id, model_id, provider, cache_request,
+                input_tokens, cache_read_tokens, cache_write_tokens, Self::now_ts(),
             )?
         } else {
             None
@@ -8411,6 +8166,10 @@ impl SessionStore {
 
     pub fn get_token_usage(&self, session_id: &str) -> Result<TokenUsage, String> {
         let conn = self.read_conn()?;
+        Self::get_token_usage_with_conn(&conn, session_id)
+    }
+
+    fn get_token_usage_with_conn(conn: &Connection, session_id: &str) -> Result<TokenUsage, String> {
         let result = conn.query_row(
             "SELECT
                 total_input_tokens,
@@ -8836,6 +8595,7 @@ impl SessionStore {
             },
         )?;
 
+        Self::reset_prompt_cache_baseline(&conn, session_id)?;
         tx.commit()
             .map_err(|e| format!("Failed to commit compact transaction: {}", e))?;
 
@@ -10876,6 +10636,65 @@ mod tests {
     }
 
     #[test]
+    fn v52_database_drops_context_attempt_captures_and_marks_capture_gaps() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("create store");
+        let session_id = store
+            .create_session("Captured", None, None, "chat", Some("unity"))
+            .expect("create session");
+        store
+            .add_message(&session_id, MessageRole::User, "keep the conversation")
+            .expect("add message");
+        store
+            .record_context_attempt(
+                &session_id, "run-1", 1, 1, "normal", "completed", "openai_codex",
+                "test-model", None, &serde_json::json!({"input": ["history"]}), "stream", None,
+            )
+            .expect("record attempt");
+        assert!(!store.session_has_context_capture_gap(&session_id).unwrap());
+        drop(store);
+        let conn = Connection::open(dir.path().join("locus.db")).expect("open v52 db");
+        conn.execute_batch("PRAGMA user_version = 52;").expect("downgrade to v52");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v52 store");
+        assert!(store.list_context_attempts(&session_id).unwrap().is_empty());
+        assert!(store.session_has_context_capture_gap(&session_id).unwrap());
+        {
+            let conn = store.conn.lock().unwrap();
+            assert!(table_exists(&conn, super::maintenance::LEGACY_CONTEXT_ATTEMPTS_TABLE));
+        }
+        // New captures go to the fresh table and survive the purge.
+        store
+            .record_context_attempt(
+                &session_id, "run-2", 1, 1, "normal", "completed", "openai_codex",
+                "test-model", None, &serde_json::json!({"input": []}), "stream", None,
+            )
+            .expect("record debug-mode attempt");
+        let mut progress = Vec::new();
+        let purged = store
+            .purge_legacy_context_attempts(&mut |done, total| progress.push((done, total)))
+            .expect("purge legacy captures");
+        assert_eq!(purged, Some(1));
+        assert_eq!(progress.last(), Some(&(1, 1)));
+        {
+            let conn = store.conn.lock().unwrap();
+            assert!(!table_exists(&conn, super::maintenance::LEGACY_CONTEXT_ATTEMPTS_TABLE));
+        }
+        assert_eq!(store.purge_legacy_context_attempts(&mut |_, _| {}).unwrap(), None);
+        assert_eq!(store.list_context_attempts(&session_id).unwrap().len(), 1);
+        let messages = store.get_messages(&session_id).expect("load messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "keep the conversation");
+        let output = dir.path().join("v52-context.yaml");
+        let result = crate::session::context_export::export_session_context_yaml(
+            &store, &session_id, "", None, None, &output,
+        )
+        .expect("export migrated session");
+        assert_eq!(result.capture_quality, "partial");
+    }
+
+    #[test]
     fn v25_database_migrates_context_attempts_and_old_session_exports_with_explicit_empty() {
         let dir = tempdir().expect("create temp dir");
         let db_path = dir.path().join("locus.db");
@@ -11215,6 +11034,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -11271,6 +11091,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -11488,7 +11309,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_usage_records_server_input_invalidation_once_per_user_message() {
+    fn completion_usage_preserves_each_request_cache_check() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");
         let session_id = store
@@ -11566,9 +11387,10 @@ mod tests {
         assert_eq!(invalidations[0].input_tokens, 90);
         assert_eq!(invalidations[0].cache_read_tokens, 0);
         assert_eq!(invalidations[0].excess_input_tokens, 90);
+        assert_eq!(store.cache_detection_summary(&session_id).unwrap().checked_requests, 2);
         assert_eq!(
             invalidations[0].reason,
-            "input_growth_exceeds_context_threshold"
+            "uncached_prefix_exceeds_threshold"
         );
     }
 
@@ -11625,7 +11447,7 @@ mod tests {
         assert_eq!(check.baseline_tokens, 276_521);
         assert_eq!(check.input_tokens, 1_900);
         assert_eq!(check.excess_input_tokens, 681);
-        assert_eq!(check.reason, "cache_reused");
+        assert_eq!(check.reason, "below_threshold");
         assert!(store
             .list_cache_invalidations(&session_id)
             .expect("list invalidations")
@@ -11705,7 +11527,7 @@ mod tests {
         let above_check = above_check.expect("above threshold check");
         assert!(above_check.invalidated);
         assert_eq!(above_check.excess_input_tokens, 81);
-        assert_eq!(above_check.reason, "input_growth_exceeds_context_threshold");
+        assert_eq!(above_check.reason, "uncached_prefix_exceeds_threshold");
     }
 
     #[test]
@@ -11993,6 +11815,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -12233,6 +12056,7 @@ mod tests {
             order: Some(1),
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -12309,6 +12133,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -12828,6 +12653,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -13110,6 +12936,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -13194,6 +13021,7 @@ mod tests {
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -13633,6 +13461,7 @@ mod tests {
             order: Some(1),
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,

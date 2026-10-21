@@ -152,7 +152,13 @@ onMounted(() => {
       <section class="model-usage-table-panel">
         <div class="model-usage-table-header">
           <span>{{ t("settings.modelUsage.byModel") }}</span>
-          <span>{{ t("settings.modelUsage.reportedCost", formatCost(report.usage.costUsd)) }}</span>
+          <span>
+            {{
+              report.usage.costUsd > 0 || report.usage.requestCount === 0
+                ? t("settings.modelUsage.reportedCost", formatCost(report.usage.costUsd))
+                : t("settings.modelUsage.costNotReported")
+            }}
+          </span>
         </div>
 
         <div v-if="report.byModel.length === 0" class="model-usage-empty model-usage-table-empty">
@@ -184,7 +190,14 @@ onMounted(() => {
                 <td class="numeric">{{ formatNumber(group.usage.outputTokens) }}</td>
                 <td class="numeric">{{ formatNumber(group.usage.cacheReadTokens) }}</td>
                 <td class="numeric">{{ formatNumber(group.usage.cacheWriteTokens) }}</td>
-                <td class="numeric">{{ formatCost(group.usage.costUsd) }}</td>
+                <td v-if="group.usage.costUsd > 0" class="numeric">{{ formatCost(group.usage.costUsd) }}</td>
+                <td
+                  v-else
+                  class="numeric model-usage-cost-missing"
+                  :title="t('settings.modelUsage.costNotReported')"
+                >
+                  {{ t("settings.modelUsage.costNotReportedShort") }}
+                </td>
               </tr>
             </tbody>
           </table>
@@ -362,6 +375,10 @@ onMounted(() => {
 .model-usage-total {
   color: var(--text-color);
   font-weight: 600;
+}
+
+.model-usage-cost-missing {
+  color: var(--text-secondary);
 }
 
 .model-usage-empty {

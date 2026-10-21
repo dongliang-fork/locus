@@ -154,6 +154,16 @@ pub enum StreamEvent {
         render_seq: Option<u32>,
     },
     #[serde(rename_all = "camelCase")]
+    ClaudeCodePhase {
+        session_id: String,
+        phase: crate::session::models::ClaudeCodePhase,
+    },
+    #[serde(rename_all = "camelCase")]
+    ClaudeCodeNotice {
+        session_id: String,
+        notice: AppError,
+    },
+    #[serde(rename_all = "camelCase")]
     ThinkingDelta {
         session_id: String,
         text: String,
@@ -268,6 +278,8 @@ pub enum StreamEvent {
         cache_invalidated: bool,
         #[serde(default)]
         cache_baseline_tokens: u64,
+        #[serde(default)]
+        cache_excess_input_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_invalidation_reason: Option<String>,
         total_input_tokens: u64,
@@ -290,6 +302,8 @@ pub enum StreamEvent {
         tool_call_id: String,
         question: String,
         options: Vec<AskOption>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        questions: Vec<crate::user_question::AskQuestion>,
     },
     #[serde(rename_all = "camelCase")]
     ToolConfirm {
@@ -509,15 +523,28 @@ pub struct SessionContextToolUsage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionCacheInvalidation {
+    pub event_id: String,
+    pub request_sequence: u64,
+    pub algorithm_version: u32,
     pub message_id: String,
     pub message: String,
     pub model_id: String,
     pub baseline_tokens: u64,
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
+    pub cache_write_tokens: Option<u64>,
     pub excess_input_tokens: u64,
     pub reason: String,
     pub occurred_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCacheDetection {
+    pub checked_requests: u64,
+    pub unavailable_requests: u64,
+    pub baseline_requests: u64,
+    pub legacy_checks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +571,7 @@ pub struct SessionContextUsageReport {
     pub breakdown: SessionContextBreakdown,
     pub tools: Vec<SessionContextToolUsage>,
     pub cache_invalidations: Vec<SessionCacheInvalidation>,
+    pub cache_detection: SessionCacheDetection,
     pub timing: SessionTimingUsage,
     pub usage: TokenUsage,
 }

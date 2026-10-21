@@ -75,6 +75,8 @@ function formatCacheInvalidationReason(reason: string): string {
       return t("chat.contextStats.cacheReason.modelChanged");
     case "provider_changed":
       return t("chat.contextStats.cacheReason.providerChanged");
+    case "uncached_prefix_exceeds_threshold":
+      return t("chat.contextStats.cacheReason.uncachedPrefixExceeded");
     case "input_growth_exceeds_context_threshold":
       return t("chat.contextStats.cacheReason.inputGrowthExceeded");
     default:
@@ -140,6 +142,18 @@ const tokenMetrics = computed(() => {
       title: t("chat.contextStats.outputSpeedHelp"),
     },
   ];
+});
+
+// Only provider-reported cost is shown; Locus never estimates one.
+const costLabel = computed(() => {
+  const usage = report.value?.usage;
+  if (!usage) return "";
+  if (usage.pricedRounds > 0) {
+    return t("chat.contextStats.reportedCost", formatCost(usage.totalCostUsd));
+  }
+  const hasUsage = usage.totalInputTokens + usage.totalOutputTokens
+    + usage.totalCacheReadTokens + usage.totalCacheWriteTokens > 0;
+  return hasUsage ? t("chat.contextStats.costNotReported") : "";
 });
 
 const toolResultSummary = computed(() => {
@@ -318,9 +332,7 @@ onUnmounted(() => {
         <section class="context-token-section" :aria-label="t('chat.contextStats.tokenUsage')">
           <div class="context-section-heading context-token-heading">
             <h2>{{ t("chat.contextStats.tokenUsage") }}</h2>
-            <span v-if="report.usage.pricedRounds > 0" class="context-section-meta">
-              {{ t("chat.contextStats.reportedCost", formatCost(report.usage.totalCostUsd)) }}
-            </span>
+            <span v-if="costLabel" class="context-section-meta">{{ costLabel }}</span>
           </div>
           <div class="context-token-metrics">
             <div
@@ -359,6 +371,13 @@ onUnmounted(() => {
               {{ t("chat.contextStats.cacheInvalidationSummary", report.cacheInvalidations.length) }}
             </span>
           </div>
+          <p class="context-cache-coverage">
+            {{ report.cacheDetection
+              ? t("chat.contextStats.cacheCoverage", report.cacheDetection.checkedRequests,
+                  report.cacheDetection.unavailableRequests, report.cacheDetection.baselineRequests,
+                  report.cacheDetection.legacyChecks)
+              : t("chat.contextStats.cacheCoverageUnavailable") }}
+          </p>
           <div v-if="report.cacheInvalidations.length === 0" class="context-tools-empty">
             {{ t("chat.contextStats.noCacheInvalidations") }}
           </div>
@@ -371,11 +390,16 @@ onUnmounted(() => {
                   <th>{{ t("chat.contextStats.cacheReason") }}</th>
                   <th class="numeric">{{ t("chat.contextStats.cacheBaseline") }}</th>
                   <th class="numeric">{{ t("chat.contextStats.cacheExcessInput") }}</th>
+                  <th class="numeric">{{ t("chat.contextStats.cacheRequestUsage") }}</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="event in report.cacheInvalidations" :key="event.messageId">
-                  <td class="context-cache-time">{{ formatTimestamp(event.occurredAt) }}</td>
+                <tr v-for="event in report.cacheInvalidations" :key="event.eventId">
+                  <td class="context-cache-time">
+                    {{ formatTimestamp(event.occurredAt) }}
+                    <div>{{ t("chat.contextStats.cacheRequestSequence", event.requestSequence) }}</div>
+                    <div v-if="event.algorithmVersion < 2">{{ t("chat.contextStats.cacheLegacy") }}</div>
+                  </td>
                   <td
                     class="context-cache-message"
                     :title="`${event.modelId}\n${event.message}`"
@@ -385,6 +409,10 @@ onUnmounted(() => {
                   <td>{{ formatCacheInvalidationReason(event.reason) }}</td>
                   <td class="numeric">{{ formatNumber(event.baselineTokens) }}</td>
                   <td class="numeric">{{ formatNumber(event.excessInputTokens) }}</td>
+                  <td class="numeric context-cache-counts">
+                    {{ formatNumber(event.inputTokens) }} / {{ formatNumber(event.cacheReadTokens) }} /
+                    {{ event.cacheWriteTokens == null ? t("chat.contextStats.unavailable") : formatNumber(event.cacheWriteTokens) }}
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -793,6 +821,25 @@ onUnmounted(() => {
 
 .context-tool-calls {
   color: var(--text-secondary);
+}
+
+.context-cache-coverage {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.context-cache-table {
+  min-width: 1000px;
+}
+
+.context-cache-counts {
+  white-space: nowrap;
+}
+
+.context-cache-table th:last-child,
+.context-cache-table td:last-child {
+  width: 190px;
 }
 
 .context-cache-table-wrap {
