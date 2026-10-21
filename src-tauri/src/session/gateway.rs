@@ -1,6 +1,7 @@
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::commands::{StreamEvent, StreamEventEnvelope};
+use crate::session::pending_inputs::{PendingInputChanges, RunSettlement};
 use crate::session::store::{
     SessionEventAppend, SessionEventMerge, SessionRunStatusUpdate, SessionStore,
 };
@@ -20,6 +21,8 @@ fn event_session_id(event: &StreamEvent) -> &str {
         | StreamEvent::PendingInputDeleted { session_id, .. }
         | StreamEvent::PendingInputAccepted { session_id, .. }
         | StreamEvent::TextDelta { session_id, .. }
+        | StreamEvent::ClaudeCodePhase { session_id, .. }
+        | StreamEvent::ClaudeCodeNotice { session_id, .. }
         | StreamEvent::ThinkingDelta { session_id, .. }
         | StreamEvent::ToolCallStart { session_id, .. }
         | StreamEvent::ToolCallDone { session_id, .. }
@@ -52,6 +55,8 @@ fn event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::PendingInputDeleted { .. } => "pendingInputDeleted",
         StreamEvent::PendingInputAccepted { .. } => "pendingInputAccepted",
         StreamEvent::TextDelta { .. } => "textDelta",
+        StreamEvent::ClaudeCodePhase { .. } => "claudeCodePhase",
+        StreamEvent::ClaudeCodeNotice { .. } => "claudeCodeNotice",
         StreamEvent::ThinkingDelta { .. } => "thinkingDelta",
         StreamEvent::ToolCallStart { .. } => "toolCallStart",
         StreamEvent::ToolCallDone { .. } => "toolCallDone",
@@ -100,7 +105,9 @@ fn run_status_for_event(event: &StreamEvent) -> Option<(&'static str, Option<Str
         StreamEvent::Done { .. } => Some((RUN_STATUS_DONE, None)),
         StreamEvent::Cancelled { .. } => Some((RUN_STATUS_CANCELLED, None)),
         StreamEvent::Error { error, .. } => Some((RUN_STATUS_ERROR, Some(error.message.clone()))),
-        StreamEvent::KnowledgeProposal { .. }
+        StreamEvent::ClaudeCodePhase { .. }
+        | StreamEvent::ClaudeCodeNotice { .. }
+        | StreamEvent::KnowledgeProposal { .. }
         | StreamEvent::PendingInputQueued { .. }
         | StreamEvent::PendingInputDeleted { .. }
         | StreamEvent::PendingInputAccepted { .. }
@@ -199,20 +206,20 @@ fn warn_if_run_session_mismatch(
 pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, event: StreamEvent) {
     let session_id = event_session_id(&event).to_string();
     let event_kind = event_type(&event);
-    if matches!(
-        &event,
-        StreamEvent::Cancelled { .. } | StreamEvent::Error { .. }
-    ) {
-        if let Some(queue_state) = app_handle.try_state::<crate::PendingInputQueueHandle>() {
-            match queue_state.lock() {
-                Ok(mut queue) => queue.clear_run(&session_id, run_id),
-                Err(error) => eprintln!(
-                    "[Locus] failed to clear pending input queue for session {} run {}: {}",
-                    session_id, run_id, error
-                ),
-            }
-        }
-    }
+    // Every terminal path passes through here before clients see the event, so
+    // queued and claimed inputs are resolved exactly once per run.
+    let settled_inputs = match &event {
+        StreamEvent::Done { .. } => with_pending_input_queue(app_handle, |queue| {
+            queue.settle_run(&session_id, run_id, RunSettlement::Completed)
+        }),
+        StreamEvent::Error { .. } => with_pending_input_queue(app_handle, |queue| {
+            queue.settle_run(&session_id, run_id, RunSettlement::Failed)
+        }),
+        StreamEvent::Cancelled { .. } => with_pending_input_queue(app_handle, |queue| {
+            queue.settle_cancelled_run(&session_id, run_id)
+        }),
+        _ => None,
+    };
     #[cfg(debug_assertions)]
     warn_if_run_session_mismatch(store, run_id, &session_id, event_kind);
 
@@ -304,6 +311,59 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
                 event_kind, session_id, run_id, error
             );
         }
+    }
+
+    if let Some(changes) = settled_inputs {
+        emit_pending_input_changes(app_handle, store, run_id, &session_id, changes);
+    }
+}
+
+fn with_pending_input_queue<T>(
+    app_handle: &AppHandle,
+    update: impl FnOnce(&mut crate::session::pending_inputs::PendingInputQueue) -> T,
+) -> Option<T> {
+    let queue_state = app_handle.try_state::<crate::PendingInputQueueHandle>()?;
+    let result = match queue_state.lock() {
+        Ok(mut queue) => Some(update(&mut *queue)),
+        Err(error) => {
+            eprintln!("[Locus] pending input queue is unavailable during run settlement: {error}");
+            None
+        }
+    };
+    result
+}
+
+/// Publishes queue changes made outside a command reply, such as settlement
+/// or returned steering claims, so every client converges on queue state.
+pub fn emit_pending_input_changes(
+    app_handle: &AppHandle,
+    store: &SessionStore,
+    run_id: &str,
+    session_id: &str,
+    changes: PendingInputChanges,
+) {
+    for pending_input_id in changes.absorbed_ids {
+        emit_stream(
+            app_handle,
+            store,
+            run_id,
+            StreamEvent::PendingInputDeleted {
+                session_id: session_id.to_string(),
+                pending_input_id,
+            },
+        );
+    }
+    for input in changes.inputs {
+        let input_run_id = input.run_id.clone();
+        emit_stream(
+            app_handle,
+            store,
+            &input_run_id,
+            StreamEvent::PendingInputQueued {
+                session_id: session_id.to_string(),
+                input,
+            },
+        );
     }
 }
 

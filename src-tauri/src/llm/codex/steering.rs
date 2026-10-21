@@ -17,6 +17,24 @@ pub trait SteeringSource: Send + Sync {
     fn committed(&self, id: &str, before_response: bool) -> Result<(), String>;
     fn rejected(&self, id: &str);
     fn has_unresolved_input(&self) -> bool;
+    /// A failed attempt discards its connection, and the next request replays
+    /// local history. Inputs never saved there were not delivered, so they go
+    /// back to the queue for the next steer or ordinary boundary.
+    fn release_unresolved(&self);
+}
+
+/// Some server lanes reject `response.steer` with a plain `error` event while
+/// the response keeps its own state. The input then never reached the model.
+pub fn is_refusal(error_message: &str) -> bool {
+    let lower = error_message.to_ascii_lowercase();
+    lower.contains("stateful websocket messages") || lower.contains("response.steer")
+}
+
+pub(super) fn refusal_error(error_message: &str, text_len: usize, tool_calls: usize) -> String {
+    format!(
+        "Codex steering was refused by the server; steering is disabled for this session \
+         (text_len={text_len}, complete_tool_calls={tool_calls}): {error_message}"
+    )
 }
 
 pub fn supports_steering(model: &str) -> bool {
@@ -73,6 +91,20 @@ impl Submission {
 
     pub fn pending(&self) -> bool {
         self.input.is_some() && !self.rejected
+    }
+
+    /// The parent response already reached its terminal event, but the
+    /// connection ended before a receipt or successor. Nothing created after
+    /// that point is visible to Locus, so the input follows the parent round.
+    pub fn abandon(&mut self, source: Option<&dyn SteeringSource>, reason: &str) {
+        let Some(input) = self.input.as_ref() else {
+            return;
+        };
+        self.rejected = true;
+        if let Some(source) = source {
+            source.rejected(&input.id);
+        }
+        tracing::info!(reason, "Codex steering lost its connection; using the next response");
     }
 
     pub fn event(

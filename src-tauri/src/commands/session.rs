@@ -200,6 +200,7 @@ fn fallback_runtime_snapshot(session_id: &str, run_id: &str) -> SessionRuntimeSn
         active_tool_calls: Vec::new(),
         streaming_text: String::new(),
         streaming_thinking: String::new(),
+        claude_code_phase: None,
         live_render_parts: Vec::new(),
         stream_sequence: 0,
         streaming_text_order: 0,
@@ -2172,11 +2173,13 @@ pub async fn chat(
                                 queue.restore_compact(&sid_clone, &current_run_id);
                             };
                         } else if let Some(follow_up) = follow_up {
-                            let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
-                                handle.state();
-                            if let Ok(mut queue) = queue_state.lock() {
-                                queue.restore_claimed(vec![follow_up]);
-                            };
+                            retain_unstarted_follow_up(
+                                &handle,
+                                store_for_task.as_ref(),
+                                &sid_clone,
+                                &current_run_id,
+                                follow_up,
+                            );
                         }
                         eprintln!(
                             "[Locus] failed to rebind queued follow-up for session {} after run {}: {}",
@@ -2202,11 +2205,13 @@ pub async fn chat(
                         queue.restore_compact(&sid_clone, &current_run_id);
                     };
                 } else if let Some(follow_up) = follow_up {
-                    let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
-                        handle.state();
-                    if let Ok(mut queue) = queue_state.lock() {
-                        queue.restore_claimed(vec![follow_up]);
-                    };
+                    retain_unstarted_follow_up(
+                        &handle,
+                        store_for_task.as_ref(),
+                        &sid_clone,
+                        &current_run_id,
+                        follow_up,
+                    );
                 }
                 eprintln!(
                     "[Locus] failed to start queued follow-up for session {} after run {}: {}",
@@ -2229,11 +2234,13 @@ pub async fn chat(
                                 queue.restore_compact(&sid_clone, &current_run_id);
                             };
                         } else if let Some(follow_up) = follow_up {
-                            let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
-                                handle.state();
-                            if let Ok(mut queue) = queue_state.lock() {
-                                queue.restore_claimed(vec![follow_up]);
-                            };
+                            retain_unstarted_follow_up(
+                                &handle,
+                                store_for_task.as_ref(),
+                                &sid_clone,
+                                &current_run_id,
+                                follow_up,
+                            );
                         }
                         if let Err(error) = store_for_task.update_run_status(
                             &next_run_id,
@@ -2497,6 +2504,36 @@ pub async fn queue_chat_input(
     );
 
     Ok(pending)
+}
+
+/// A claimed follow-up whose run could not start goes back to the user as a
+/// retained input; the scheduler that owned it stops here.
+fn retain_unstarted_follow_up(
+    handle: &AppHandle,
+    store: &SessionStore,
+    session_id: &str,
+    run_id: &str,
+    follow_up: PendingSessionInput,
+) {
+    let queue_state: tauri::State<'_, PendingInputQueueHandle> = handle.state();
+    let changes = match queue_state.lock() {
+        Ok(mut queue) => {
+            queue.restore_claimed(vec![follow_up]);
+            queue.settle_run(
+                session_id,
+                run_id,
+                crate::session::pending_inputs::RunSettlement::Failed,
+            )
+        }
+        Err(error) => {
+            eprintln!(
+                "[Locus] failed to retain queued follow-up for session {} run {}: {}",
+                session_id, run_id, error
+            );
+            return;
+        }
+    };
+    crate::session::gateway::emit_pending_input_changes(handle, store, run_id, session_id, changes);
 }
 
 #[tauri::command]
@@ -3248,6 +3285,7 @@ pub async fn unarchive_session(
 #[tauri::command]
 pub async fn delete_session(
     session_id: String,
+    app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     undo_manager: State<'_, crate::UndoManagerHandle>,
 ) -> Result<(), AppError> {
@@ -3257,7 +3295,7 @@ pub async fn delete_session(
     undo_manager.on_session_delete(&session_id).await;
     // The delete cascades to messages/events; reclaim file space in the
     // background once enough of the database is dead freelist pages.
-    store.inner().clone().spawn_vacuum_if_fragmented();
+    crate::session::maintenance::spawn(app_handle, store.inner().clone(), false);
     Ok(())
 }
 
@@ -3417,6 +3455,7 @@ pub async fn get_session_context_usage_report(
         )
         .await;
     report.upstream_model = upstream_model;
+    report.cache_detection = store.cache_detection_summary(&session_id)?;
     Ok(report)
 }
 
@@ -4032,40 +4071,24 @@ pub async fn export_session_context(
 #[tauri::command]
 pub async fn answer_question(
     question_id: String,
-    answer: String,
+    answer: serde_json::Value,
     app_handle: AppHandle,
     question_store: State<'_, QuestionStore>,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<(), AppError> {
-    let pending = {
-        let mut store = question_store.lock().await;
-        store.remove(&question_id)
+    let (pending, answer) = {
+        let mut pending = question_store.lock().await;
+        crate::user_question::take_answer(&mut pending, &question_id, &answer)?
     };
-    match pending {
-        Some(pending) => {
-            let crate::PendingQuestionResponse {
-                session_id,
-                run_id,
-                tx,
-            } = pending;
-
-            tx.send(answer)
-                .map_err(|_| "Question receiver dropped".to_string())?;
-
-            crate::session::gateway::emit_stream(
-                &app_handle,
-                store.inner().as_ref(),
-                &run_id,
-                StreamEvent::InputAnswered {
-                    session_id,
-                    question_id,
-                },
-            );
-
-            Ok(())
-        }
-        None => Err(format!("Question '{}' not found or already answered", question_id).into()),
-    }
+    let crate::PendingQuestionResponse { session_id, run_id, tx, .. } = pending;
+    tx.send(answer).map_err(|_| "Question receiver dropped".to_string())?;
+    crate::session::gateway::emit_stream(
+        &app_handle,
+        store.inner().as_ref(),
+        &run_id,
+        StreamEvent::InputAnswered { session_id, question_id },
+    );
+    Ok(())
 }
 
 #[cfg(test)]

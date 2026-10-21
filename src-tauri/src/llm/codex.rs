@@ -48,6 +48,7 @@ mod reasoning;
 pub(crate) use reasoning::compaction_metadata;
 mod retention;
 pub mod steering;
+pub(crate) mod web;
 mod tls;
 
 const DEFAULT_CODEX_PROVIDER_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -318,6 +319,9 @@ struct CachedWebsocketSession {
     connection: Option<CodexWebsocketStream>,
     last_response: Option<LastWebsocketResponse>,
     disable_websockets: bool,
+    /// The server refused `response.steer` for this connection identity.
+    /// Inserted input then waits for ordinary tool-round boundaries.
+    steering_disabled: bool,
     connection_key: Option<String>,
     prewarm_attempted: bool,
 }
@@ -636,12 +640,17 @@ fn build_input_with_reasoning_updates(
                             }));
                             continue;
                         }
-                        input.push(serde_json::json!({
+                        let mut call = serde_json::json!({
                             "type": "function_call",
                             "call_id": tc.id,
                             "name": tc.name,
                             "arguments": tc.arguments,
-                        }));
+                        });
+                        if tc.name == web::TOOL_NAME {
+                            call["namespace"] = serde_json::json!("web");
+                            call["name"] = serde_json::json!("run");
+                        }
+                        input.push(call);
                     }
                 }
             }
@@ -725,7 +734,7 @@ fn convert_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
     tools
         .iter()
         .filter_map(|tool| {
-            if tool.get("type").and_then(serde_json::Value::as_str) == Some("custom") {
+            if matches!(tool.get("type").and_then(serde_json::Value::as_str), Some("custom" | "namespace")) {
                 return Some(tool.clone());
             }
             if tool.get("type")?.as_str()? != "function" {
@@ -782,11 +791,18 @@ fn build_standard_request_body(
     options: CodexStreamOptions,
 ) -> serde_json::Value {
     let native_reasoning = supports_reasoning_updates(model) && options.use_session_continuation;
-    let input =
+    let mut input =
         build_input_with_reasoning_updates(history, response_request_metadata, native_reasoning);
     let mut responses_tools = convert_tools(tools);
+    let standalone_web = responses_tools.iter().any(web::is_tool_spec);
+    if standalone_web {
+        // A resumed tool_search result can still advertise the retired local
+        // fetch schema. Filter only request declarations; saved history stays intact.
+        web::remove_local_fetch_declarations(&mut responses_tools);
+        web::remove_local_fetch_from_history(&mut input);
+    }
 
-    if options.include_web_search {
+    if options.include_web_search && !standalone_web {
         // Inject web_search server tool (executed by OpenAI API, not locally).
         responses_tools.push(serde_json::json!({
             "type": "web_search",
@@ -1755,6 +1771,7 @@ async fn take_cached_websocket_session_state(
         state.connection = None;
         state.last_response = None;
         state.disable_websockets = false;
+        state.steering_disabled = false;
         state.connection_key = Some(connection_key.to_string());
         state.prewarm_attempted = false;
     }
@@ -2263,6 +2280,7 @@ fn collect_complete_tool_calls(
                     order: None,
                     server_tool: None,
                     server_tool_output: None,
+                    server_tool_result: None,
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
@@ -2863,6 +2881,7 @@ where
                                     order: None,
                                     server_tool: Some(ServerToolKind::WebSearch),
                                     server_tool_output: Some(detail),
+                                    server_tool_result: None,
                                     outcome: None,
                                     recorded_output: None,
                                     nested_tool_calls: None,
@@ -3083,6 +3102,7 @@ fn should_retry_safe_codex_error(error: &str) -> bool {
 
     no_visible_output
         && (lower.contains("stream ended without response.completed")
+            || lower.contains("codex steering was refused by the server")
             || lower.contains("stream ended before the response finalized")
             || lower.contains("websocket ended before the response finalized")
             || lower.contains("response completed with"))
@@ -3311,13 +3331,20 @@ where
                 continue;
             }
             Err(err) => {
-                if resuming_steering || steering.is_some_and(|source| source.has_unresolved_input())
+                let cancelled = options.cancel_rx.as_ref().is_some_and(|cancel| *cancel.borrow());
+                if !cancelled
+                    && (resuming_steering
+                        || steering.is_some_and(|source| source.has_unresolved_input()))
                 {
-                    // A lost acknowledgement is not a rejection. Neither transport nor
-                    // the agent may replay this request automatically.
-                    return Err(format!(
-                        "Codex steering outcome unknown; automatic retry disabled: {err}"
-                    ));
+                    // Every failed attempt discards its socket and continuation,
+                    // so the next request replays local history. An inserted input
+                    // that was never saved there is not part of the conversation
+                    // and is returned to the queue instead of being stranded.
+                    // A cancelled run's in-flight input is retained by run
+                    // settlement instead, so clients never resend it.
+                    if let Some(source) = steering {
+                        source.release_unresolved();
+                    }
                 }
                 if active_transport == CodexTransportMode::Websocket
                     && cached_websocket_http_fallback_enabled(
@@ -4027,7 +4054,9 @@ where
     }
     let mut submission = steering::Submission::default();
     let mut next_created = None;
+    let steering_disabled = shared_session.lock().await.steering_disabled;
     let can_steer = steering.is_some()
+        && !steering_disabled
         && steering::supports_steering(model)
         && cache_session_id.is_some()
         && !body["input"].as_array().is_some_and(|input| {
@@ -4041,6 +4070,9 @@ where
     trace.stage("read");
     trace.activity();
     let mut terminal_stream_error: Option<String> = None;
+    // Set when the socket ended or closed; it must not become the cached
+    // continuation connection even if a terminal event was received.
+    let mut connection_lost = false;
 
     loop {
         let incoming = tokio::select! {
@@ -4051,13 +4083,27 @@ where
                 if let Some(input) = steering.expect("steering source").claim()? {
                     let event = submission.send(input, stream_state.response_id.as_deref()
                         .ok_or("Codex steering response has no ID")?);
-                    tokio::time::timeout(request_timeout, socket.send(Message::Text(event.to_string().into()))).await
-                        .map_err(|_| "Codex steering send outcome unknown: WebSocket send timed out".to_string())?
-                        .map_err(|e| format!("Codex steering send outcome unknown: {e}"))?;
+                    let sent = tokio::time::timeout(
+                        request_timeout,
+                        socket.send(Message::Text(event.to_string().into())),
+                    )
+                    .await
+                    .map_err(|_| "send timed out".to_string())
+                    .and_then(|result| result.map_err(|e| e.to_string()));
+                    if let Err(error) = sent {
+                        terminal_stream_error =
+                            Some(format!("WebSocket steering send failed: {error}"));
+                        break;
+                    }
                 }
                 continue;
             }
         };
+        // After the parent's terminal event, losing the socket only ends the
+        // wait for a steering receipt or successor. The parent stays valid.
+        let awaiting_steering_outcome = stream_state.got_terminal_event
+            && submission.pending()
+            && !inherited_submission.pending();
         let message = match incoming {
             Ok(Some(Ok(message))) => {
                 // Renew before parsing: metadata, ignored events and even
@@ -4068,17 +4114,32 @@ where
                 message
             }
             Ok(Some(Err(e))) => {
+                if awaiting_steering_outcome {
+                    submission.abandon(steering, "read error");
+                    connection_lost = true;
+                    break;
+                }
                 // The pump terminates after a read error; another read only
                 // loses this cause behind a generic channel-closed error.
                 terminal_stream_error = Some(format!("WebSocket read error: {e}"));
                 break;
             }
             Ok(None) => {
+                if awaiting_steering_outcome {
+                    submission.abandon(steering, "connection closed");
+                    connection_lost = true;
+                    break;
+                }
                 terminal_stream_error =
                     Some("WebSocket closed before response.completed".to_string());
                 break;
             }
             Err(_) => {
+                if awaiting_steering_outcome {
+                    submission.abandon(steering, "idle timeout");
+                    connection_lost = true;
+                    break;
+                }
                 if !stream_state.full_text.is_empty() || !stream_state.tool_calls_map.is_empty() {
                     terminal_stream_error =
                         Some("WebSocket read timed out before the response finalized".to_string());
@@ -4169,12 +4230,29 @@ where
                     }
                 }
                 if let Some(error_message) = websocket_event_error_message(&payload) {
+                    // An error answering our not-yet-acknowledged steer means the
+                    // lane cannot steer. The input never reached the model.
+                    let steering_refused = submission.pending()
+                        && submission.accepted_id.is_none()
+                        && steering::is_refusal(&error_message);
                     clear_cached_websocket_session_state(
                         &shared_session,
                         &connection_key,
                         /*disable_websockets*/ false,
                     )
                     .await;
+                    if steering_refused {
+                        shared_session.lock().await.steering_disabled = true;
+                        tracing::warn!(
+                            error = %error_message,
+                            "Codex steering refused; inserted input will use tool-round boundaries"
+                        );
+                        return Err(steering::refusal_error(
+                            &error_message,
+                            stream_state.full_text.len(),
+                            stream_state.tool_calls_map.len(),
+                        ));
+                    }
                     return Err(error_message);
                 }
                 let event_text = format!("data: {}", payload);
@@ -4219,6 +4297,11 @@ where
             // immediately, so response processing only observes data frames.
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
             Message::Close(frame) => {
+                connection_lost = true;
+                if awaiting_steering_outcome {
+                    submission.abandon(steering, "closed by server");
+                    break;
+                }
                 if !stream_state.got_terminal_event
                     || submission.pending()
                     || inherited_submission.pending()
@@ -4326,7 +4409,7 @@ where
         if submission.rejected {
             stream_state.end_turn = Some(false);
         }
-        if stream_state.got_completed_event {
+        if stream_state.got_completed_event && !connection_lost {
             store_cached_websocket_session_state(
                 &shared_session,
                 &connection_key,
@@ -4530,6 +4613,7 @@ mod tests {
                 order: None,
                 server_tool: None,
                 server_tool_output: None,
+                server_tool_result: None,
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,
@@ -4608,6 +4692,7 @@ mod tests {
                 order: None,
                 server_tool: Some(ServerToolKind::WebSearch),
                 server_tool_output: Some("Searched: rust async await".to_string()),
+                server_tool_result: None,
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,
@@ -4632,6 +4717,7 @@ mod tests {
                 order: None,
                 server_tool: None,
                 server_tool_output: None,
+                server_tool_result: None,
                 outcome: Some(ToolCallOutcome::Done),
                 recorded_output: None,
                 nested_tool_calls: None,
@@ -4656,6 +4742,7 @@ mod tests {
             order: None,
             server_tool: None,
             server_tool_output: None,
+            server_tool_result: None,
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
@@ -6226,6 +6313,7 @@ mod tests {
                 order: None,
                 server_tool: Some(ServerToolKind::WebSearch),
                 server_tool_output: Some("Searched: rust async await".to_string()),
+                server_tool_result: None,
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,

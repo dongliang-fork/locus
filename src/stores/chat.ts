@@ -36,6 +36,13 @@ import {
   buildUserMessageDraft,
 } from "../composables/chatMessageDraft";
 import { isMessageFromActiveStream } from "../composables/chatMessageFork";
+import {
+  mergePendingInputList,
+  pendingInputDelivery,
+  queuedFollowUpInputs,
+  summarizeQueuedFollowUp,
+  visiblePendingInputs,
+} from "../composables/pendingSessionInputs";
 import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
 import { useChatChangesStore } from "./chatChanges";
@@ -45,9 +52,9 @@ import { useChatInputSettings } from "../composables/useChatInputSettings";
 import { applyNewSessionSelection } from "../composables/newSessionSelection";
 import { isToolCollapseTraceEnabled, logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import type {
-  SessionSummary, SessionDetail, ChatMessage, TokenUsage,
+  SessionSummary, SessionDetail, ChatMessage, TokenUsage, ClaudeCodePhase,
   TodoItem, StreamEvent, ImageAttachment, AssetRefAttachment, ToolCallDisplay,
-  PendingQuestion, PendingToolConfirm,
+  PendingQuestion, PendingToolConfirm, QuestionAnswerPayload,
   UserIntentMeta,
   KnowledgeProposalStatus,
   UndoConflictInfo,
@@ -249,36 +256,6 @@ function traceStreamMutation(mutation: StreamMutation) {
   }
 }
 
-function mergePendingInputList(
-  list: PendingSessionInput[],
-  input: PendingSessionInput,
-): PendingSessionInput[] {
-  const index = list.findIndex((item) =>
-    item.id === input.id
-    || (
-      item.runId === input.runId
-      && item.mergeGroupId === input.mergeGroupId
-      && item.status !== "delivering"
-      && item.status !== "accepted"
-      && item.status !== "restored"
-    ));
-  if (index < 0) return [...list, input];
-  // A delayed enqueue acknowledgement must not make sent steering withdrawable.
-  if (list[index]?.id === input.id && list[index]?.status === "delivering" && input.status === "queued") return list;
-  const next = [...list];
-  next.splice(index, 1, input);
-  return next;
-}
-
-function visiblePendingInputs(inputs: PendingSessionInput[] | undefined): PendingSessionInput[] {
-  return (inputs ?? []).filter((input) =>
-    input.status === "queued" || input.status === "delivering");
-}
-
-function pendingInputDelivery(input: PendingSessionInput): "after_run" | "immediate" {
-  return input.delivery === "immediate" ? "immediate" : "after_run";
-}
-
 function joinPendingText(existing: string, next: string): string {
   const existingTrimmed = existing.trim();
   const nextTrimmed = next.trim();
@@ -401,6 +378,7 @@ export const useChatStore = defineStore("chat", () => {
   const isCompacting = ref(false);
   const compactQueuedRuns = ref(new Map<string, string>());
   const currentRunId = ref<string | null>(null);
+  const claudeCodePhase = ref<ClaudeCodePhase | null>(null);
   const isThinking = ref(false);
   const thinkingStartTime = ref(0);
   const thinkingDuration = ref(0);
@@ -483,27 +461,15 @@ export const useChatStore = defineStore("chat", () => {
   const activeQueuedFollowUps = computed(() => {
     const sessionId = activeSessionId.value;
     if (!sessionId) return [];
-    const inputs = visiblePendingInputs(pendingInputsBySession.value.get(sessionId));
-    const runId = currentRunId.value;
-    return runId ? inputs.filter((input) => input.runId === runId) : inputs;
+    return queuedFollowUpInputs(pendingInputsBySession.value.get(sessionId), currentRunId.value);
   });
   const activeQueuedFollowUp = computed(() => {
-    const inputs = activeQueuedFollowUps.value;
-    if (inputs.length === 0) return null;
-    const displayText = inputs
-      .map((input) => input.displayText || input.text)
-      .filter((text) => text.trim().length > 0)
-      .join("\n");
-    const images = inputs.flatMap((input) => input.images ?? []);
+    const summary = summarizeQueuedFollowUp(activeQueuedFollowUps.value, currentRunId.value);
+    if (!summary) return null;
     return {
-      inputs,
-      displayText,
-      images,
-      canInsert: inputs.some((input) => pendingInputDelivery(input) !== "immediate"),
-      canEdit: inputs.every((input) => input.status === "queued"),
-      isInserting: inputs.every((input) => pendingInputDelivery(input) === "immediate"),
-      imageCount: images.length,
-      assetRefCount: inputs.reduce((total, input) => total + (input.assetRefs?.length ?? 0), 0),
+      ...summary,
+      imageCount: summary.images.length,
+      assetRefCount: summary.inputs.reduce((total, input) => total + (input.assetRefs?.length ?? 0), 0),
     };
   });
   const isCompactQueued = computed(() => {
@@ -750,6 +716,7 @@ export const useChatStore = defineStore("chat", () => {
     liveRenderParts.value = [];
     isCompacting.value = false;
     isThinking.value = false;
+    claudeCodePhase.value = null;
     thinkingStartTime.value = 0;
     thinkingDuration.value = 0;
     activeToolCalls.value = [];
@@ -906,6 +873,7 @@ export const useChatStore = defineStore("chat", () => {
         ensureLivePartStream(part.id);
       }
     }
+    claudeCodePhase.value = runtime.claudeCodePhase ?? null;
     isThinking.value = runtime.isThinking === true && !removedMaterializedThinkingPart;
     thinkingStartTime.value = isThinking.value ? Date.now() : 0;
     thinkingDuration.value = runtime.thinkingDuration ?? 0;
@@ -1761,6 +1729,9 @@ export const useChatStore = defineStore("chat", () => {
         liveRenderParts.value = [];
         clearLivePartStreams();
         break;
+      case "setClaudeCodePhase":
+        claudeCodePhase.value = m.phase;
+        break;
       case "setThinking":
         isThinking.value = m.value;
         if (m.startTime !== undefined) thinkingStartTime.value = m.startTime;
@@ -1866,6 +1837,7 @@ export const useChatStore = defineStore("chat", () => {
         thinkingStartTime.value = 0;
         thinkingDuration.value = 0;
         isThinking.value = false;
+        claudeCodePhase.value = null;
         activeToolCalls.value = [];
         break;
       case "resetRoundKeepToolCalls":
@@ -1886,6 +1858,7 @@ export const useChatStore = defineStore("chat", () => {
         thinkingStartTime.value = 0;
         thinkingDuration.value = 0;
         isThinking.value = false;
+        claudeCodePhase.value = null;
         break;
       case "clearPendingInputs":
         pendingQuestion.value = null;
@@ -2075,6 +2048,34 @@ export const useChatStore = defineStore("chat", () => {
       return true;
     }
 
+    // Pending input events carry their own input and run. Settlement emits
+    // them right after a terminal event, and inputs retained from an earlier
+    // run stay editable, so they must also bypass run gating.
+    if (event.type === "pendingInputQueued") {
+      upsertPendingInput(event.input);
+      return true;
+    }
+
+    if (event.type === "pendingInputDeleted") {
+      markPendingInputDeleted(event.sessionId, event.pendingInputId);
+      return true;
+    }
+
+    if (event.type === "pendingInputAccepted") {
+      markPendingInputAccepted(event.sessionId, event.pendingInputId);
+      for (const key of Array.from(localPendingInputGroups)) {
+        if (key.includes(`\u{0}${event.runId}\u{0}`)) {
+          localPendingInputGroups.delete(key);
+        }
+      }
+      for (const key of Array.from(localFallbackPendingInputGroups)) {
+        if (key.includes(`\u{0}${event.runId}\u{0}`)) {
+          localFallbackPendingInputGroups.delete(key);
+        }
+      }
+      return true;
+    }
+
     // Session auto-assignment
     if (!activeSessionId.value && isStreaming.value && pendingSessionId === null) {
       pendingSessionId = event.sessionId;
@@ -2104,31 +2105,6 @@ export const useChatStore = defineStore("chat", () => {
         eventType: event.type,
       });
       return false;
-    }
-
-    if (event.type === "pendingInputQueued") {
-      upsertPendingInput(event.input);
-      return true;
-    }
-
-    if (event.type === "pendingInputDeleted") {
-      markPendingInputDeleted(event.sessionId, event.pendingInputId);
-      return true;
-    }
-
-    if (event.type === "pendingInputAccepted") {
-      markPendingInputAccepted(event.sessionId, event.pendingInputId);
-      for (const key of Array.from(localPendingInputGroups)) {
-        if (key.includes(`\u{0}${event.runId}\u{0}`)) {
-          localPendingInputGroups.delete(key);
-        }
-      }
-      for (const key of Array.from(localFallbackPendingInputGroups)) {
-        if (key.includes(`\u{0}${event.runId}\u{0}`)) {
-          localFallbackPendingInputGroups.delete(key);
-        }
-      }
-      return true;
     }
 
     if (event.type === "userMessage" && shouldDeferUserMessage(event)) {
@@ -2203,6 +2179,19 @@ export const useChatStore = defineStore("chat", () => {
 
     if (event.sessionId !== activeSessionId.value) return true;
 
+    if (event.type === "claudeCodeNotice") {
+      useNotificationStore().addNotice(event.notice.severity, event.notice.message, {
+        code: event.notice.code,
+        operation: `claudeCode:${event.sessionId}:${event.runId}`,
+        replaceOperation: true,
+        sticky: event.notice.code !== "claude_code.api_retry",
+      });
+      return true;
+    }
+    if (event.type === "error") {
+      useNotificationStore().clearByOperation(`claudeCode:${event.sessionId}:${event.runId}`);
+    }
+
     const shouldUseIncrementalReducer =
       event.type === "compactStart"
       || event.type === "compactDone"
@@ -2257,6 +2246,7 @@ export const useChatStore = defineStore("chat", () => {
       messages: messages.value,
       streamingText: streamingText.value,
       rawStreamText: rawStreamText.value,
+      claudeCodePhase: claudeCodePhase.value,
       streamingThinking: streamingThinking.value,
       streamSequence: streamSequence.value,
       streamingTextOrder: streamingTextOrder.value,
@@ -2779,7 +2769,9 @@ export const useChatStore = defineStore("chat", () => {
     const sessionId = activeSessionId.value;
     const runId = currentRunId.value;
     const pending = activeQueuedFollowUps.value.find((input) =>
-      pendingInputDelivery(input) !== "immediate");
+      input.runId === runId
+      && input.status === "queued"
+      && pendingInputDelivery(input) !== "immediate");
     if (!sessionId || !runId || !pending) return false;
 
     try {
@@ -3462,14 +3454,11 @@ export const useChatStore = defineStore("chat", () => {
     await cancelSession(activeSessionId.value);
   }
 
-  async function answerQuestion(answer: string) {
+  async function answerQuestion(answer: QuestionAnswerPayload, questionId?: string) {
     const q = pendingQuestion.value;
-    if (!q) return;
-    pendingQuestion.value = null;
-    try {
-      await sessionService.answerQuestion(q.questionId, answer);
-    } catch (e) {
-      console.error("answer_question failed:", e);
+    if (!q || (questionId && q.questionId !== questionId)) return;
+    if (await sessionService.submitQuestionForm(q, answer)) {
+      if (pendingQuestion.value?.questionId === q.questionId) pendingQuestion.value = null;
     }
   }
 
@@ -3723,6 +3712,7 @@ export const useChatStore = defineStore("chat", () => {
     currentRunId,
     isCancelling,
     isThinking,
+    claudeCodePhase,
     thinkingStartTime,
     thinkingDuration,
     showThinkingPanel,

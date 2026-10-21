@@ -5,8 +5,11 @@ use std::collections::VecDeque;
 struct Source {
     queued: StdMutex<VecDeque<SteeringInput>>,
     claimed: StdMutex<Vec<String>>,
+    // Claimed inputs without a receipt or successor yet.
+    unresolved: StdMutex<Vec<String>>,
     committed: StdMutex<Vec<(String, bool)>>,
     rejected: StdMutex<Vec<String>>,
+    released: StdMutex<Vec<String>>,
 }
 
 impl Source {
@@ -16,6 +19,10 @@ impl Source {
             input: user_input(text, None),
         });
     }
+
+    fn resolve(&self, id: &str) {
+        self.unresolved.lock().unwrap().retain(|item| item != id);
+    }
 }
 
 impl SteeringSource for Source {
@@ -23,19 +30,32 @@ impl SteeringSource for Source {
         let input = self.queued.lock().unwrap().pop_front();
         if let Some(input) = &input {
             self.claimed.lock().unwrap().push(input.id.clone());
+            self.unresolved.lock().unwrap().push(input.id.clone());
         }
         Ok(input)
     }
     fn committed(&self, id: &str, before: bool) -> Result<(), String> {
+        self.resolve(id);
         self.committed.lock().unwrap().push((id.into(), before));
         Ok(())
     }
     fn rejected(&self, id: &str) {
+        self.resolve(id);
         self.rejected.lock().unwrap().push(id.into());
     }
     fn has_unresolved_input(&self) -> bool {
-        !self.claimed.lock().unwrap().is_empty()
+        !self.unresolved.lock().unwrap().is_empty()
     }
+    fn release_unresolved(&self) {
+        // The production queue makes these claimable again; recording them is
+        // enough here and keeps retries free of a second steering race.
+        let released = std::mem::take(&mut *self.unresolved.lock().unwrap());
+        self.released.lock().unwrap().extend(released);
+    }
+}
+
+fn steering_refusal() -> Value {
+    json!({"type":"error","error":{"message":"The experimental native turn lane cannot accept stateful WebSocket messages while a native turn is running. Start a new independent response.create turn instead."}})
 }
 
 fn msg(id: &str, role: &str, text: &str) -> ChatMessage {
@@ -307,7 +327,7 @@ async fn rejected_steering_returns_to_normal_follow_up_without_stopping_output()
 }
 
 #[tokio::test]
-async fn disconnect_after_submission_never_retries_even_without_output() {
+async fn disconnect_mid_response_releases_input_and_replays_local_history() {
     for acknowledge in [false, true] {
         let (listener, base, sid) = setup().await;
         let server = tokio::spawn(async move {
@@ -319,15 +339,18 @@ async fn disconnect_after_submission_never_retries_even_without_output() {
                 send(&mut ws, accepted("r1")).await;
             }
             ws.close(None).await.unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(200), listener.accept())
-                    .await
-                    .is_err()
-            );
+            // The retry is a full replay on a new socket; the unsaved input is
+            // not part of it, so the server cannot see the input twice.
+            let mut ws = connect(&listener).await;
+            let replay = recv(&mut ws).await;
+            assert!(replay.get("previous_response_id").is_none());
+            assert!(!replay["input"].to_string().contains("update"));
+            send(&mut ws, created("r2")).await;
+            send(&mut ws, completed("r2", output("m2", "Recovered"))).await;
         });
         let source = Source::default();
         source.queue("u1", "update");
-        let error = run(
+        let response = run(
             &base,
             &sid,
             &[msg("u0", "user", "Start")],
@@ -336,12 +359,136 @@ async fn disconnect_after_submission_never_retries_even_without_output() {
             &source,
         )
         .await
-        .unwrap_err();
-        assert!(error.contains("steering outcome unknown"), "{error}");
+        .unwrap();
+        assert_eq!(response.text, "Recovered");
+        assert_eq!(*source.released.lock().unwrap(), vec!["u1"]);
         assert!(source.committed.lock().unwrap().is_empty());
+        assert!(!source.has_unresolved_input());
         server.await.unwrap();
         invalidate_cached_session(&sid);
     }
+}
+
+#[tokio::test]
+async fn refused_steering_is_disabled_and_the_request_is_retried_without_it() {
+    let (listener, base, sid) = setup().await;
+    let server = tokio::spawn(async move {
+        let mut ws = connect(&listener).await;
+        recv(&mut ws).await;
+        send(&mut ws, created("r1")).await;
+        assert_eq!(recv(&mut ws).await["type"], "response.steer");
+        send(&mut ws, steering_refusal()).await;
+
+        let mut ws = connect(&listener).await;
+        let replay = recv(&mut ws).await;
+        assert_eq!(replay["type"], "response.create");
+        assert!(replay.get("previous_response_id").is_none());
+        send(&mut ws, created("r2")).await;
+        // A second queued input must not be steered once the lane refused it.
+        assert!(tokio::time::timeout(Duration::from_millis(250), ws.next())
+            .await
+            .is_err());
+        send(&mut ws, completed("r2", output("m2", "Done"))).await;
+    });
+    let source = Source::default();
+    source.queue("u1", "first");
+    source.queue("u2", "second");
+    let response = run(
+        &base,
+        &sid,
+        &[msg("u0", "user", "Start")],
+        &HashMap::new(),
+        &mut TurnState::default(),
+        &source,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.text, "Done");
+    assert_eq!(*source.released.lock().unwrap(), vec!["u1"]);
+    assert_eq!(source.queued.lock().unwrap().len(), 1);
+    server.await.unwrap();
+    invalidate_cached_session(&sid);
+}
+
+#[tokio::test]
+async fn refusal_after_visible_output_is_not_retried_by_the_transport() {
+    let (listener, base, sid) = setup().await;
+    let server = tokio::spawn(async move {
+        let mut ws = connect(&listener).await;
+        recv(&mut ws).await;
+        send(&mut ws, created("r1")).await;
+        send(&mut ws, json!({"type":"response.output_text.delta","item_id":"m1","output_index":0,
+            "content_index":0,"delta":"partial"})).await;
+        assert_eq!(recv(&mut ws).await["type"], "response.steer");
+        send(&mut ws, steering_refusal()).await;
+        assert!(tokio::time::timeout(Duration::from_millis(1500), listener.accept())
+            .await
+            .is_err());
+    });
+    let source = Source::default();
+    source.queue("u1", "update");
+    let error = run(
+        &base,
+        &sid,
+        &[msg("u0", "user", "Start")],
+        &HashMap::new(),
+        &mut TurnState::default(),
+        &source,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("steering was refused"), "{error}");
+    assert!(!error.contains("text_len=0"), "{error}");
+    assert_eq!(*source.released.lock().unwrap(), vec!["u1"]);
+    server.await.unwrap();
+    invalidate_cached_session(&sid);
+}
+
+#[tokio::test]
+async fn connection_lost_while_awaiting_successor_keeps_the_terminal_response() {
+    let (listener, base, sid) = setup().await;
+    let server = tokio::spawn(async move {
+        let mut ws = connect(&listener).await;
+        recv(&mut ws).await;
+        send(&mut ws, created("r1")).await;
+        recv(&mut ws).await;
+        send(&mut ws, accepted("r1")).await;
+        send(
+            &mut ws,
+            json!({"type":"response.incomplete","response":{"id":"r1",
+            "incomplete_details":{"reason":"steered"},"output":[output("msg_m1","Preserved")]}}),
+        )
+        .await;
+        ws.close(None).await.unwrap();
+
+        let mut ws = connect(&listener).await;
+        let replay = recv(&mut ws).await;
+        assert!(replay.get("previous_response_id").is_none());
+        assert!(replay["input"].to_string().contains("update"));
+        send(&mut ws, created("r2")).await;
+        send(&mut ws, completed("r2", output("msg_m2", "Continued"))).await;
+    });
+    let source = Source::default();
+    source.queue("u1", "update");
+    let mut turn = TurnState::default();
+    let mut history = vec![msg("u0", "user", "Start")];
+    let mut metadata = HashMap::new();
+    let response = run(&base, &sid, &history, &metadata, &mut turn, &source)
+        .await
+        .unwrap();
+    assert_eq!(response.text, "Preserved");
+    assert_eq!(response.end_turn, Some(false));
+    assert!(!turn.has_steering_continuation());
+    assert_eq!(*source.rejected.lock().unwrap(), vec!["u1"]);
+    assert!(source.released.lock().unwrap().is_empty());
+    save(&mut history, &mut metadata, "a1", &response);
+    history.push(msg("u1", "user", "update"));
+    let follow_up = run(&base, &sid, &history, &metadata, &mut turn, &source)
+        .await
+        .unwrap();
+    assert_eq!(follow_up.text, "Continued");
+    server.await.unwrap();
+    invalidate_cached_session(&sid);
 }
 
 #[test]

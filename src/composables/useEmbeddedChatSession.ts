@@ -28,6 +28,13 @@ import {
   applyAsyncTaskUpdateToMessages,
   asyncTaskDisplayStatus,
 } from "./asyncTaskUpdates";
+import {
+  mergePendingInputList,
+  pendingInputDelivery,
+  queuedFollowUpInputs,
+  summarizeQueuedFollowUp,
+  visiblePendingInputs,
+} from "./pendingSessionInputs";
 import { useModelStore } from "../stores/model";
 import { useNotificationStore } from "../stores/notification";
 import type { WorkspaceRef } from "../services/project";
@@ -56,12 +63,14 @@ import type {
   AsyncTaskUpdatedEvent,
   ChatComposerSendPayload,
   ChatMessage,
+  ClaudeCodePhase,
   EffortLevel,
   ImageAttachment,
   AssetRefAttachment,
   KnowledgeAccessMode,
   KnowledgeDocumentType,
   PendingQuestion,
+  QuestionAnswerPayload,
   PendingToolConfirm,
   StreamEvent,
   TokenUsage,
@@ -224,6 +233,7 @@ function createState(key: string): EmbeddedChatState {
     streamingText: "",
     rawStreamText: "",
     streamingThinking: "",
+    claudeCodePhase: null as ClaudeCodePhase | null,
     streamSequence: 0,
     streamingTextOrder: 0,
     thinkingOrder: 0,
@@ -649,28 +659,6 @@ function shouldDeferUserMessage(
   return state.activeToolCalls.length > 0;
 }
 
-function mergePendingInputList(
-  list: PendingSessionInput[],
-  input: PendingSessionInput,
-): PendingSessionInput[] {
-  const index = list.findIndex((item) =>
-    item.id === input.id
-    || (item.runId === input.runId && item.mergeGroupId === input.mergeGroupId && item.status !== "delivering"));
-  if (index < 0) return [...list, input];
-  if (list[index]?.id === input.id && list[index]?.status === "delivering" && input.status === "queued") return list;
-  const next = [...list];
-  next.splice(index, 1, input);
-  return next;
-}
-
-function visiblePendingInputs(inputs: PendingSessionInput[]) {
-  return inputs.filter((input) => input.status === "queued" || input.status === "delivering");
-}
-
-function pendingInputDelivery(input: PendingSessionInput): "after_run" | "immediate" {
-  return input.delivery === "immediate" ? "immediate" : "after_run";
-}
-
 function joinPendingText(existing: string, next: string): string {
   const existingTrimmed = existing.trim();
   const nextTrimmed = next.trim();
@@ -750,6 +738,7 @@ function applySessionRuntimeSnapshot(state: EmbeddedChatState, detail: SessionDe
       ensureEmbeddedPartStream(state, part.id);
     }
   }
+  state.claudeCodePhase = runtime.claudeCodePhase ?? null;
   state.isThinking = runtime.isThinking === true;
   state.thinkingStartTime = state.isThinking ? Date.now() : 0;
   state.thinkingDuration = runtime.thinkingDuration ?? 0;
@@ -795,6 +784,7 @@ function resetRoundState(state: EmbeddedChatState) {
   state.thinkingOrder = 0;
   state.liveRenderParts = [];
   state.isThinking = false;
+  state.claudeCodePhase = null;
   state.thinkingStartTime = 0;
   state.thinkingDuration = 0;
   state.activeToolCalls = [];
@@ -864,6 +854,9 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
     case "clearLiveRenderParts":
       state.liveRenderParts = [];
       state.livePartStreams.clear();
+      break;
+    case "setClaudeCodePhase":
+      state.claudeCodePhase = mutation.phase;
       break;
     case "setThinking":
       state.isThinking = mutation.value;
@@ -997,6 +990,7 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       state.thinkingOrder = 0;
       state.liveRenderParts = [];
       state.isThinking = false;
+      state.claudeCodePhase = null;
       state.thinkingStartTime = 0;
       state.thinkingDuration = 0;
       resetEmbeddedStreams(state);
@@ -1329,28 +1323,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       return;
     }
 
-    if (event.type === "runStart") {
-      if (state.currentRunId && state.currentRunId !== event.runId) {
-        state.deferredUserMessagesByRun.delete(state.currentRunId);
-        state.submittedUserMessagesByRun.delete(state.currentRunId);
-        state.streamSequence = 0;
-        state.pendingQuestion = null;
-        state.pendingToolConfirms = [];
-        state.isCompacting = false;
-        resetRoundState(state);
-      }
-      state.currentRunId = event.runId;
-      state.isStreaming = true;
-      state.pendingRun = false;
-      state.isCancelling = false;
-      state.resumeAvailable = false;
-      setEmbeddedError(state, null);
-      return;
-    }
-
-    if (state.currentRunId && event.runId !== state.currentRunId) return;
-    if (!state.currentRunId) state.currentRunId = event.runId;
-
+    // Pending input events carry their own input and run. Settlement emits
+    // them right after a terminal event, and inputs retained from an earlier
+    // run stay editable, so they bypass active-run filtering.
     if (event.type === "pendingInputQueued") {
       if (state.acceptedPendingInputIds.has(event.input.id)) return;
       state.pendingInputs = visiblePendingInputs(
@@ -1376,6 +1351,38 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.pendingInputs = state.pendingInputs.filter((input) => input.id !== event.pendingInputId);
       state.localMergeGroupId = null;
       state.localFallbackMergeGroupId = null;
+      return;
+    }
+
+    if (event.type === "runStart") {
+      if (state.currentRunId && state.currentRunId !== event.runId) {
+        state.deferredUserMessagesByRun.delete(state.currentRunId);
+        state.submittedUserMessagesByRun.delete(state.currentRunId);
+        state.streamSequence = 0;
+        state.pendingQuestion = null;
+        state.pendingToolConfirms = [];
+        state.isCompacting = false;
+        resetRoundState(state);
+      }
+      state.currentRunId = event.runId;
+      state.isStreaming = true;
+      state.pendingRun = false;
+      state.isCancelling = false;
+      state.resumeAvailable = false;
+      setEmbeddedError(state, null);
+      return;
+    }
+
+    if (state.currentRunId && event.runId !== state.currentRunId) return;
+    if (!state.currentRunId) state.currentRunId = event.runId;
+
+    if (event.type === "claudeCodeNotice") {
+      useNotificationStore().addNotice(event.notice.severity, event.notice.message, {
+        code: event.notice.code,
+        operation: `claudeCode:${event.sessionId}:${event.runId}`,
+        replaceOperation: true,
+        sticky: event.notice.code !== "claude_code.api_retry",
+      });
       return;
     }
 
@@ -1406,6 +1413,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
     if (event.type === "error") {
       flushDeferredUserMessages(state, event.runId);
+      useNotificationStore().clearByOperation(`claudeCode:${event.sessionId}:${event.runId}`);
       useNotificationStore().addNotice("error", event.error.message, { code: event.error.code, operation: "chat" });
       setEmbeddedError(state, normalizeAppError(event.error).message, true);
       state.currentRunId = null;
@@ -1961,7 +1969,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const state = activeState.value;
     if (!state.sessionId || !state.currentRunId) return false;
     const pending = visiblePendingInputs(state.pendingInputs).find((input) =>
-      input.runId === state.currentRunId && pendingInputDelivery(input) !== "immediate");
+      input.runId === state.currentRunId
+      && input.status === "queued"
+      && pendingInputDelivery(input) !== "immediate");
     if (!pending) return false;
 
     try {
@@ -1984,7 +1994,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
   async function deleteQueuedFollowUp() {
     const state = activeState.value;
-    const targets = visiblePendingInputs(state.pendingInputs);
+    const targets = queuedFollowUpInputs(state.pendingInputs, state.currentRunId);
     if (!state.sessionId || targets.length === 0 || targets.some((input) => input.status === "delivering")) return false;
 
     try {
@@ -2019,7 +2029,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
   async function reEditQueuedFollowUp() {
     const state = activeState.value;
-    const targets = visiblePendingInputs(state.pendingInputs);
+    const targets = queuedFollowUpInputs(state.pendingInputs, state.currentRunId);
     if (!state.sessionId || targets.length === 0) return null;
 
     const draft = buildPendingSessionInputDraft(targets);
@@ -2306,15 +2316,12 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     }
   }
 
-  async function answerQuestion(answer: string) {
+  async function answerQuestion(answer: QuestionAnswerPayload, questionId?: string) {
     const state = activeState.value;
     const question = state.pendingQuestion;
-    if (!question) return;
-    state.pendingQuestion = null;
-    try {
-      await sessionService.answerQuestion(question.questionId, answer);
-    } catch (error) {
-      setEmbeddedError(state, normalizeAppError(error).message);
+    if (!question || (questionId && question.questionId !== questionId)) return;
+    if (await sessionService.submitQuestionForm(question, answer)) {
+      if (state.pendingQuestion?.questionId === question.questionId) state.pendingQuestion = null;
     }
   }
 
@@ -2427,6 +2434,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const isCancelling = computed(() => activeState.value.isCancelling);
   const isCompacting = computed(() => activeState.value.isCompacting);
   const compactQueued = computed(() => activeState.value.compactQueued);
+  const claudeCodePhase = computed(() => activeState.value.claudeCodePhase);
   const isThinking = computed(() => activeState.value.isThinking);
   const hasThinking = computed(() => (
     activeState.value.streamingThinking.length > 0
@@ -2465,19 +2473,11 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const pendingQuestion = computed(() => activeState.value.pendingQuestion);
   const pendingToolConfirms = computed(() => activeState.value.pendingToolConfirms);
   const queuedFollowUp = computed(() => {
-    const inputs = visiblePendingInputs(activeState.value.pendingInputs);
-    if (inputs.length === 0) return null;
-    return {
-      inputs,
-      canInsert: inputs.some((input) => pendingInputDelivery(input) !== "immediate"),
-      canEdit: inputs.every((input) => input.status === "queued"),
-      isInserting: inputs.every((input) => pendingInputDelivery(input) === "immediate"),
-      images: inputs.flatMap((input) => input.images ?? []),
-      displayText: inputs
-        .map((input) => input.displayText || input.text)
-        .filter((text) => text.trim().length > 0)
-        .join("\n"),
-    };
+    const state = activeState.value;
+    return summarizeQueuedFollowUp(
+      queuedFollowUpInputs(state.pendingInputs, state.currentRunId),
+      state.currentRunId,
+    );
   });
   const errorMessage = computed(() => activeState.value.error);
   const isLoading = computed(() => activeState.value.loading);
@@ -2567,6 +2567,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     isCompacting,
     compactQueued,
     isThinking,
+    claudeCodePhase,
     hasThinking,
     thinkingDuration,
     activeToolCalls,
