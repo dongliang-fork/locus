@@ -10,7 +10,7 @@ pub(crate) async fn execute(
     scope: NativeInvocation,
 ) -> ToolResult {
     let result = match scope.call.tool.as_str() {
-        "Write" => write(registry, &ctx, &scope).await,
+        "Write" => return write(registry, &ctx, &scope).await.unwrap_or_else(|output| ToolResult { output, is_error: true }),
         "Glob" | "Grep" => search(&ctx, &scope).await,
         "TaskOutput" | "TaskStop" => task(&ctx, &scope).await,
         _ => {
@@ -22,11 +22,9 @@ pub(crate) async fn execute(
     };
     match result {
         Ok(value) => {
-            scope.set_result(value.clone());
-            ToolResult {
-                output: value.to_string(),
-                is_error: false,
-            }
+            let output = super::native_output::render(&scope.call.tool, &value);
+            scope.set_result(value);
+            ToolResult { output, is_error: false }
         }
         Err(output) => ToolResult {
             output,
@@ -39,7 +37,7 @@ async fn write(
     registry: &ToolRegistry,
     ctx: &ToolExecutionContext,
     scope: &NativeInvocation,
-) -> Result<Value, String> {
+) -> Result<ToolResult, String> {
     let input = &scope.call.input;
     let path = ctx.resolve_path(
         input["file_path"]
@@ -76,22 +74,28 @@ async fn write(
     let actual = tokio::fs::read_to_string(&path)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(
+    scope.set_result(
         json!({"type":if original.is_some(){"update"}else{"create"},"filePath":path,
         "content":actual,"originalFile":original,"structuredPatch":[],"userModified":false}),
-    )
+    );
+    // Preserve the actual write/edit status, including generated frontmatter,
+    // knowledge sync warnings and Unity/import diagnostics.
+    Ok(result)
 }
 
 async fn search(ctx: &ToolExecutionContext, scope: &NativeInvocation) -> Result<Value, String> {
     let input = scope.call.input.clone();
     let root = ctx.resolve_path(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
     let is_glob = scope.call.tool == "Glob";
-    tokio::task::spawn_blocking(move || search_sync(&root, &input, is_glob))
+    tokio::task::spawn_blocking(move || {
+        if is_glob { glob_sync(&root, &input) }
+        else { super::native_grep::run(&root, &input) }
+    })
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn search_sync(root: &str, input: &Value, is_glob: bool) -> Result<Value, String> {
+fn glob_sync(root: &str, input: &Value) -> Result<Value, String> {
     let started = std::time::Instant::now();
     let pattern = input["pattern"].as_str().ok_or("Search requires pattern")?;
     let mut builder = ignore::WalkBuilder::new(root);
@@ -100,12 +104,8 @@ fn search_sync(root: &str, input: &Value, is_glob: bool) -> Result<Value, String
         .follow_links(false)
         .git_ignore(true)
         .git_exclude(true);
-    let glob = if is_glob {
-        Some(pattern)
-    } else {
-        input["glob"].as_str()
-    };
-    if let Some(glob) = glob {
+    {
+        let glob = pattern;
         let base = if std::path::Path::new(root).is_file() {
             std::path::Path::new(root).parent().unwrap()
         } else {
@@ -121,41 +121,6 @@ fn search_sync(root: &str, input: &Value, is_glob: bool) -> Result<Value, String
         types.select(kind);
         builder.types(types.build().map_err(|e| e.to_string())?);
     }
-    let regex = if is_glob {
-        None
-    } else {
-        Some(
-            regex::RegexBuilder::new(pattern)
-                .case_insensitive(input["-i"].as_bool().unwrap_or(false))
-                .multi_line(true)
-                .dot_matches_new_line(input["multiline"].as_bool().unwrap_or(false))
-                .build()
-                .map_err(|e| e.to_string())?,
-        )
-    };
-    let mode = input["output_mode"]
-        .as_str()
-        .unwrap_or("files_with_matches");
-    if !is_glob && !["files_with_matches", "content", "count"].contains(&mode) {
-        return Err("Invalid Grep output_mode".into());
-    }
-    let offset = input["offset"].as_u64().unwrap_or(0).min(1_000_000) as usize;
-    let limit = input["head_limit"].as_u64().unwrap_or(200) as usize;
-    let limit = if limit == 0 { 10000 } else { limit.min(10000) };
-    let context = input["-C"].as_u64().or_else(|| input["context"].as_u64());
-    let before = context
-        .or_else(|| input["-B"].as_u64())
-        .unwrap_or(0)
-        .min(1000) as usize;
-    let after = context
-        .or_else(|| input["-A"].as_u64())
-        .unwrap_or(0)
-        .min(1000) as usize;
-    let numbered = input["-n"].as_bool().unwrap_or(true);
-    let mut filenames = Vec::new();
-    let mut rows = Vec::new();
-    let mut matches = 0usize;
-    let mut scanned = 0usize;
     let mut paths = Vec::new();
     for entry in builder.build() {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -167,80 +132,11 @@ fn search_sync(root: &str, input: &Value, is_glob: bool) -> Result<Value, String
         }
     }
     paths.sort();
-    for path in paths {
-        if is_glob {
-            filenames.push(path.to_string_lossy().into_owned());
-            continue;
-        }
-        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if bytes.len() > 20 * 1024 * 1024 || bytes.contains(&0) {
-            continue;
-        }
-        scanned += 1;
-        let text = String::from_utf8_lossy(&bytes);
-        let regex = regex.as_ref().unwrap();
-        let spans: Vec<_> = regex.find_iter(&text).collect();
-        if spans.is_empty() {
-            continue;
-        }
-        let file = path.to_string_lossy().into_owned();
-        filenames.push(file.clone());
-        matches += spans.len();
-        if mode == "count" {
-            rows.push(format!("{file}:{}", spans.len()));
-            continue;
-        }
-        if mode != "content" {
-            continue;
-        }
-        let lines: Vec<_> = text.lines().collect();
-        let mut selected = std::collections::BTreeSet::new();
-        let mut matching = std::collections::HashSet::new();
-        for m in spans {
-            let first = text[..m.start()].bytes().filter(|b| *b == b'\n').count();
-            let last = text[..m.end()].bytes().filter(|b| *b == b'\n').count();
-            for line in first..=last {
-                matching.insert(line);
-            }
-            for line in
-                first.saturating_sub(before)..=(last + after).min(lines.len().saturating_sub(1))
-            {
-                selected.insert(line);
-            }
-        }
-        for line in selected {
-            if let Some(text) = lines.get(line) {
-                let sep = if matching.contains(&line) { ":" } else { "-" };
-                rows.push(if numbered {
-                    format!("{file}{sep}{}{sep}{text}", line + 1)
-                } else {
-                    format!("{file}{sep}{text}")
-                });
-            }
-        }
-        if rows.len() > 100000 {
-            return Err("Search output exceeded 100000 lines; narrow the query".into());
-        }
-    }
-    if is_glob {
-        let total = filenames.len();
-        filenames.truncate(100);
-        return Ok(
-            json!({"durationMs":started.elapsed().as_millis(),"numFiles":filenames.len(),"filenames":filenames,
-            "truncated":total>100,"totalMatches":total,"countIsComplete":true}),
-        );
-    }
-    let total_files = filenames.len();
-    let total_lines = rows.len();
-    if mode == "files_with_matches" {
-        filenames = filenames.into_iter().skip(offset).take(limit).collect();
-    }
-    let selected: Vec<_> = rows.into_iter().skip(offset).take(limit).collect();
-    Ok(
-        json!({"mode":mode,"numFiles":filenames.len(),"filenames":filenames,"content":selected.join("\n"),
-        "numLines":selected.len(),"numMatches":matches,"totalFiles":total_files,"totalLines":total_lines,
-        "appliedLimit":limit,"appliedOffset":offset,"scannedFiles":scanned}),
-    )
+    let total = paths.len();
+    let filenames: Vec<_> = paths.into_iter().take(100)
+        .map(|path| path.to_string_lossy().into_owned()).collect();
+    Ok(json!({"durationMs":started.elapsed().as_millis(),"numFiles":filenames.len(),"filenames":filenames,
+        "truncated":total>100,"totalMatches":total,"countIsComplete":true}))
 }
 
 async fn task(ctx: &ToolExecutionContext, scope: &NativeInvocation) -> Result<Value, String> {
@@ -293,11 +189,15 @@ mod tests {
         let call = super::super::native_tools::adapt("native_test", tool, &input).unwrap();
         let scope = NativeInvocation::new(call.clone(), "test_session".into());
         let registry = ToolRegistry::with_builtins();
+        let identity = crate::workspace_service::identity::ProjectIdResolver::resolve(root).unwrap();
+        let runtime = crate::workspace_service::WorkspaceRuntime::new(identity, Vec::new(), 1);
+        let execution = std::sync::Arc::new(crate::workspace_service::AgentExecutionContext::new(runtime, std::collections::HashMap::new()));
         let result = scope
             .run(registry.execute_with_context(
                 call.locus_name,
                 &call.locus_input,
                 ToolExecutionContext {
+                    execution: Some(execution),
                     working_dir: Some(root.to_string_lossy().into_owned()),
                     ..Default::default()
                 },
@@ -322,6 +222,10 @@ mod tests {
             )
             .await;
             assert!(!result.is_error, "{}", result.output);
+            assert!(!result.output.starts_with('{'), "{}", result.output);
+            assert!(!result.output.contains("new\\n"));
+            assert_eq!(raw["content"], "new\n");
+            assert_eq!(raw["originalFile"], json!(original));
             assert_eq!(
                 std::fs::read_to_string(file).unwrap().replace("\r\n", "\n"),
                 "new\n"
@@ -336,6 +240,36 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn native_knowledge_write_retains_generated_metadata_and_sync_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let input = json!({"file_path":"Locus/knowledge/plan/native.md","content":"# Plan\n"});
+        let (result, raw) = run(root.path(), "Write", input.clone()).await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("Generated frontmatter:"));
+        assert!(result.output.contains("contentStartLine:"));
+        assert!(result.output.contains("Knowledge index: Locus application context required"));
+        assert!(raw["content"].as_str().unwrap().starts_with("---\n"));
+        let call = super::super::native_tools::adapt("native_test", "Write", &input).unwrap();
+        let reply = super::super::native_tools::finish_result(&call, &result.into(), Some(raw));
+        assert!(reply["context"][0].as_str().unwrap().contains("Knowledge index:"));
+    }
+
+    #[tokio::test]
+    async fn search_metadata_tracks_the_returned_page() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..5 { std::fs::write(root.path().join(format!("{index}.txt")), "match\n").unwrap(); }
+        for mode in ["content", "count", "files_with_matches"] {
+            let (result, raw) = run(root.path(), "Grep", json!({"pattern":"match","output_mode":mode,"head_limit":1,"offset":2})).await;
+            assert!(!result.is_error, "{}", result.output);
+            assert!(result.output.starts_with("Found 5 matches in 5 files"));
+            assert_eq!(raw["totalFiles"], 5);
+            assert_eq!(raw["numFiles"], 1);
+            assert_eq!(raw["filenames"].as_array().unwrap().len(), 1);
+            assert!(raw["filenames"][0].as_str().unwrap().ends_with("2.txt"));
+        }
+    }
+
     #[tokio::test]
     async fn native_search_supports_globs_case_context_count_and_pagination() {
         let root = tempfile::tempdir().unwrap();
@@ -362,7 +296,8 @@ mod tests {
             json!({"pattern":"needle","output_mode":"count","head_limit":1}),
         )
         .await;
-        assert_eq!(count["numFiles"], 2);
+        assert_eq!(count["numFiles"], 1);
+        assert_eq!(count["totalFiles"], 2);
         assert_eq!(count["numLines"], 1);
         let (bad, _) = run(root.path(), "Grep", json!({"pattern":"["})).await;
         assert!(bad.is_error);
