@@ -8,7 +8,7 @@ import UnityEditorResources from "./UnityEditorResources.vue";
 const limits = ref<WorkspaceResourceLimits | null>(null);
 const busy = ref(false);
 const error = ref("");
-const fields = ["maxRunningSessions", "maxUnityEditors", "maxRunningWorkspaceServices", "maxWatchedWorkspaces", "maxLspProcesses", "maxConcurrentServiceStarts", "maxConcurrentCompileJobs", "serviceIdleTimeoutSecs"] as const;
+const fields = ["serviceIdleTimeoutSecs"] as const;
 function displayValue(field: typeof fields[number]) {
   const value = limits.value?.[field] ?? 1;
   return field === "serviceIdleTimeoutSecs" ? Math.ceil(value / 60) : value;

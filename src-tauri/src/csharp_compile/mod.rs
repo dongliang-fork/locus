@@ -187,12 +187,11 @@ pub fn initialize(
     enabled: bool,
     non_public_access_enabled: bool,
     app_handle: tauri::AppHandle,
-    resource_policy: std::sync::Arc<crate::resource_policy::ResourcePolicyStore>,
 ) {
     ENABLED.store(enabled, Ordering::Relaxed);
     NON_PUBLIC_ACCESS_ENABLED.store(non_public_access_enabled, Ordering::Relaxed);
     let _ = APP_HANDLE.set(app_handle);
-    scheduler::initialize(resource_policy);
+    scheduler::initialize();
 }
 
 pub fn is_enabled() -> bool {
@@ -2060,14 +2059,7 @@ mod tests {
     /// stays green on machines without the sidecar toolchain.
     #[tokio::test]
     async fn compile_raw_bcl_smoke_and_crash_recovery() {
-        let policy_dir = tempfile::tempdir().expect("compile policy dir");
-        let config = std::sync::Arc::new(crate::config::AppConfig::load_from_path(
-            &policy_dir.path().join("config.json"),
-        ));
-        scheduler::initialize(std::sync::Arc::new(
-            crate::resource_policy::ResourcePolicyStore::from_config(config)
-                .expect("compile resource policy"),
-        ));
+        scheduler::initialize();
         if manager::find_server_dll().is_none() {
             eprintln!("skip: compile server dll not built (bun run compile-server:bundle)");
             return;

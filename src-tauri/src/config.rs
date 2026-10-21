@@ -8,17 +8,11 @@ use std::sync::{Arc, Mutex};
 
 const CONFIG_FILE_NAME: &str = "config.json";
 
+/// Resource lifetime settings. Legacy count/concurrency fields are deliberately
+/// ignored on load and disappear on the next save.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceServiceResourceLimits {
-    pub max_running_sessions: usize,
-    pub max_unity_editors: usize,
-    pub max_running_workspace_services: usize,
-    pub max_watched_workspaces: usize,
-    pub max_lsp_processes: usize,
-    pub max_concurrent_service_starts: usize,
-    pub max_concurrent_compile_jobs: usize,
-    pub max_compile_queue_depth: usize,
     /// Idle TTL for checkout-owned watchers and lazily opened indexes. The
     /// checkout runtime identity remains registered for the process lifetime.
     pub workspace_idle_timeout_secs: u64,
@@ -31,14 +25,6 @@ pub struct WorkspaceServiceResourceLimits {
 impl Default for WorkspaceServiceResourceLimits {
     fn default() -> Self {
         Self {
-            max_running_sessions: 4,
-            max_unity_editors: 4,
-            max_running_workspace_services: 4,
-            max_watched_workspaces: 2,
-            max_lsp_processes: 1,
-            max_concurrent_service_starts: 2,
-            max_concurrent_compile_jobs: 1,
-            max_compile_queue_depth: 64,
             workspace_idle_timeout_secs: 600,
             service_idle_timeout_secs: 3600,
             lsp_idle_timeout_secs: 600,
@@ -80,19 +66,6 @@ impl WorkspaceServiceResourceLimits {
     pub fn validate(&self) -> Result<(), WorkspaceServiceResourceLimitsValidationErrors> {
         let mut fields = Vec::new();
 
-        fn require_positive_usize(
-            fields: &mut Vec<WorkspaceServiceResourceLimitFieldError>,
-            field: &'static str,
-            value: usize,
-        ) {
-            if value == 0 {
-                fields.push(WorkspaceServiceResourceLimitFieldError {
-                    field: field.to_string(),
-                    message: "must be greater than zero".to_string(),
-                });
-            }
-        }
-
         fn require_checked_timeout(
             fields: &mut Vec<WorkspaceServiceResourceLimitFieldError>,
             field: &'static str,
@@ -115,34 +88,6 @@ impl WorkspaceServiceResourceLimits {
             }
         }
 
-        require_positive_usize(&mut fields, "maxRunningSessions", self.max_running_sessions);
-        require_positive_usize(&mut fields, "maxUnityEditors", self.max_unity_editors);
-        require_positive_usize(
-            &mut fields,
-            "maxRunningWorkspaceServices",
-            self.max_running_workspace_services,
-        );
-        require_positive_usize(
-            &mut fields,
-            "maxWatchedWorkspaces",
-            self.max_watched_workspaces,
-        );
-        require_positive_usize(&mut fields, "maxLspProcesses", self.max_lsp_processes);
-        require_positive_usize(
-            &mut fields,
-            "maxConcurrentServiceStarts",
-            self.max_concurrent_service_starts,
-        );
-        require_positive_usize(
-            &mut fields,
-            "maxConcurrentCompileJobs",
-            self.max_concurrent_compile_jobs,
-        );
-        require_positive_usize(
-            &mut fields,
-            "maxCompileQueueDepth",
-            self.max_compile_queue_depth,
-        );
         require_checked_timeout(
             &mut fields,
             "workspaceIdleTimeoutSecs",
@@ -520,6 +465,10 @@ fn default_skill_package_namespace() -> Arc<Mutex<String>> {
     Arc::new(Mutex::new(String::new()))
 }
 
+fn default_worktree_root() -> Arc<Mutex<String>> {
+    Arc::new(Mutex::new(String::new()))
+}
+
 mod serde_workspace_service_resource_limits {
     use super::*;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -747,6 +696,11 @@ pub struct AppConfig {
         with = "serde_workspace_service_resource_limits"
     )]
     pub workspace_service_resource_limits: Arc<Mutex<WorkspaceServiceResourceLimits>>,
+    /// Base directory for new worktrees. Empty places them beside the main
+    /// repository. `--locus-worktree-root` / `LOCUS_WORKTREE_ROOT` override it
+    /// for one process without changing this persisted value.
+    #[serde(default = "default_worktree_root", with = "serde_string_mutex")]
+    pub worktree_root: Arc<Mutex<String>>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
     /// Serializes whole-file config replacements so a resource-policy update
@@ -820,6 +774,7 @@ impl AppConfig {
             subagent_max_depth: default_subagent_max_depth(),
             subagent_max_concurrent: default_subagent_max_concurrent(),
             workspace_service_resource_limits: default_workspace_service_resource_limits(),
+            worktree_root: default_worktree_root(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
             persist_lock: default_config_persist_lock(),
         };
@@ -1145,6 +1100,26 @@ impl AppConfig {
             .default_skill_package_namespace
             .lock()
             .map_err(|e| format!("default skill package namespace lock poisoned: {}", e))? = value;
+        self.persist()
+    }
+
+    /// Persisted worktree base directory; `None` when unset.
+    pub fn worktree_root(&self) -> Option<PathBuf> {
+        self.worktree_root
+            .lock()
+            .ok()
+            .map(|guard| guard.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+
+    pub fn set_worktree_root(&self, value: Option<&Path>) -> Result<(), String> {
+        *self
+            .worktree_root
+            .lock()
+            .map_err(|e| format!("worktree root lock poisoned: {}", e))? = value
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
         self.persist()
     }
 
@@ -2151,6 +2126,26 @@ mod tests {
     }
 
     #[test]
+    fn worktree_root_defaults_to_unset_and_persists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+        assert_eq!(config.worktree_root(), None);
+
+        let root = temp.path().join("worktrees");
+        config
+            .set_worktree_root(Some(&root))
+            .expect("persist worktree root");
+        assert_eq!(
+            AppConfig::load_from_path(&config_path).worktree_root(),
+            Some(root)
+        );
+
+        config.set_worktree_root(None).expect("clear worktree root");
+        assert_eq!(AppConfig::load_from_path(&config_path).worktree_root(), None);
+    }
+
+    #[test]
     fn unity_background_hook_persists_disabled() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("config.json");
@@ -2285,15 +2280,41 @@ mod tests {
                 .expect("parse persisted config");
         let limits = &persisted["workspace_service_resource_limits"];
         assert!(limits.get("maxReadyWorkspaceRuntimes").is_none());
-        assert_eq!(limits["maxRunningWorkspaceServices"], 4);
-        assert_eq!(limits["maxWatchedWorkspaces"], 2);
-        assert_eq!(limits["maxLspProcesses"], 1);
-        assert_eq!(limits["maxConcurrentServiceStarts"], 2);
-        assert_eq!(limits["maxConcurrentCompileJobs"], 1);
-        assert_eq!(limits["maxCompileQueueDepth"], 64);
         assert_eq!(limits["workspaceIdleTimeoutSecs"], 600);
         assert_eq!(limits["serviceIdleTimeoutSecs"], 3600);
         assert_eq!(limits["lspIdleTimeoutSecs"], 600);
+    }
+
+    #[test]
+    fn legacy_resource_caps_are_ignored_and_removed_without_resetting_idle_preferences() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let legacy = serde_json::json!({
+            "model": "legacy-model",
+            "dynamic_tool_loading_native_migrated": true,
+            "workspace_service_ttl_hour_migrated": true,
+            "workspace_service_resource_limits": {
+                "maxRunningSessions": 1, "maxUnityEditors": 1,
+                "maxRunningWorkspaceServices": 1, "maxWatchedWorkspaces": 1,
+                "maxLspProcesses": 1, "maxConcurrentServiceStarts": 1,
+                "maxConcurrentCompileJobs": 1, "maxCompileQueueDepth": 1,
+                "workspaceIdleTimeoutSecs": 321,
+                "serviceIdleTimeoutSecs": 900,
+                "lspIdleTimeoutSecs": 123
+            }
+        });
+        fs::write(&config_path, legacy.to_string()).unwrap();
+        let config = AppConfig::load_from_path(&config_path);
+        let expected = WorkspaceServiceResourceLimits {
+            workspace_idle_timeout_secs: 321,
+            service_idle_timeout_secs: 900,
+            lsp_idle_timeout_secs: 123,
+        };
+        assert_eq!(config.workspace_service_resource_limits(), expected);
+        config.set_debug_enabled(true).unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(persisted["workspace_service_resource_limits"], serde_json::to_value(&expected).unwrap());
+        assert_eq!(AppConfig::load_from_path(&config_path).workspace_service_resource_limits(), expected);
     }
 
     #[test]
@@ -2355,14 +2376,6 @@ mod tests {
     #[test]
     fn workspace_service_resource_limits_validation_reports_every_invalid_field() {
         let invalid = WorkspaceServiceResourceLimits {
-            max_running_sessions: 0,
-            max_unity_editors: 0,
-            max_running_workspace_services: 0,
-            max_watched_workspaces: 0,
-            max_lsp_processes: 0,
-            max_concurrent_service_starts: 0,
-            max_concurrent_compile_jobs: 0,
-            max_compile_queue_depth: 0,
             workspace_idle_timeout_secs: 0,
             service_idle_timeout_secs: 0,
             lsp_idle_timeout_secs: 0,
@@ -2376,14 +2389,6 @@ mod tests {
                 .map(|error| error.field.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "maxRunningSessions",
-                "maxUnityEditors",
-                "maxRunningWorkspaceServices",
-                "maxWatchedWorkspaces",
-                "maxLspProcesses",
-                "maxConcurrentServiceStarts",
-                "maxConcurrentCompileJobs",
-                "maxCompileQueueDepth",
                 "workspaceIdleTimeoutSecs",
                 "serviceIdleTimeoutSecs",
                 "lspIdleTimeoutSecs",
@@ -2412,7 +2417,7 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
         let before = config.workspace_service_resource_limits();
         let mut candidate = before.clone();
-        candidate.max_lsp_processes = 3;
+        candidate.lsp_idle_timeout_secs = 180;
 
         let error = config
             .set_workspace_service_resource_limits(candidate)
@@ -2431,8 +2436,8 @@ mod tests {
         let config_path = temp.path().join("config.json");
         let config = AppConfig::load_from_path(&config_path);
         let mut candidate = WorkspaceServiceResourceLimits::default();
-        candidate.max_lsp_processes = 3;
-        candidate.max_compile_queue_depth = 19;
+        candidate.lsp_idle_timeout_secs = 180;
+        candidate.service_idle_timeout_secs = 900;
 
         config
             .set_workspace_service_resource_limits(candidate.clone())

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tokio::sync::watch;
@@ -53,26 +53,6 @@ struct ResourcePolicyStoreInner {
     config: Arc<AppConfig>,
     snapshot_tx: watch::Sender<ResourcePolicySnapshot>,
     update_lock: Mutex<()>,
-    active_sessions: AtomicUsize,
-    session_notify: tokio::sync::Notify,
-}
-
-static APPLICATION_POLICY: OnceLock<Arc<ResourcePolicyStore>> = OnceLock::new();
-
-pub fn install_application_policy(policy: Arc<ResourcePolicyStore>) {
-    let _ = APPLICATION_POLICY.set(policy);
-}
-
-pub fn application_policy() -> Option<&'static Arc<ResourcePolicyStore>> { APPLICATION_POLICY.get() }
-
-/// Existing runs keep their permit when a user lowers the budget. Only new
-/// top-level runs queue; child Agents have their independent subagent budget.
-pub struct SessionBudgetPermit { policy: ResourcePolicyStore }
-impl Drop for SessionBudgetPermit {
-    fn drop(&mut self) {
-        self.policy.inner.active_sessions.fetch_sub(1, Ordering::AcqRel);
-        self.policy.inner.session_notify.notify_waiters();
-    }
 }
 
 /// Process-wide source of validated workspace-service resource policy.
@@ -113,37 +93,12 @@ impl ResourcePolicyStore {
                 config,
                 snapshot_tx,
                 update_lock: Mutex::new(()),
-                active_sessions: AtomicUsize::new(0),
-                session_notify: tokio::sync::Notify::new(),
             }),
         })
     }
 
     pub fn snapshot(&self) -> ResourcePolicySnapshot {
         self.inner.snapshot_tx.borrow().clone()
-    }
-
-    pub async fn acquire_session(&self, mut cancel: watch::Receiver<bool>) -> Result<SessionBudgetPermit, String> {
-        let mut updates = self.subscribe();
-        loop {
-            if *cancel.borrow() { return Err("Session cancelled while waiting for concurrency capacity".into()); }
-            let notified = self.inner.session_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let limit = updates.borrow_and_update().limits.max_running_sessions;
-            let active = self.inner.active_sessions.load(Ordering::Acquire);
-            if active < limit {
-                if self.inner.active_sessions.compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                    return Ok(SessionBudgetPermit { policy: self.clone() });
-                }
-                continue;
-            }
-            tokio::select! {
-                _ = &mut notified => {},
-                result = updates.changed() => { if result.is_err() { return Err("Resource policy closed".into()); } },
-                result = cancel.changed() => { if result.is_err() || *cancel.borrow() { return Err("Session cancelled while waiting for concurrency capacity".into()); } },
-            }
-        }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<ResourcePolicySnapshot> {
@@ -198,60 +153,8 @@ impl ResourcePolicyStore {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn lowering_session_limit_waits_without_revoking_existing_runs() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = Arc::new(AppConfig::load_from_path(&temp.path().join("config.json")));
-        let policy = ResourcePolicyStore::from_config(config).unwrap();
-        let mut limits = policy.configured_limits(); limits.max_running_sessions = 2;
-        policy.update(limits.clone()).unwrap();
-        let (_cancel, receiver) = watch::channel(false);
-        let first = policy.acquire_session(receiver.clone()).await.unwrap();
-        let second = policy.acquire_session(receiver.clone()).await.unwrap();
-        limits.max_running_sessions = 1; policy.update(limits).unwrap();
-        let third = policy.acquire_session(receiver.clone()); tokio::pin!(third);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut third).await.is_err());
-        drop(first);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut third).await.is_err());
-        drop(second);
-        let third = tokio::time::timeout(std::time::Duration::from_secs(1), third).await.unwrap().unwrap();
-        assert_eq!(policy.inner.active_sessions.load(Ordering::Acquire), 1);
-        drop(third);
-        assert_eq!(policy.inner.active_sessions.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
-    async fn queued_session_reacts_to_budget_increase_and_cancellation() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = Arc::new(AppConfig::load_from_path(&temp.path().join("config.json")));
-        let policy = ResourcePolicyStore::from_config(config).unwrap();
-        let mut limits = policy.configured_limits(); limits.max_running_sessions = 1;
-        policy.update(limits.clone()).unwrap();
-        let (_cancel, receiver) = watch::channel(false);
-        let first = policy.acquire_session(receiver.clone()).await.unwrap();
-        let (cancel, cancelled) = watch::channel(false);
-        let waiting = policy.acquire_session(cancelled); tokio::pin!(waiting);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting).await.is_err());
-        cancel.send(true).unwrap();
-        assert!(waiting.await.is_err());
-        assert_eq!(policy.inner.active_sessions.load(Ordering::Acquire), 1);
-        let next = policy.acquire_session(receiver); tokio::pin!(next);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut next).await.is_err());
-        limits.max_running_sessions = 2; policy.update(limits).unwrap();
-        let second = tokio::time::timeout(std::time::Duration::from_secs(1), next).await.unwrap().unwrap();
-        drop((first, second));
-    }
-
     fn changed_limits() -> WorkspaceServiceResourceLimits {
         WorkspaceServiceResourceLimits {
-            max_running_sessions: 6,
-            max_unity_editors: 6,
-            max_running_workspace_services: 6,
-            max_watched_workspaces: 3,
-            max_lsp_processes: 2,
-            max_concurrent_service_starts: 3,
-            max_concurrent_compile_jobs: 2,
-            max_compile_queue_depth: 17,
             workspace_idle_timeout_secs: 111,
             service_idle_timeout_secs: 222,
             lsp_idle_timeout_secs: 333,
@@ -269,7 +172,7 @@ mod tests {
                 "dynamic_tool_loading_native_migrated": true,
                 "workspace_service_ttl_hour_migrated": true,
                 "workspace_service_resource_limits": {
-                    "maxRunningWorkspaceServices": 0
+                    "serviceIdleTimeoutSecs": 0
                 }
             }"#,
         )
@@ -280,7 +183,7 @@ mod tests {
             .err()
             .expect("invalid persisted policy must be rejected");
         assert_eq!(errors.fields.len(), 1);
-        assert_eq!(errors.fields[0].field, "maxRunningWorkspaceServices");
+        assert_eq!(errors.fields[0].field, "serviceIdleTimeoutSecs");
     }
 
     #[tokio::test]
@@ -301,8 +204,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read persisted config"))
                 .expect("parse persisted config");
         assert_eq!(
-            persisted["workspace_service_resource_limits"]["maxLspProcesses"],
-            2
+            persisted["workspace_service_resource_limits"]["lspIdleTimeoutSecs"],
+            333
         );
         assert_eq!(store.configured_metrics().revision, 1);
     }
@@ -339,7 +242,6 @@ mod tests {
         let updates = store.subscribe();
         let before = store.snapshot();
         let mut invalid = changed_limits();
-        invalid.max_compile_queue_depth = 0;
         invalid.lsp_idle_timeout_secs = 0;
 
         let error = store
@@ -352,7 +254,7 @@ mod tests {
                 .iter()
                 .map(|field| field.field.as_str())
                 .collect::<Vec<_>>(),
-            vec!["maxCompileQueueDepth", "lspIdleTimeoutSecs"]
+            vec!["lspIdleTimeoutSecs"]
         );
         assert_eq!(store.snapshot(), before);
         assert!(!updates.has_changed().expect("watch state"));
@@ -370,6 +272,6 @@ mod tests {
             .expect("update through clone");
 
         assert_eq!(store.revision(), 1);
-        assert_eq!(store.configured_limits().max_lsp_processes, 2);
+        assert_eq!(store.configured_limits().lsp_idle_timeout_secs, 333);
     }
 }

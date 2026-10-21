@@ -133,7 +133,6 @@ pub(super) async fn run(
     policy
         .update(limits.clone())
         .map_err(|error| error.to_string())?;
-    registry.notify_policy_changed();
     let foreground = unity_bridge::managed_editor::resources()
         .await?
         .into_iter()

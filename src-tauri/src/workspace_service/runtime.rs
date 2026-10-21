@@ -1,17 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 use serde::Serialize;
-use tokio::sync::Notify;
 
 use crate::resource_policy::{ResourcePolicyStore, WorkspaceActivityPriority};
 
 use super::event::WorkspaceEventRouter;
 use super::execution::AgentExecutionContext;
-use super::identity::{CheckoutId, ProjectId, ProjectIdResolver, ResolvedWorkspaceIdentity};
+use super::identity::{
+    CheckoutId, ProjectId, ProjectIdResolver, ResolvedWorkspaceIdentity,
+};
 use super::scope::{ResolvedWorkspaceScope, WorkspaceRef, WorkspaceResolveError};
 use super::service::{ServiceBinding, ServiceKind, WorkspaceServiceFactory, WorkspaceServiceHost};
 
@@ -451,6 +452,7 @@ pub struct WorkspaceRuntime {
     normalized_root: String,
     generation: AtomicU64,
     materialization_epoch: u64,
+    managed_worktree: bool,
     materialization_lease: Mutex<Option<std::fs::File>>,
     core: WorkspaceCoreServices,
     services: Arc<WorkspaceServiceHost>,
@@ -473,6 +475,7 @@ impl WorkspaceRuntime {
             generation: AtomicU64::new(generation),
             materialization_epoch: super::worktrees::record_for_root(&identity.root)
                 .ok().flatten().map(|record| record.materialization_epoch).unwrap_or(0),
+            managed_worktree: identity.managed_worktree,
             materialization_lease: Mutex::new(None),
             core: WorkspaceCoreServices::new(&identity),
             services,
@@ -507,6 +510,12 @@ impl WorkspaceRuntime {
 
     pub fn materialization_epoch(&self) -> u64 {
         self.materialization_epoch
+    }
+
+    /// True for Locus-managed worktree checkouts. They belong to their source
+    /// project and are entered through it, never as standalone workspaces.
+    pub fn is_managed_worktree(&self) -> bool {
+        self.managed_worktree
     }
 
     pub fn core(&self) -> &WorkspaceCoreServices {
@@ -747,121 +756,44 @@ impl ProjectSessionCatalog {
     }
 }
 
-struct ServiceStartGate {
-    active: Mutex<usize>,
-    waiting: AtomicUsize,
-    notify: Notify,
-}
+#[derive(Default)]
+struct ServiceStartTracker { active: AtomicUsize }
 
-impl Default for ServiceStartGate {
-    fn default() -> Self {
-        Self {
-            active: Mutex::new(0),
-            waiting: AtomicUsize::new(0),
-            notify: Notify::new(),
-        }
+impl ServiceStartTracker {
+    fn begin(self: &Arc<Self>) -> ServiceStartPermit {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        ServiceStartPermit { tracker: Arc::clone(self) }
     }
 }
 
-impl ServiceStartGate {
-    async fn acquire(self: &Arc<Self>, policy: &ResourcePolicyStore) -> ServiceStartPermit {
-        let mut wait_registration = ServiceStartWaitRegistration {
-            gate: Arc::clone(self),
-            armed: false,
-        };
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let limit = policy.snapshot().limits.max_concurrent_service_starts;
-            {
-                let mut active = self.active.lock().expect("service start gate lock");
-                if *active < limit {
-                    *active += 1;
-                    wait_registration.disarm();
-                    return ServiceStartPermit {
-                        gate: Arc::clone(self),
-                    };
-                }
-            }
-            wait_registration.arm();
-            notified.await;
-        }
-    }
-
-    fn policy_changed(&self) {
-        self.notify.notify_waiters();
-    }
-
-    fn snapshot(&self) -> (usize, usize) {
-        (
-            self.active.lock().map(|active| *active).unwrap_or(0),
-            self.waiting.load(Ordering::Acquire),
-        )
-    }
-}
-
-struct ServiceStartWaitRegistration {
-    gate: Arc<ServiceStartGate>,
-    armed: bool,
-}
-
-impl ServiceStartWaitRegistration {
-    fn arm(&mut self) {
-        if !self.armed {
-            self.gate.waiting.fetch_add(1, Ordering::AcqRel);
-            self.armed = true;
-        }
-    }
-
-    fn disarm(&mut self) {
-        if self.armed {
-            self.gate.waiting.fetch_sub(1, Ordering::AcqRel);
-            self.armed = false;
-        }
-    }
-}
-
-impl Drop for ServiceStartWaitRegistration {
-    fn drop(&mut self) {
-        self.disarm();
-    }
-}
-
-struct ServiceStartPermit {
-    gate: Arc<ServiceStartGate>,
-}
+struct ServiceStartPermit { tracker: Arc<ServiceStartTracker> }
 
 impl Drop for ServiceStartPermit {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.gate.active.lock() {
-            *active = active.saturating_sub(1);
-        }
-        self.gate.notify.notify_waiters();
+        self.tracker.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ServiceAdmissionKey {
+struct ServiceOperationKey {
     checkout_id: CheckoutId,
     kind: ServiceKind,
 }
 
 #[derive(Default)]
-struct ServiceAdmissionState {
-    occupied: HashSet<ServiceAdmissionKey>,
-    operation_locks: HashMap<ServiceAdmissionKey, Arc<tokio::sync::Mutex<()>>>,
+struct ServiceOperationState {
+    operation_locks: HashMap<ServiceOperationKey, Arc<tokio::sync::Mutex<()>>>,
 }
 
 #[derive(Default)]
-struct ServiceAdmissionCoordinator {
-    state: Mutex<ServiceAdmissionState>,
+struct ServiceOperationCoordinator {
+    state: Mutex<ServiceOperationState>,
 }
 
-impl ServiceAdmissionCoordinator {
-    async fn lock_operation(&self, key: &ServiceAdmissionKey) -> tokio::sync::OwnedMutexGuard<()> {
+impl ServiceOperationCoordinator {
+    async fn lock_operation(&self, key: &ServiceOperationKey) -> tokio::sync::OwnedMutexGuard<()> {
         let operation_lock = {
-            let mut state = self.state.lock().expect("service admission lock");
+            let mut state = self.state.lock().expect("service operation lock");
             Arc::clone(
                 state
                     .operation_locks
@@ -872,66 +804,11 @@ impl ServiceAdmissionCoordinator {
         operation_lock.lock_owned().await
     }
 
-    fn reserve(
-        self: &Arc<Self>,
-        key: ServiceAdmissionKey,
-        limit: usize,
-    ) -> Result<ServiceCapacityReservation, String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|error| format!("service admission lock poisoned: {error}"))?;
-        if !state.occupied.contains(&key) && state.occupied.len() >= limit {
-            return Err(format!(
-                "workspace service capacity is busy (configured limit: {limit})"
-            ));
-        }
-        state.occupied.insert(key.clone());
-        Ok(ServiceCapacityReservation {
-            coordinator: Arc::clone(self),
-            key,
-            committed: false,
-        })
-    }
-
-    fn observe_running(&self, key: ServiceAdmissionKey) {
-        if let Ok(mut state) = self.state.lock() {
-            state.occupied.insert(key);
-        }
-    }
-
-    fn release(&self, key: &ServiceAdmissionKey) {
-        if let Ok(mut state) = self.state.lock() {
-            state.occupied.remove(key);
-        }
-    }
-
     fn remove_checkout(&self, checkout_id: &CheckoutId) {
         if let Ok(mut state) = self.state.lock() {
-            state.occupied.retain(|key| &key.checkout_id != checkout_id);
             state
                 .operation_locks
                 .retain(|key, _| &key.checkout_id != checkout_id);
-        }
-    }
-}
-
-struct ServiceCapacityReservation {
-    coordinator: Arc<ServiceAdmissionCoordinator>,
-    key: ServiceAdmissionKey,
-    committed: bool,
-}
-
-impl ServiceCapacityReservation {
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for ServiceCapacityReservation {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.coordinator.release(&self.key);
         }
     }
 }
@@ -955,8 +832,8 @@ pub struct ProjectRegistry {
     session_store: Arc<RwLock<Option<Arc<crate::session::store::SessionStore>>>>,
     resource_policy: Arc<ResourcePolicyStore>,
     factories: Vec<Arc<dyn WorkspaceServiceFactory>>,
-    service_start_gate: Arc<ServiceStartGate>,
-    service_admission: Arc<ServiceAdmissionCoordinator>,
+    service_start_tracker: Arc<ServiceStartTracker>,
+    service_operations: Arc<ServiceOperationCoordinator>,
     event_router: Arc<WorkspaceEventRouter>,
     runtime_registration_hooks: Mutex<Vec<RuntimeRegistrationHook>>,
     runtime_retirement_hooks: Mutex<Vec<RuntimeRetirementHook>>,
@@ -978,8 +855,8 @@ impl ProjectRegistry {
             session_store: Arc::new(RwLock::new(None)),
             resource_policy,
             factories,
-            service_start_gate: Arc::new(ServiceStartGate::default()),
-            service_admission: Arc::new(ServiceAdmissionCoordinator::default()),
+            service_start_tracker: Arc::new(ServiceStartTracker::default()),
+            service_operations: Arc::new(ServiceOperationCoordinator::default()),
             event_router: WorkspaceEventRouter::new(),
             runtime_registration_hooks: Mutex::new(Vec::new()),
             runtime_retirement_hooks: Mutex::new(Vec::new()),
@@ -1301,8 +1178,8 @@ impl ProjectRegistry {
             .map_err(|error| error.to_string())
     }
 
-    fn service_key(runtime: &WorkspaceRuntime, kind: ServiceKind) -> ServiceAdmissionKey {
-        ServiceAdmissionKey {
+    fn service_key(runtime: &WorkspaceRuntime, kind: ServiceKind) -> ServiceOperationKey {
+        ServiceOperationKey {
             checkout_id: runtime.checkout_id().clone(),
             kind,
         }
@@ -1318,7 +1195,7 @@ impl ProjectRegistry {
 
     async fn stop_service_with_idle_guard(&self,runtime:&Arc<WorkspaceRuntime>,kind:ServiceKind,require_idle:bool)->Result<(),String>{
         let key = Self::service_key(runtime, kind);
-        let _operation = self.service_admission.lock_operation(&key).await;
+        let _operation = self.service_operations.lock_operation(&key).await;
         if require_idle {
             if runtime.lease_count()!=0{return Err("Checkout became active during retirement".into());}
             for (_,_,leases,_) in runtime.services().running_snapshot().await {
@@ -1326,7 +1203,6 @@ impl ProjectRegistry {
             }
         }
         runtime.services().stop(kind).await?;
-        self.service_admission.release(&key);
         Ok(())
     }
 
@@ -1339,9 +1215,8 @@ impl ProjectRegistry {
         let mut service_bindings = HashMap::<ServiceKind, ServiceBinding>::new();
         for kind in requested_services {
             let key = Self::service_key(&workspace, *kind);
-            let _operation = self.service_admission.lock_operation(&key).await;
+            let _operation = self.service_operations.lock_operation(&key).await;
             if workspace.services().is_running(*kind).await {
-                self.service_admission.observe_running(key);
                 let binding = workspace
                     .services()
                     .bind(Arc::clone(&workspace), *kind, true)
@@ -1350,22 +1225,11 @@ impl ProjectRegistry {
                 continue;
             }
 
-            let max_running = self
-                .resource_policy
-                .snapshot()
-                .limits
-                .max_running_workspace_services;
-            let reservation = self.service_admission.reserve(key, max_running)?;
-            let _start_permit = self
-                .service_start_gate
-                .clone()
-                .acquire(&self.resource_policy)
-                .await;
+            let _start_permit = self.service_start_tracker.begin();
             let binding = workspace
                 .services()
                 .bind(Arc::clone(&workspace), *kind, true)
                 .await?;
-            reservation.commit();
             service_bindings.insert(*kind, binding);
         }
         let execution = Arc::new(AgentExecutionContext::new(workspace, service_bindings));
@@ -1402,10 +1266,6 @@ impl ProjectRegistry {
             .await
     }
 
-    pub fn notify_policy_changed(&self) {
-        self.service_start_gate.policy_changed();
-    }
-
     pub fn spawn_idle_reaper(self: &Arc<Self>) {
         let registry = Arc::clone(self);
         let mut policy_updates = self.resource_policy.subscribe();
@@ -1432,76 +1292,7 @@ impl ProjectRegistry {
     }
 
     pub async fn converge_resource_policy(&self) {
-        let limits = self.resource_policy.snapshot().limits;
-        let activity_idle_timeout =
-            std::time::Duration::from_secs(limits.workspace_idle_timeout_secs);
-        let runtimes = self.runtimes();
-        let mut running = Vec::new();
-        for runtime in &runtimes {
-            let activity = runtime.activity_snapshot(activity_idle_timeout);
-            for (kind, _, leases, idle_for) in runtime.services().running_snapshot().await {
-                running.push((Arc::clone(runtime), kind, leases, idle_for, activity));
-            }
-        }
-        running.sort_by_key(|(runtime, _, _, idle_for, activity)| {
-            (
-                activity.priority,
-                std::cmp::Reverse(*idle_for),
-                runtime.checkout_id().to_string(),
-            )
-        });
-        let mut running_count = running.len();
-        for (runtime, kind, leases, _, activity) in running {
-            if running_count <= limits.max_running_workspace_services {
-                break;
-            }
-            if leases == 0
-                && !activity.priority.protects_resources()
-                && !runtime
-                    .activity_snapshot(activity_idle_timeout)
-                    .priority
-                    .protects_resources()
-                && self.stop_service(&runtime, kind).await.is_ok()
-            {
-                running_count = running_count.saturating_sub(1);
-            }
-        }
-        self.converge_background_watcher_policy(activity_idle_timeout);
-    }
-
-    fn converge_background_watcher_policy(&self, activity_idle_timeout: std::time::Duration) {
-        let max_watched = self
-            .resource_policy
-            .snapshot()
-            .limits
-            .max_watched_workspaces;
-        let mut watched = self
-            .runtimes()
-            .into_iter()
-            .filter(|runtime| runtime.core().watchers_running())
-            .collect::<Vec<_>>();
-        watched.sort_by_key(|runtime| {
-            let activity = runtime.activity_snapshot(activity_idle_timeout);
-            (
-                activity.priority,
-                std::cmp::Reverse(activity.idle_for),
-                runtime.checkout_id().to_string(),
-            )
-        });
-        let mut count = watched.len();
-        for runtime in watched {
-            if count <= max_watched {
-                break;
-            }
-            if !runtime
-                .activity_snapshot(activity_idle_timeout)
-                .priority
-                .protects_resources()
-            {
-                runtime.core().stop_background_watchers();
-                count = count.saturating_sub(1);
-            }
-        }
+        self.reap_idle_resources().await;
     }
 
     async fn reap_idle_resources(&self) {
@@ -1604,7 +1395,7 @@ impl ProjectRegistry {
                 hook(removed.as_ref());
             }
         }
-        self.service_admission
+        self.service_operations
             .remove_checkout(removed.checkout_id());
         if let Ok(mut lease) = removed.materialization_lease.lock() {
             lease.take();
@@ -1676,16 +1467,12 @@ impl ProjectRegistry {
                 service_leases += leases;
             }
         }
-        let (service_starts_active, service_starts_waiting) = self.service_start_gate.snapshot();
+        let service_starts_active = self.service_start_tracker.active.load(Ordering::Acquire);
         WorkspaceRegistryMetrics {
-            configured_max_running_workspace_services: limits.max_running_workspace_services,
-            configured_max_concurrent_service_starts: limits.max_concurrent_service_starts,
-            configured_max_watched_workspaces: limits.max_watched_workspaces,
             registered_workspace_runtimes: self.checkout_count(),
             running_workspace_services: running_services,
             watched_workspaces,
             service_starts_active,
-            service_starts_waiting,
             workspace_leases,
             service_leases,
             running_task_workspaces,
@@ -1699,14 +1486,10 @@ impl ProjectRegistry {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRegistryMetrics {
-    pub configured_max_running_workspace_services: usize,
-    pub configured_max_concurrent_service_starts: usize,
-    pub configured_max_watched_workspaces: usize,
     pub registered_workspace_runtimes: usize,
     pub running_workspace_services: usize,
     pub watched_workspaces: usize,
     pub service_starts_active: usize,
-    pub service_starts_waiting: usize,
     pub workspace_leases: usize,
     pub service_leases: usize,
     pub running_task_workspaces: usize,
@@ -1721,7 +1504,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::config::{AppConfig, WorkspaceServiceResourceLimits};
+    use crate::config::AppConfig;
     use crate::workspace_service::service::{
         DetectionResult, PromptFragment, ServiceActivationPolicy, ServiceBindingError,
         ServiceCapabilities, ServiceContextProvider, ServiceFuture, ServiceLeaseTracker,
@@ -1922,14 +1705,9 @@ mod tests {
     fn registry(
         config_dir: &Path,
         factory: Arc<FakeServiceFactory>,
-        max_running: usize,
     ) -> Arc<ProjectRegistry> {
         let config = Arc::new(AppConfig::load_from_path(&config_dir.join("config.json")));
         let policy = Arc::new(ResourcePolicyStore::from_config(config).expect("resource policy"));
-        let mut limits = WorkspaceServiceResourceLimits::default();
-        limits.max_running_workspace_services = max_running;
-        limits.max_concurrent_service_starts = max_running.max(1);
-        policy.update(limits).expect("update resource policy");
         let factory: Arc<dyn WorkspaceServiceFactory> = factory;
         ProjectRegistry::new(policy, vec![factory])
     }
@@ -1941,7 +1719,7 @@ mod tests {
             let root = temp.path().join("中文工程");
             std::fs::create_dir_all(root.join("Locus")).unwrap();
             std::fs::write(root.join("Locus/config.json"), r#"{"workspace_id":"original"}"#).unwrap();
-            let registry = registry(temp.path(), FakeServiceFactory::immediate(), 4);
+            let registry = registry(temp.path(), FakeServiceFactory::immediate());
             let runtime = registry.open_workspace(&root).unwrap();
             let reference = WorkspaceRef::for_runtime(&runtime);
             assert!(registry.resolve_workspace_ref(&reference).is_ok());
@@ -1983,7 +1761,7 @@ mod tests {
             )
             .expect("workspace config");
         }
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 4);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let runtime_a = registry.register(&root_a).expect("checkout A");
         let runtime_b = registry.register(&root_b).expect("checkout B");
         assert_eq!(runtime_a.project_id(), runtime_b.project_id());
@@ -2111,7 +1889,7 @@ mod tests {
                 last_opened_at: 1,
             })
             .expect("persist checkout");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 1);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
 
         registry.attach_session_store(&store).expect("attach store");
 
@@ -2152,7 +1930,7 @@ mod tests {
     #[test]
     fn retirement_removes_the_project_owner_and_weak_checkout_index_together() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 1);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let runtime = registry
             .register(workspace_dir(temp.path(), "owned-checkout"))
             .expect("register runtime");
@@ -2179,7 +1957,7 @@ mod tests {
     #[test]
     fn workspace_activity_priority_distinguishes_all_retention_levels() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 1);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let runtime = registry
             .register(workspace_dir(temp.path(), "checkout"))
             .expect("register workspace");
@@ -2227,7 +2005,7 @@ mod tests {
     #[test]
     fn checkout_runtimes_own_distinct_asset_operation_state() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 2);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let runtime_a = registry
             .open_workspace(workspace_dir(temp.path(), "checkout-a"))
             .expect("runtime a");
@@ -2281,7 +2059,7 @@ mod tests {
     fn concurrent_registration_is_single_flight_and_idempotent() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::immediate();
-        let registry = registry(temp.path(), Arc::clone(&factory), 2);
+        let registry = registry(temp.path(), Arc::clone(&factory));
         let root = workspace_dir(temp.path(), "checkout");
         let barrier = Arc::new(std::sync::Barrier::new(12));
 
@@ -2312,7 +2090,7 @@ mod tests {
     #[test]
     fn registration_initializer_completes_before_publication_and_reactivates_fast_path() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 2);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let weak_registry = Arc::downgrade(&registry);
         let calls = Arc::new(AtomicUsize::new(0));
         let hook_calls = Arc::clone(&calls);
@@ -2339,7 +2117,7 @@ mod tests {
     #[test]
     fn concurrent_runtime_observers_always_see_the_complete_project_hierarchy() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 2);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let root = workspace_dir(temp.path(), "hierarchy-checkout");
         let identity = ProjectIdResolver::resolve(&root).expect("workspace identity");
         let barrier = Arc::new(std::sync::Barrier::new(33));
@@ -2392,7 +2170,7 @@ mod tests {
     #[test]
     fn retirement_joins_local_reference_workers_before_reopening_checkout() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 2);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let root = workspace_dir(temp.path(), "retired-checkout");
         let first = registry.register(&root).expect("first runtime");
         let first_generation = first.generation();
@@ -2445,7 +2223,7 @@ mod tests {
     fn knowledge_operation_state_is_stable_per_checkout_and_isolated_between_checkouts() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::immediate();
-        let registry = registry(temp.path(), factory, 2);
+        let registry = registry(temp.path(), factory);
         let runtime_a = registry
             .register(workspace_dir(temp.path(), "checkout-a"))
             .expect("register checkout a");
@@ -2479,7 +2257,7 @@ mod tests {
     fn workspace_ref_resolution_holds_a_lease_and_rejects_stale_generation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::immediate();
-        let registry = registry(temp.path(), factory, 1);
+        let registry = registry(temp.path(), factory);
         let runtime = registry
             .register(workspace_dir(temp.path(), "checkout"))
             .expect("register workspace");
@@ -2532,7 +2310,7 @@ mod tests {
     async fn activation_policy_can_be_restored_before_lazy_start() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::immediate();
-        let registry = registry(temp.path(), factory, 1);
+        let registry = registry(temp.path(), factory);
         let runtime = registry
             .register(workspace_dir(temp.path(), "checkout"))
             .expect("register workspace");
@@ -2566,7 +2344,7 @@ mod tests {
     async fn concurrent_execution_contexts_merge_one_service_start() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::blocked();
-        let registry = registry(temp.path(), Arc::clone(&factory), 1);
+        let registry = registry(temp.path(), Arc::clone(&factory));
         let runtime = registry
             .register(workspace_dir(temp.path(), "checkout"))
             .expect("register workspace");
@@ -2607,48 +2385,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn capacity_reservation_is_atomic_across_checkouts() {
+    async fn independent_checkouts_start_without_a_global_capacity_gate() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::blocked();
-        let registry = registry(temp.path(), Arc::clone(&factory), 1);
-        let first_runtime = registry
-            .register(workspace_dir(temp.path(), "first"))
-            .expect("register first");
-        let second_runtime = registry
-            .register(workspace_dir(temp.path(), "second"))
-            .expect("register second");
-
-        let first_registry = Arc::clone(&registry);
-        let first_checkout = first_runtime.checkout_id().clone();
-        let first = tokio::spawn(async move {
-            first_registry
-                .execution_context(&first_checkout, &[ServiceKind::Unity])
-                .await
-        });
-        factory.control.wait_until_entered().await;
-
-        let error = match registry
-            .execution_context(second_runtime.checkout_id(), &[ServiceKind::Unity])
-            .await
-        {
-            Ok(_) => panic!("second checkout exceeded reserved capacity"),
-            Err(error) => error,
-        };
-        assert!(
-            error.contains("capacity is busy"),
-            "unexpected error: {error}"
-        );
-        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
-
-        factory.control.release_one();
-        first.await.expect("first join").expect("first context");
+        let registry = registry(temp.path(), Arc::clone(&factory));
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let runtime = registry.register(workspace_dir(temp.path(), &format!("checkout-{index}"))).unwrap();
+            let checkout = runtime.checkout_id().clone();
+            let registry = Arc::clone(&registry);
+            tasks.push(tokio::spawn(async move {
+                registry.execution_context(&checkout, &[ServiceKind::Unity]).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..8 { factory.control.wait_until_entered().await; }
+        }).await.expect("all starts enter before any earlier start completes");
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 8);
+        assert_eq!(registry.service_start_tracker.active.load(Ordering::Acquire), 8);
+        for _ in 0..8 { factory.control.release_one(); }
+        for task in tasks { task.await.unwrap().unwrap(); }
+        assert_eq!(registry.metrics().await.running_workspace_services, 8);
+        assert_eq!(registry.metrics().await.service_starts_active, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn runtime_rebuild_and_service_restart_advance_global_generations() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::immediate();
-        let registry = registry(temp.path(), factory, 1);
+        let registry = registry(temp.path(), factory);
         let root = workspace_dir(temp.path(), "checkout");
         let first_runtime = registry.register(&root).expect("register workspace");
         let first_runtime_generation = first_runtime.generation();
@@ -2705,7 +2470,7 @@ mod tests {
     async fn execution_acquires_workspace_lease_before_start_await_and_explicit_retirement() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::blocked();
-        let registry = registry(temp.path(), Arc::clone(&factory), 2);
+        let registry = registry(temp.path(), Arc::clone(&factory));
         let active_runtime = registry
             .register(workspace_dir(temp.path(), "active"))
             .expect("register active");
@@ -2743,10 +2508,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn policy_shrink_keeps_service_with_active_tool_lease() {
+    async fn idle_policy_keeps_service_with_active_tool_lease() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::immediate();
-        let registry = registry(temp.path(), factory, 2);
+        let registry = registry(temp.path(), factory);
         let first_runtime = registry
             .register(workspace_dir(temp.path(), "first"))
             .expect("register first");
@@ -2767,11 +2532,12 @@ mod tests {
         drop(second_context);
 
         let mut limits = registry.resource_policy().snapshot().limits;
-        limits.max_running_workspace_services = 1;
+        limits.service_idle_timeout_secs = 1;
         registry
             .resource_policy()
             .update(limits)
-            .expect("shrink policy");
+            .expect("short idle timeout");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         registry.converge_resource_policy().await;
 
         assert_eq!(active_tool_lease.service.status(), ServiceStatus::Running);
@@ -2794,7 +2560,7 @@ mod tests {
     #[tokio::test]
     async fn idle_unity_service_reap_stops_service_and_keeps_workspace_runtime() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 1);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let mut limits = registry.resource_policy().snapshot().limits;
         limits.service_idle_timeout_secs = 1;
         registry.resource_policy().update(limits).expect("short idle timeout");
@@ -2821,10 +2587,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_shrink_preserves_visible_pane_service_before_background_service() {
+    async fn idle_policy_preserves_visible_pane_service_before_background_service() {
         let temp = tempfile::tempdir().expect("tempdir");
         let factory = FakeServiceFactory::immediate();
-        let registry = registry(temp.path(), factory, 2);
+        let registry = registry(temp.path(), factory);
         let visible_runtime = registry
             .register(workspace_dir(temp.path(), "visible"))
             .expect("register visible");
@@ -2847,12 +2613,13 @@ mod tests {
             .focus("main", "left", Arc::clone(&visible_runtime), 1)
             .expect("focus visible checkout");
         let mut limits = registry.resource_policy().snapshot().limits;
-        limits.max_running_workspace_services = 1;
+        limits.service_idle_timeout_secs = 1;
         registry
             .resource_policy()
             .update(limits)
-            .expect("shrink service policy");
+            .expect("short idle timeout");
 
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         registry.converge_resource_policy().await;
 
         assert!(
@@ -2874,7 +2641,7 @@ mod tests {
         use crate::knowledge_index::{KnowledgeIndexState, KnowledgeRuntime};
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 1);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let runtime = registry
             .register(workspace_dir(temp.path(), "hidden-checkout"))
             .expect("register workspace");
@@ -2926,7 +2693,7 @@ mod tests {
     #[tokio::test]
     async fn idle_resource_reap_preserves_visible_and_background_workspace_runtimes() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 1);
+        let registry = registry(temp.path(), FakeServiceFactory::immediate());
         let visible_runtime = registry
             .register(workspace_dir(temp.path(), "visible"))
             .expect("register visible");

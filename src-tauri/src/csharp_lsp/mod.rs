@@ -7,7 +7,7 @@
 //!
 //! Architecture: each active checkout owns one language-server process. The
 //! process is spawned lazily, loads that checkout's Unity-generated `.sln` /
-//! `.csproj` files via MSBuild, and is retained by a policy-driven LRU pool.
+//! `.csproj` files via MSBuild, and is retained until its idle timeout expires.
 //! Server binaries and the .NET runtime are downloaded on demand (see
 //! `assets`).
 
@@ -164,47 +164,18 @@ fn process_pool() -> Result<&'static Arc<LspProcessPool>, String> {
         .ok_or_else(|| "C# LSP process pool is not initialized".to_string())
 }
 
-fn lru_eviction_candidate(
-    entries: &HashMap<CheckoutId, Arc<LspProcessEntry>>,
-) -> Option<CheckoutId> {
-    entries
-        .iter()
-        .filter(|(_, entry)| !entry.is_retiring())
-        .filter(|(_, entry)| entry.lease_count.load(Ordering::Acquire) == 0)
-        .max_by_key(|(_, entry)| entry.idle_for())
-        .map(|(checkout_id, _)| checkout_id.clone())
-}
-
 fn convergence_candidates(
     entries: &HashMap<CheckoutId, Arc<LspProcessEntry>>,
-    limit: usize,
     idle_timeout: Duration,
-    idle_only: bool,
 ) -> Vec<CheckoutId> {
-    let mut candidates = entries
-        .iter()
+    let mut candidates = entries.iter()
         .filter(|(_, entry)| !entry.is_retiring())
         .filter(|(_, entry)| entry.lease_count.load(Ordering::Acquire) == 0)
         .map(|(checkout_id, entry)| (checkout_id.clone(), entry.idle_for()))
-        .filter(|(_, idle_for)| !idle_only || *idle_for >= idle_timeout)
+        .filter(|(_, idle_for)| *idle_for >= idle_timeout)
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, idle_for)| std::cmp::Reverse(*idle_for));
-
-    let mut active_count = entries
-        .values()
-        .filter(|entry| !entry.is_retiring())
-        .count();
-    let mut retire = Vec::new();
-    for (checkout_id, idle_for) in candidates {
-        let over_capacity = active_count > limit;
-        let idle_expired = idle_for >= idle_timeout;
-        if !over_capacity && !idle_expired {
-            continue;
-        }
-        retire.push(checkout_id);
-        active_count = active_count.saturating_sub(1);
-    }
-    retire
+    candidates.into_iter().map(|(checkout_id, _)| checkout_id).collect()
 }
 
 fn remove_retired_entry_if_current(
@@ -509,13 +480,13 @@ pub fn initialize(
                     Duration::from_secs(policy_updates.borrow().limits.lsp_idle_timeout_secs);
                 tokio::select! {
                     _ = tokio::time::sleep(idle_timeout) => {
-                        converge_lsp_pool(&pool, true).await;
+                        converge_lsp_pool(&pool).await;
                     }
                     changed = policy_updates.changed() => {
                         if changed.is_err() {
                             return;
                         }
-                        converge_lsp_pool(&pool, false).await;
+                        converge_lsp_pool(&pool).await;
                         pool.notify.notify_waiters();
                     }
                 }
@@ -666,8 +637,8 @@ pub async fn restart(workspace: &str) -> Result<(), String> {
     ensure_workspace_server(workspace).await.map(|_| ())
 }
 
-/// Acquire one checkout-exclusive language server lease. Capacity and idle
-/// eviction come from the shared resource policy.
+/// Acquire one checkout-exclusive language server lease. Other checkouts do
+/// not impose a capacity limit; unused servers expire through the idle policy.
 async fn ensure_workspace_server(workspace: &str) -> Result<LspProcessLease, String> {
     if !is_enabled() {
         return Err("C# code analysis is disabled".to_string());
@@ -708,28 +679,6 @@ async fn ensure_workspace_server(workspace: &str) -> Result<LspProcessLease, Str
                     return Err("C# language server is being recycled".to_string());
                 }
             } else {
-                let limit = pool.resource_policy.snapshot().limits.max_lsp_processes;
-                if entries.len() >= limit {
-                    if entries.values().any(|entry| entry.is_retiring()) {
-                        return Err(format!(
-                            "C# language server capacity is being recycled (configured limit: {limit})"
-                        ));
-                    }
-                    let Some(eviction) = lru_eviction_candidate(&entries) else {
-                        return Err(format!(
-                            "C# language server capacity is busy (configured limit: {limit})"
-                        ));
-                    };
-                    let evicted = entries
-                        .get(&eviction)
-                        .cloned()
-                        .expect("LRU candidate must still exist while the pool is locked");
-                    if evicted.begin_retirement() {
-                        retirement = Some(evicted);
-                    } else {
-                        return Err("C# language server capacity is being recycled".to_string());
-                    }
-                } else {
                     let server = WorkspaceServer::new(root.clone());
                     let entry = Arc::new(LspProcessEntry {
                         checkout_id: checkout_id.clone(),
@@ -752,7 +701,6 @@ async fn ensure_workspace_server(workspace: &str) -> Result<LspProcessLease, Str
                     entry.set_startup_task(startup_task);
                     entries.insert(checkout_id.clone(), Arc::clone(&entry));
                     lease = Some(entry.acquire());
-                }
             }
         }
 
@@ -767,12 +715,12 @@ async fn ensure_workspace_server(workspace: &str) -> Result<LspProcessLease, Str
     }
 }
 
-async fn converge_lsp_pool(pool: &Arc<LspProcessPool>, idle_only: bool) {
+async fn converge_lsp_pool(pool: &Arc<LspProcessPool>) {
     let limits = pool.resource_policy.snapshot().limits;
     let idle_timeout = Duration::from_secs(limits.lsp_idle_timeout_secs);
     let retiring = {
         let entries = pool.entries.lock().await;
-        convergence_candidates(&entries, limits.max_lsp_processes, idle_timeout, idle_only)
+        convergence_candidates(&entries, idle_timeout)
             .into_iter()
             .filter_map(|checkout_id| entries.get(&checkout_id).cloned())
             .filter(|entry| entry.begin_retirement())
@@ -2003,7 +1951,6 @@ pub struct LspProcessEntryMetrics {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LspProcessPoolMetrics {
-    pub configured_max_processes: usize,
     pub configured_idle_timeout_secs: u64,
     pub process_count: usize,
     pub waiting_count: usize,
@@ -2013,7 +1960,6 @@ pub struct LspProcessPoolMetrics {
 pub async fn pool_metrics() -> LspProcessPoolMetrics {
     let Ok(pool) = process_pool() else {
         return LspProcessPoolMetrics {
-            configured_max_processes: 0,
             configured_idle_timeout_secs: 0,
             process_count: 0,
             waiting_count: 0,
@@ -2033,7 +1979,6 @@ pub async fn pool_metrics() -> LspProcessPoolMetrics {
         })
         .collect::<Vec<_>>();
     LspProcessPoolMetrics {
-        configured_max_processes: limits.max_lsp_processes,
         configured_idle_timeout_secs: limits.lsp_idle_timeout_secs,
         process_count: entries.len(),
         waiting_count: 0,
@@ -2352,7 +2297,7 @@ mod tests {
 
     use super::{
         build_status, convergence_candidates, document_diagnostics, is_unity_managed_csharp_file,
-        lru_eviction_candidate, remove_retired_entry_if_current, LspProcessEntry, Phase,
+        remove_retired_entry_if_current, LspProcessEntry, Phase,
         WorkspaceServer,
     };
     use crate::workspace_service::CheckoutId;
@@ -2387,7 +2332,7 @@ mod tests {
         let entries = entry_map(&[Arc::clone(&entry)]);
 
         assert_eq!(entry.lease_count.load(Ordering::Acquire), 1);
-        assert_eq!(lru_eviction_candidate(&entries), None);
+        assert!(convergence_candidates(&entries, Duration::ZERO).is_empty());
 
         let _ = entry.server.phase_tx.send(Phase::Ready);
         lease.wait_startup_finished().await;
@@ -2396,8 +2341,8 @@ mod tests {
         drop(lease);
         assert_eq!(entry.lease_count.load(Ordering::Acquire), 0);
         assert_eq!(
-            lru_eviction_candidate(&entries),
-            Some(entry.checkout_id.clone())
+            convergence_candidates(&entries, Duration::ZERO),
+            vec![entry.checkout_id.clone()]
         );
     }
 
@@ -2432,7 +2377,7 @@ mod tests {
     }
 
     #[test]
-    fn lru_eviction_skips_leased_and_retiring_generations() {
+    fn idle_reaper_skips_leased_and_retiring_generations() {
         let leased = test_entry("checkout-leased", 1, Duration::from_secs(90));
         let retiring = test_entry("checkout-retiring", 2, Duration::from_secs(60));
         let eligible = test_entry("checkout-eligible", 3, Duration::from_secs(30));
@@ -2445,13 +2390,13 @@ mod tests {
         ]);
 
         assert_eq!(
-            lru_eviction_candidate(&entries),
-            Some(eligible.checkout_id.clone())
+            convergence_candidates(&entries, Duration::ZERO),
+            vec![eligible.checkout_id.clone()]
         );
     }
 
     #[test]
-    fn policy_shrink_retires_idle_lru_entries_and_preserves_leases() {
+    fn idle_reaper_preserves_active_leases() {
         let leased_a = test_entry("checkout-leased-a", 1, Duration::from_secs(120));
         let leased_b = test_entry("checkout-leased-b", 2, Duration::from_secs(110));
         let idle = test_entry("checkout-idle", 3, Duration::from_secs(100));
@@ -2463,7 +2408,7 @@ mod tests {
             Arc::clone(&idle),
         ]);
 
-        let candidates = convergence_candidates(&entries, 1, Duration::from_secs(1_000), false);
+        let candidates = convergence_candidates(&entries, Duration::from_secs(60));
 
         assert_eq!(candidates, vec![idle.checkout_id.clone()]);
         assert!(!candidates.contains(&leased_a.checkout_id));
@@ -2471,7 +2416,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_shrink_uses_idle_lru_order_until_the_new_limit_is_met() {
+    fn idle_reaper_retires_only_expired_entries_in_idle_order() {
         let oldest = test_entry("checkout-oldest", 1, Duration::from_secs(90));
         let middle = test_entry("checkout-middle", 2, Duration::from_secs(60));
         let newest = test_entry("checkout-newest", 3, Duration::from_secs(30));
@@ -2481,7 +2426,7 @@ mod tests {
             Arc::clone(&newest),
         ]);
 
-        let candidates = convergence_candidates(&entries, 1, Duration::from_secs(1_000), false);
+        let candidates = convergence_candidates(&entries, Duration::from_secs(60));
 
         assert_eq!(
             candidates,
@@ -2495,7 +2440,7 @@ mod tests {
         let young = test_entry("checkout-young", 2, Duration::from_secs(10));
         let entries = entry_map(&[Arc::clone(&expired), Arc::clone(&young)]);
 
-        let candidates = convergence_candidates(&entries, 1, Duration::from_secs(60), true);
+        let candidates = convergence_candidates(&entries, Duration::from_secs(60));
 
         assert_eq!(candidates, vec![expired.checkout_id.clone()]);
         assert!(!candidates.contains(&young.checkout_id));

@@ -1794,7 +1794,6 @@ pub async fn launch_project_with_mode_and_options(
     let project_version = read_project_unity_version(project_path)?
         .ok_or_else(|| "Current Unity project is missing ProjectVersion.txt".to_string())?;
     let editor_path = resolve_unity_editor_executable(&project_version)?;
-    let _editor_admission = process::admit_editor_launch().await?;
     let project_path = normalized_project_path_for_launch(project_path);
     let editor_log_path = project_path.join("Logs").join("Editor.log");
     if let Some(parent) = editor_log_path.parent() {

@@ -8,9 +8,7 @@ vi.mock("../i18n", () => ({ t: (key: string) => key }));
 vi.mock("../services/worktrees", () => ({ getWorkspaceResourceLimits: vi.fn(), setWorkspaceResourceLimits: vi.fn(), getUnityEditorResources: vi.fn().mockResolvedValue([]) }));
 
 const limits: WorkspaceResourceLimits = {
-  maxRunningSessions: 4, maxUnityEditors: 3, maxRunningWorkspaceServices: 4,
-  maxWatchedWorkspaces: 8, maxLspProcesses: 4, maxConcurrentServiceStarts: 2,
-  maxConcurrentCompileJobs: 2, maxCompileQueueDepth: 17, workspaceIdleTimeoutSecs: 421,
+  workspaceIdleTimeoutSecs: 421,
   serviceIdleTimeoutSecs: 422, lspIdleTimeoutSecs: 423,
 };
 let app: App | undefined;
@@ -31,8 +29,8 @@ beforeEach(async () => {
 });
 afterEach(() => { app?.unmount(); root.remove(); });
 
-describe("workspace concurrency settings", () => {
-  it("saves idle minutes as seconds while preserving concurrency limits", async () => {
+describe("workspace resource lifetime settings", () => {
+  it("saves idle minutes as seconds while preserving other idle preferences", async () => {
     vi.mocked(setWorkspaceResourceLimits).mockImplementation(async (updated) => ({ revision: 2, limits: updated }));
     const inputs = root.querySelectorAll<HTMLInputElement>('input');
     const input = inputs[inputs.length - 1]!;
@@ -41,19 +39,18 @@ describe("workspace concurrency settings", () => {
     await settle();
     expect(setWorkspaceResourceLimits).toHaveBeenCalledWith({ ...limits, serviceIdleTimeoutSecs: 900 });
   });
-  it("changes the requested budget without resetting hidden queue and idle budgets", async () => {
-    vi.mocked(setWorkspaceResourceLimits).mockImplementation(async (updated) => ({ revision: 2, limits: updated }));
-    await change("7");
-    expect(setWorkspaceResourceLimits).toHaveBeenCalledWith({ ...limits, maxRunningSessions: 7 });
-    expect(root.querySelector<HTMLInputElement>("input")!.value).toBe("7");
+  it("shows the idle timeout without any concurrency controls", () => {
+    expect(root.querySelectorAll('input')).toHaveLength(1);
+    expect(root.querySelector('label')?.textContent).toContain('settings.resources.serviceIdleTimeoutSecs');
+    expect(root.textContent).not.toContain('settings.resources.max');
   });
-  it("does not send fractional, empty or zero concurrency values", async () => {
-    for (const value of ["1.5", "", "0", "-2"]) expect((await change(value)).value).toBe("4");
+  it("does not send fractional, empty or zero idle minutes", async () => {
+    for (const value of ["1.5", "", "0", "-2"]) expect((await change(value)).value).toBe("8");
     expect(setWorkspaceResourceLimits).not.toHaveBeenCalled();
   });
   it("restores the effective limit after persistence fails and permits retry", async () => {
     vi.mocked(setWorkspaceResourceLimits).mockRejectedValueOnce(new Error("configuration write failed"));
-    expect((await change("8")).value).toBe("4");
+    expect((await change("9")).value).toBe("8");
     expect(root.querySelector('[role="alert"]')?.textContent).toContain("configuration write failed");
     vi.mocked(setWorkspaceResourceLimits).mockImplementationOnce(async (updated) => ({ revision: 2, limits: updated }));
     expect((await change("6")).value).toBe("6");

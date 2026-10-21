@@ -166,37 +166,6 @@ pub async fn close_current_project_unity_processes(
     close_current_project_unity_processes_inner(project_path, timeout, false).await
 }
 
-/// Admission is separate from service monitors: an Editor keeps consuming its
-/// slot until its actual process exits. Lowering the policy never closes it.
-pub(super) async fn admit_editor_launch() -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
-    static ADMISSION: Mutex<()> = Mutex::const_new(());
-    let guard = ADMISSION.lock().await;
-    let Some(policy) = crate::resource_policy::application_policy() else { return Ok(guard); };
-    let mut changes = policy.subscribe();
-    loop {
-        let limit = changes.borrow_and_update().limits.max_unity_editors;
-        let count = tokio::task::spawn_blocking(main_editor_process_count).await.map_err(|e| e.to_string())??;
-        if count < limit { return Ok(guard); }
-        tokio::select! {
-            result = changes.changed() => { if result.is_err() { return Err("Editor resource policy closed".into()); } },
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {},
-        }
-    }
-}
-
-#[cfg(windows)]
-fn main_editor_process_count() -> Result<usize, String> {
-    Ok(query_unity_processes()?.iter().filter(|process| {
-        !process.command_line.as_deref().is_some_and(|line| unity_process_args_are_worker(&split_windows_command_line(line)))
-    }).count())
-}
-
-#[cfg(not(windows))]
-fn main_editor_process_count() -> Result<usize, String> {
-    // Windows is the supported launch-budget provider for this release.
-    Ok(0)
-}
-
 pub async fn force_close_current_project_unity_processes(
     project_path: &str,
     timeout: Duration,
