@@ -544,3 +544,112 @@ fn prepare_performance_baseline() {
         );
     }
 }
+
+/// Prefixes the plain `m_Name` values at the given line offsets.
+fn renamed(text: &str, offsets: &[usize], prefix: &str) -> String {
+    let mut out = String::with_capacity(text.len() + offsets.len() * prefix.len());
+    let mut cursor = 0;
+    for &at in offsets {
+        out.push_str(&text[cursor..at]);
+        out.push_str(prefix);
+        cursor = at;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// What one merge of a real asset costs the agent, end to end. Set
+/// LOCUS_MERGE_BENCH_FILES to `;`-separated Unity YAML paths (read only; the
+/// bytes are copied into a temporary repository). The destination renames the
+/// first object, the source renames a middle and the last one, so the plan is
+/// clean and every phase does real work on the whole file.
+#[test]
+#[ignore = "manual benchmark over real assets; prints MERGE_REAL_BENCH lines"]
+fn real_asset_merge_benchmark() {
+    let Ok(list) = std::env::var("LOCUS_MERGE_BENCH_FILES") else {
+        eprintln!("LOCUS_MERGE_BENCH_FILES is not set");
+        return;
+    };
+    for file in list.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        let text = String::from_utf8(std::fs::read(file).unwrap()).unwrap();
+        let marker = "\n  m_Name: ";
+        // Plain names get the prefix in front; Unity's double-quoted
+        // (`\u`-escaped) names get it inside the quotes.
+        let names: Vec<usize> = text
+            .match_indices(marker)
+            .map(|(at, _)| at + marker.len())
+            .filter_map(|at| match text[at..].chars().next() {
+                Some('"') => Some(at + 1),
+                Some(c) if c.is_ascii_alphanumeric() => Some(at),
+                _ => None,
+            })
+            .collect();
+        assert!(names.len() >= 3, "{file}: needs three m_Name values");
+        let target = renamed(&text, &names[..1], "Target");
+        let source = renamed(&text, &[names[names.len() / 2], names[names.len() - 1]], "Source");
+        let name = Path::new(file).file_name().unwrap().to_string_lossy().into_owned();
+        let path = format!("Assets/{name}");
+        let repo = repo_with(&[(&path, &text)]);
+        let commit = repo.commit_files(&[(&path, Some(&source))]);
+        std::fs::write(repo.root.join(&path), &target).unwrap();
+
+        let timed = |f: &mut dyn FnMut()| {
+            let start = Instant::now();
+            f();
+            start.elapsed().as_millis()
+        };
+        let mut session = None;
+        let core_prepare = timed(&mut || {
+            session = Some(crate::unity_asset_core::prepare_merge(text.as_bytes(), target.as_bytes(), source.as_bytes()).unwrap())
+        });
+        let session = session.unwrap();
+        let decisions: Vec<_> = session
+            .catalog()
+            .changes
+            .iter()
+            .map(|c| crate::unity_asset_core::Decision { change_id: c.id.clone(), resolution: crate::unity_asset_core::Resolution::Include })
+            .collect();
+        let mut rendered = None;
+        let core_render = timed(&mut || rendered = Some(session.render(&decisions).unwrap()));
+        let rendered = rendered.unwrap();
+        assert!(rendered.ready, "{file}: {:?}", rendered.conflicts);
+
+        let mut job = None;
+        let prepare_ms = timed(&mut || {
+            job = Some(
+                prepare(
+                    &repo.root,
+                    &PrepareRequest {
+                        sources: vec![SourceSelection { commits: vec![commit.clone()], ..Default::default() }],
+                        paths: Some(vec![path.clone()]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            )
+        });
+        let job = job.unwrap();
+        let mut bytes = 0usize;
+        let mut call = |action: &str, params: Value| {
+            let start = Instant::now();
+            let value = execute(&repo.root, &job.id, action, params).unwrap();
+            bytes += value.to_string().len();
+            (start.elapsed().as_millis(), value)
+        };
+        let (changes_ms, changes) = call("changes", json!({"limit":1000}));
+        let (include_ms, _) = call("include", json!({"path":path}));
+        let (preview_ms, preview) = call("preview", json!({}));
+        let (repeat_preview_ms, _) = call("preview", json!({}));
+        assert_eq!(preview["ready_to_apply"], true, "{file}: {}", preview["issues"]);
+        let (apply_ms, _) = call("apply", json!({"expected_plan_hash":preview["plan_hash"]}));
+        let merged = std::fs::read_to_string(repo.root.join(&path)).unwrap();
+        assert!(merged == renamed(&source, &names[..1], "Target"), "{file}: merged bytes differ from the expected union");
+        std::println!(
+            "MERGE_REAL_BENCH {}",
+            json!({"file":name,"bytes":text.len(),"documents":text.matches("\n--- !u!").count() + 1,
+                "changes":changes["total"],"core_prepare_ms":core_prepare,"core_render_ms":core_render,
+                "prepare_ms":prepare_ms,"prepare_phases":job.prepare_metrics,"changes_ms":changes_ms,"include_ms":include_ms,
+                "preview_ms":preview_ms,"repeat_preview_ms":repeat_preview_ms,"apply_ms":apply_ms,"response_bytes":bytes})
+        );
+    }
+}

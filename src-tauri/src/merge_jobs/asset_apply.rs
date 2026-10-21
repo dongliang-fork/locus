@@ -94,13 +94,22 @@ pub(super) fn try_apply(root: &Path, dir: &Path, job: &MergeJob) -> Result<bool,
             };
         }
     };
-    if !runtime.block_on(crate::unity_bridge::is_unity_connected(&job.project_root)) {
-        runtime.block_on(crate::unity_assets::require_closed_editor(Path::new(
-            &job.project_root,
-        )))?;
+    // Hosts call this from spawn_blocking, where waiting is plain blocking. A
+    // caller still on a multi-thread worker hands its core off instead of
+    // panicking with a nested block_on.
+    if !tokio::task::block_in_place(|| {
+        runtime.block_on(crate::unity_bridge::is_unity_connected(&job.project_root))
+    }) {
+        tokio::task::block_in_place(|| {
+            runtime.block_on(crate::unity_assets::require_closed_editor(Path::new(
+                &job.project_root,
+            )))
+        })?;
         return Ok(false);
     }
-    let response = runtime.block_on(crate::unity_bridge::asset_api(&job.project_root, &request))?;
+    let response = tokio::task::block_in_place(|| {
+        runtime.block_on(crate::unity_bridge::asset_api(&job.project_root, &request))
+    })?;
     if response["applied"].as_bool() != Some(true) || response["persisted"].as_bool() != Some(true)
     {
         return Err(

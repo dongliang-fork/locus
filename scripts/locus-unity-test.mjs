@@ -116,6 +116,7 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite connect
   bun run locus:test:unity -- --project F:\\Game --suite worktrees --install-plugin
   bun run locus:test:unity -- --project F:\\OwnedCheckout --suite asset-merge --install-plugin
+  bun run locus:test:unity -- --project F:\\OwnedCheckout --suite asset-merge-matrix --install-plugin
   bun run locus:test:unity -- --project F:\\OwnedCheckout --suite asset-api --install-plugin
   bun run locus:test:unity -- --driver-binary F:\\Builds\\driver\\locus.exe --project F:\\OwnedCheckout --suite asset-api --install-plugin
   bun run locus:test:unity -- --project F:\\OwnedCheckout --suite project-pool --install-plugin
@@ -140,11 +141,12 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite yaml-parity --yaml-parity-samples 8
 
 Driver options:
-  --suite <name>              headless-development | worktrees | worktree-sdk | asset-merge | asset-api | project-pool | workspace | workspace-switch | session-undo | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | recompile-import | execute | frame-debugger | python-sdk | property-sdk-read | modal-dialog | safe-mode | yaml-parity | unity-test | all
+  --suite <name>              headless-development | worktrees | worktree-sdk | asset-merge | asset-merge-matrix | asset-api | project-pool | workspace | workspace-switch | session-undo | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | recompile-import | execute | frame-debugger | python-sdk | property-sdk-read | modal-dialog | safe-mode | yaml-parity | unity-test | all
                                headless-development creates an isolated worktree and verifies C# edits, tests, Editor reuse, idle TTL and process memory
                                frame-debugger diagnoses capture, paused unity_execute and event-data readiness
                                hot-reload-release runs Release first, then switches to Debug at runtime and runs again
                                every CLI driver run enables Locus Debug mode inside its isolated config
+                               asset-merge-matrix merges Unity-authored Prefab, SerializeReference, list and scene cases and checks them by reimport
                                asset-api runs alone: offline YAML, Editor-coordinated YAML, live Editor and native View SDK parity
   --workspace-project <path>  Additional Unity project for a single-process workspace suite; repeat as needed
   --type-index-sample <mode>  sample32 | all, default sample32

@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::validation::{path_child, pptr, scalar_text};
+use super::identity::{decoded_scalar, identity_fingerprint, ListIdentity};
+use super::validation::{path_child, pptr};
 use super::{
-    parse, validate, Asset, CoreError, Diagnostic, Document, Entry, Node, NodeKind, Severity, Span,
+    parse, validate, Asset, CoreError, Diagnostic, Document, Entry, Item, Node, NodeKind, Severity,
+    Span,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,8 +120,18 @@ pub struct MergeOutput {
 #[derive(Debug, Clone, Copy)]
 enum RegionKind {
     Value,
+    /// Complete block-mapping entry lines.
     Entry,
+    /// Complete block-sequence element lines, including its `- ` marker.
+    Item,
     Document,
+}
+
+impl RegionKind {
+    /// Whole-line regions that can be deleted, inserted or reindented.
+    fn lines(self) -> bool {
+        matches!(self, RegionKind::Entry | RegionKind::Item)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,16 +146,30 @@ struct Region {
 struct Point<'a> {
     node: &'a Node,
     entry: Option<&'a Entry>,
+    item: Option<&'a Item>,
     parent: Option<&'a Node>,
 }
 
-impl Point<'_> {
+impl<'a> Point<'a> {
+    fn root(node: &'a Node) -> Self {
+        Point { node, entry: None, item: None, parent: None }
+    }
+    fn in_sequence(item: &'a Item, parent: &'a Node) -> Self {
+        Point { node: &item.value, entry: None, item: Some(item), parent: Some(parent) }
+    }
     fn region(self) -> Region {
-        let entry = self.entry.filter(|_| self.parent.is_some_and(|p| !p.flow));
+        let block_parent = self.parent.is_some_and(|p| !p.flow);
+        let entry = self.entry.filter(|_| block_parent);
+        let item = self.item.filter(|_| block_parent);
         Region {
-            span: entry.map(|e| e.span).unwrap_or(self.node.span),
+            span: entry
+                .map(|e| e.span)
+                .or(item.map(|i| i.span))
+                .unwrap_or(self.node.span),
             kind: if entry.is_some() {
                 RegionKind::Entry
+            } else if item.is_some() {
+                RegionKind::Item
             } else {
                 RegionKind::Value
             },
@@ -151,6 +177,18 @@ impl Point<'_> {
             key: self.entry.map(|e| e.key.clone()),
         }
     }
+}
+
+/// An entry/element region that starts after other content on its line, such
+/// as the first field of a `- ` sequence element, cannot be removed alone.
+pub(super) fn starts_line(bytes: &[u8], position: usize) -> bool {
+    position == 0 || bytes[position - 1] == b'\n'
+}
+
+/// Content for a field or element that the target does not contain yet.
+enum Insertion<'a> {
+    Value(&'a serde_json::Value),
+    Copy(&'a Asset, Region),
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +206,8 @@ struct Patch {
     id: String,
     object_id: String,
     path: String,
+    /// Fills an empty scalar on its existing line rather than adding lines.
+    inline: bool,
 }
 
 /// An immutable snapshot triple. Creating/revising a plan never edits its input.
@@ -508,7 +548,7 @@ impl MergeSession {
                 if matches!(decision.resolution, Resolution::Target) {
                     continue;
                 }
-                patches.push(self.explicit_field_patch(&object_id, &path, decision)?);
+                patches.extend(self.explicit_field_patch(&object_id, &path, decision)?);
                 continue;
             }
             if let Some(object_id) = decision.change_id.strip_prefix("$object:") {
@@ -554,6 +594,7 @@ impl MergeSession {
                     id: decision.change_id.clone(),
                     object_id: object_id.into(),
                     path: String::new(),
+                    inline: false,
                 });
                 continue;
             }
@@ -615,13 +656,10 @@ impl MergeSession {
                 .map(|r| r.indent)
                 .or_else(|| stored.insertion.map(|(_, i)| i))
                 .unwrap_or(0);
-            if matches!(decision.resolution, Resolution::Delete)
-                && stored
-                    .target
-                    .as_ref()
-                    .is_some_and(|r| matches!(r.kind, RegionKind::Value))
-            {
-                return Err(CoreError::new("delete_scope","delete a complete block field/object or explicitly select the enclosing flow mapping",span.start));
+            if matches!(decision.resolution, Resolution::Delete) {
+                if let Some(region) = stored.target.as_ref() {
+                    self.check_deletable(region)?;
+                }
             }
             let bytes = if let Resolution::Set { value } = &decision.resolution {
                 let region = stored
@@ -637,39 +675,73 @@ impl MergeSession {
                         0,
                     ));
                 }
-                let rendered = json_yaml(value)?;
-                if matches!(region.kind, RegionKind::Entry) {
-                    let key = region
-                        .key
-                        .as_ref()
-                        .ok_or_else(|| CoreError::new("set_key", "typed field has no key", 0))?;
-                    format!(
-                        "{}{}: {}{}",
-                        " ".repeat(indent),
-                        yaml_key(key),
-                        rendered,
-                        self.target.newline
-                    )
-                    .into_bytes()
-                } else {
-                    rendered.into_bytes()
+                if stored.target.is_some() {
+                    if let Some(point) = point_at(&self.target, &change.object_id, &change.property_path)? {
+                        for (span, bytes, inline) in self.set_value(point, value, &change.property_path)? {
+                            patches.push(Patch {
+                                span,
+                                bytes,
+                                id: change.id.clone(),
+                                object_id: change.object_id.clone(),
+                                path: change.property_path.clone(),
+                                inline,
+                            });
+                        }
+                        continue;
+                    }
+                }
+                match region.kind {
+                    RegionKind::Entry => {
+                        let key = region
+                            .key
+                            .as_ref()
+                            .ok_or_else(|| CoreError::new("set_key", "typed field has no key", 0))?;
+                        format!(
+                            "{}{}: {}{}",
+                            " ".repeat(indent),
+                            yaml_key(key),
+                            json_yaml_unity(value, true)?,
+                            self.target.newline
+                        )
+                        .into_bytes()
+                    }
+                    RegionKind::Item => super::set_patch::Patcher::new(&self.target)
+                        .render_item(value, indent, None)?
+                        .into_bytes(),
+                    _ => json_yaml_unity(value, false)?.into_bytes(),
                 }
             } else if let Some((asset, region)) = chosen {
                 let bytes = region.span.bytes(&asset.bytes);
-                if matches!(region.kind, RegionKind::Entry) {
+                if region.kind.lines() {
                     reindent(bytes, region.indent, indent, self.target.newline)
                 } else {
-                    bytes.to_vec()
+                    with_newline(bytes, self.target.newline)
                 }
             } else {
                 Vec::new()
             };
+            if bytes.is_empty()
+                && stored.target.as_ref().is_some_and(|region| {
+                    matches!(region.kind, RegionKind::Entry)
+                        && !starts_line(&self.target.bytes, region.span.start)
+                })
+            {
+                conflicts.push(Conflict {
+                    change_id: change.id.clone(),
+                    object_id: change.object_id.clone(),
+                    property_path: change.property_path.clone(),
+                    code: "delete_scope".into(),
+                    message: "this removes the first field of a sequence element, which shares its '- ' line; take or set the whole element instead".into(),
+                });
+                continue;
+            }
             patches.push(Patch {
                 span,
                 bytes,
                 id: change.id.clone(),
                 object_id: change.object_id.clone(),
                 path: change.property_path.clone(),
+                inline: false,
             });
         }
         // Ascending stable order means independent additions at the same end
@@ -699,8 +771,10 @@ impl MergeSession {
             bytes.extend_from_slice(&self.target.bytes[cursor..patch.span.start]);
             // Appending fields/documents to files without a terminal newline
             // must not concatenate the previous token and the new key/header.
+            // Inline fills (a value after an empty `key:`) stay on their line.
             if patch.span.start == patch.span.end
                 && !patch.bytes.is_empty()
+                && !patch.inline
                 && !bytes.is_empty()
                 && !bytes.ends_with(b"\n")
             {
@@ -708,18 +782,23 @@ impl MergeSession {
             }
             bytes.extend_from_slice(&patch.bytes);
             cursor = patch.span.end;
-            ids.push(patch.id);
+            if !ids.contains(&patch.id) {
+                ids.push(patch.id);
+            }
         }
         bytes.extend_from_slice(&self.target.bytes[cursor..]);
         self.finish(bytes, conflicts, ids)
     }
 
+    /// Address a target field even when the source catalog has no delta for it.
+    /// Sequence elements are whole-line regions: they can be deleted, copied
+    /// from a snapshot, or inserted at their identity/index position.
     fn explicit_field_patch(
         &self,
         object_id: &str,
         path: &str,
         decision: &Decision,
-    ) -> Result<Patch, CoreError> {
+    ) -> Result<Vec<Patch>, CoreError> {
         if path.is_empty() {
             return Err(CoreError::new(
                 "field_scope",
@@ -730,70 +809,42 @@ impl MergeSession {
         let target = point_at(&self.target, object_id, path)?;
         let (parent_path, key) = split_pointer(path)?;
         let parent = point_at(&self.target, object_id, &parent_path)?;
-        let region = if let Some(point) = target {
-            point.region()
-        } else {
-            let parent = parent.ok_or_else(|| {
-                CoreError::new(
-                    "missing_parent",
-                    "field insertion requires an existing target parent mapping",
-                    0,
-                )
-            })?;
-            if parent.node.flow || parent.node.entries().is_none() {
-                return Err(CoreError::new(
-                    "insert_scope",
-                    "insert requires a block mapping; set the complete flow mapping instead",
-                    parent.node.span.start,
-                ));
-            }
-            Region {
-                span: Span::new(parent.node.span.end, parent.node.span.end),
-                kind: RegionKind::Entry,
-                indent: parent.node.indent,
-                key: Some(key.clone()),
-            }
+        let patch = |span: Span, bytes: Vec<u8>, inline: bool| Patch {
+            span,
+            bytes,
+            id: decision.change_id.clone(),
+            object_id: object_id.into(),
+            path: path.into(),
+            inline,
         };
-        let bytes = match &decision.resolution {
+        let missing_parent = || {
+            CoreError::new(
+                "missing_parent",
+                "field insertion requires an existing target parent mapping or block sequence",
+                0,
+            )
+        };
+        match &decision.resolution {
             Resolution::Set { value } => {
-                let rendered = json_yaml(value)?;
-                if matches!(region.kind, RegionKind::Entry) {
-                    let first_prefix = if region.span.start < region.span.end {
-                        self.target.bytes[region.span.start..region.span.end]
-                            .iter()
-                            .take_while(|b| **b == b' ')
-                            .count()
-                    } else {
-                        region.indent
-                    };
-                    format!(
-                        "{}{}: {}{}",
-                        " ".repeat(first_prefix),
-                        yaml_key(&key),
-                        rendered,
-                        self.target.newline
-                    )
-                    .into_bytes()
-                } else {
-                    rendered.into_bytes()
+                if let Some(point) = target {
+                    return Ok(self
+                        .set_value(point, value, path)?
+                        .into_iter()
+                        .map(|(span, bytes, inline)| patch(span, bytes, inline))
+                        .collect());
                 }
+                let parent = parent.ok_or_else(missing_parent)?;
+                let (at, bytes) =
+                    self.insertion(object_id, parent, &parent_path, &key, Insertion::Value(value))?;
+                Ok(vec![patch(Span::new(at, at), bytes, false)])
             }
             Resolution::Delete => {
-                if target.is_none() {
-                    return Err(CoreError::new(
-                        "unknown_field",
-                        "cannot delete a missing target field",
-                        0,
-                    ));
-                }
-                if !matches!(region.kind, RegionKind::Entry) {
-                    return Err(CoreError::new(
-                        "delete_scope",
-                        "delete a complete block entry or set the enclosing flow mapping",
-                        region.span.start,
-                    ));
-                }
-                Vec::new()
+                let point = target.ok_or_else(|| {
+                    CoreError::new("unknown_field", "cannot delete a missing target field", 0)
+                })?;
+                let region = point.region();
+                self.check_deletable(&region)?;
+                Ok(vec![patch(region.span, Vec::new(), false)])
             }
             Resolution::Source | Resolution::Base => {
                 let asset = if matches!(decision.resolution, Resolution::Source) {
@@ -809,16 +860,26 @@ impl MergeSession {
                     )
                 })?;
                 let chosen_region = chosen.region();
-                if matches!(region.kind, RegionKind::Entry)
-                    != matches!(chosen_region.kind, RegionKind::Entry)
-                {
+                let Some(point) = target else {
+                    let parent = parent.ok_or_else(missing_parent)?;
+                    let (at, bytes) = self.insertion(
+                        object_id,
+                        parent,
+                        &parent_path,
+                        &key,
+                        Insertion::Copy(asset, chosen_region),
+                    )?;
+                    return Ok(vec![patch(Span::new(at, at), bytes, false)]);
+                };
+                let region = point.region();
+                if region.kind.lines() != chosen_region.kind.lines() {
                     return Err(CoreError::new(
                         "field_representation",
                         "field representation differs; choose its parent or provide a typed value",
                         region.span.start,
                     ));
                 }
-                if matches!(region.kind, RegionKind::Entry) {
+                let bytes = if region.kind.lines() {
                     reindent(
                         chosen_region.span.bytes(&asset.bytes),
                         chosen_region.indent,
@@ -826,24 +887,208 @@ impl MergeSession {
                         self.target.newline,
                     )
                 } else {
-                    chosen_region.span.bytes(&asset.bytes).to_vec()
-                }
+                    with_newline(chosen_region.span.bytes(&asset.bytes), self.target.newline)
+                };
+                Ok(vec![patch(region.span, bytes, false)])
             }
-            _ => {
-                return Err(CoreError::new(
-                    "field_resolution",
-                    "explicit fields require set, delete, source, target, or base",
-                    0,
-                ))
-            }
+            _ => Err(CoreError::new(
+                "field_resolution",
+                "explicit fields require set, delete, source, target, or base",
+                0,
+            )),
+        }
+    }
+
+    /// Minimal typed write of an existing target node.
+    fn set_value(
+        &self,
+        point: Point<'_>,
+        value: &serde_json::Value,
+        path: &str,
+    ) -> Result<Vec<(Span, Vec<u8>, bool)>, CoreError> {
+        use super::set_patch::{Holder, Patcher};
+        let parent_flow = point.parent.is_some_and(|p| p.flow);
+        let (holder, flow) = if parent_flow {
+            (Holder::Inline, true)
+        } else if let Some(entry) = point.entry {
+            (Holder::Entry(entry), false)
+        } else if let Some(item) = point.item {
+            (Holder::Item(item), false)
+        } else {
+            (Holder::Inline, point.node.flow)
         };
-        Ok(Patch {
-            span: region.span,
-            bytes,
-            id: decision.change_id.clone(),
-            object_id: object_id.into(),
-            path: path.into(),
-        })
+        let identity = match (point.parent, point.entry) {
+            (Some(parent), Some(entry)) => super::identity::identity_scalar(parent, &entry.key),
+            _ => false,
+        };
+        let mut patcher = Patcher::new(&self.target);
+        // The addressed scalar itself is written as typed (strings quoted);
+        // scalars changed inside an addressed container keep their style.
+        patcher.set(point.node, holder, value, path, flow, identity, true)?;
+        Ok(patcher.patches)
+    }
+
+    fn check_deletable(&self, region: &Region) -> Result<(), CoreError> {
+        match region.kind {
+            RegionKind::Entry | RegionKind::Item
+                if starts_line(&self.target.bytes, region.span.start) =>
+            {
+                Ok(())
+            }
+            RegionKind::Entry => Err(CoreError::new(
+                "delete_scope",
+                "this is the first field of a sequence element and shares its '- ' line; delete or replace the element itself (its parent path) instead",
+                region.span.start,
+            )),
+            RegionKind::Document => Err(CoreError::new(
+                "delete_scope",
+                "use objects.delete for a complete Unity object",
+                region.span.start,
+            )),
+            _ => Err(CoreError::new(
+                "delete_scope",
+                "values inside a flow collection ({...} or [...]) cannot be deleted individually; set the enclosing flow value instead",
+                region.span.start,
+            )),
+        }
+    }
+
+    /// Bytes and position for a field/element absent from the target.
+    fn insertion(
+        &self,
+        object_id: &str,
+        parent: Point<'_>,
+        parent_path: &str,
+        key: &str,
+        source: Insertion<'_>,
+    ) -> Result<(usize, Vec<u8>), CoreError> {
+        let newline = self.target.newline;
+        let representation = || {
+            CoreError::new(
+                "field_representation",
+                "field representation differs; choose its parent or provide a typed value",
+                parent.node.span.start,
+            )
+        };
+        match &parent.node.kind {
+            NodeKind::Mapping(_) if !parent.node.flow => {
+                let indent = parent.node.indent;
+                let bytes = match source {
+                    Insertion::Value(value) => format!(
+                        "{}{}: {}{}",
+                        " ".repeat(indent),
+                        yaml_key(key),
+                        json_yaml_unity(value, true)?,
+                        newline
+                    )
+                    .into_bytes(),
+                    Insertion::Copy(asset, region) => {
+                        if !matches!(region.kind, RegionKind::Entry) {
+                            return Err(representation());
+                        }
+                        reindent(region.span.bytes(&asset.bytes), region.indent, indent, newline)
+                    }
+                };
+                Ok((parent.node.span.end, bytes))
+            }
+            NodeKind::Sequence(items) if !parent.node.flow => {
+                let indent = parent.node.indent;
+                let end = items
+                    .last()
+                    .map(|i| i.span.end)
+                    .unwrap_or(parent.node.span.end);
+                let at = if key.starts_with('@') {
+                    let target_keys = sequence_keys(&self.target, parent.node, parent_path)
+                        .ok_or_else(|| {
+                            CoreError::new(
+                                "insert_scope",
+                                "the target sequence has no stable element identity; address elements by index",
+                                parent.node.span.start,
+                            )
+                        })?;
+                    let target_index: HashMap<String, usize> = target_keys
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, k)| (k, i))
+                        .collect();
+                    match &source {
+                        Insertion::Copy(asset, _) => {
+                            let chosen_keys = point_at(asset, object_id, parent_path)?
+                                .and_then(|p| sequence_keys(asset, p.node, parent_path))
+                                .unwrap_or_default();
+                            match chosen_keys.iter().position(|k| k == key) {
+                                Some(position) => {
+                                    sequence_insertion(
+                                        &chosen_keys,
+                                        position,
+                                        &target_index,
+                                        items,
+                                        parent.node,
+                                    )
+                                    .0
+                                }
+                                None => end,
+                            }
+                        }
+                        Insertion::Value(value) => {
+                            let identity = super::identity::json_sequence_keys(
+                                parent_path,
+                                std::slice::from_ref(*value),
+                            );
+                            if identity
+                                .as_deref()
+                                .and_then(|keys| keys.first())
+                                .map(String::as_str)
+                                != Some(key)
+                            {
+                                return Err(CoreError::new(
+                                    "identity_mismatch",
+                                    "the value's own identity (target/propertyPath, rid, or fileID) does not match the addressed element",
+                                    parent.node.span.start,
+                                ));
+                            }
+                            end
+                        }
+                    }
+                } else {
+                    let index: usize = key.parse().map_err(|_| {
+                        CoreError::new(
+                            "property_path",
+                            "sequence elements are addressed by index or identity selector",
+                            0,
+                        )
+                    })?;
+                    if index > items.len() {
+                        return Err(CoreError::new(
+                            "array_index",
+                            format!(
+                                "index {index} is out of bounds for array length {} (insertion at length is allowed)",
+                                items.len()
+                            ),
+                            parent.node.span.start,
+                        ));
+                    }
+                    items.get(index).map(|i| i.span.start).unwrap_or(end)
+                };
+                let bytes = match source {
+                    Insertion::Value(value) => super::set_patch::Patcher::new(&self.target)
+                        .render_item(value, indent, items.first().map(|i| &i.value))?
+                        .into_bytes(),
+                    Insertion::Copy(asset, region) => {
+                        if !matches!(region.kind, RegionKind::Item) {
+                            return Err(representation());
+                        }
+                        reindent(region.span.bytes(&asset.bytes), region.indent, indent, newline)
+                    }
+                };
+                Ok((at, bytes))
+            }
+            _ => Err(CoreError::new(
+                "insert_scope",
+                "insertion requires a block mapping or block sequence parent; set the complete flow value instead",
+                parent.node.span.start,
+            )),
+        }
     }
 
     fn finish(
@@ -950,21 +1195,10 @@ impl Builder<'_, '_> {
                 return self.node(
                     id,
                     "",
-                    Some(Point {
-                        node: &b.root,
-                        entry: None,
-                        parent: None,
-                    }),
-                    Some(Point {
-                        node: &t.root,
-                        entry: None,
-                        parent: None,
-                    }),
-                    Some(Point {
-                        node: &s.root,
-                        entry: None,
-                        parent: None,
-                    }),
+                    Some(Point::root(&b.root)),
+                    Some(Point::root(&t.root)),
+                    Some(Point::root(&s.root)),
+                    None,
                     None,
                 );
             }
@@ -976,7 +1210,11 @@ impl Builder<'_, '_> {
         } else {
             ChangeKind::ModifyObject
         };
-        let status = if base.is_none() && target.is_some() && source.is_some() {
+        // A stripped document is the proxy of an object inside a prefab
+        // instance; Unity derives its fileID from the instance and source
+        // object, so identical proxies added on both sides are one object.
+        let same_proxy = docs_equal(target, source) && target.is_some_and(|d| d.stripped);
+        let status = if base.is_none() && target.is_some() && source.is_some() && !same_proxy {
             ChangeStatus::Conflict
         } else if docs_equal(target, source) {
             ChangeStatus::AlreadyApplied
@@ -985,8 +1223,16 @@ impl Builder<'_, '_> {
         } else {
             ChangeStatus::Conflict
         };
+        let reason = match (base.is_some(), target.is_some(), source.is_some()) {
+            (false, true, true) if !same_proxy => "both sides added an object with this fileID; choose one with resolve side='source' or 'target'",
+            (true, false, true) => "the destination deleted this object while the source modified it; resolve side='source' to restore it or 'target' to keep it deleted",
+            (true, true, false) => "the source deleted this object while the destination modified it; resolve side='source' to delete it or 'target' to keep it",
+            (false, _, true) => "the source added this object",
+            (true, _, false) => "the source deleted this object",
+            _ => "the object's class or stripped state changed; choose the complete object",
+        };
         let id_hash = change_id(id, "", base.map(|d| &d.root), source.map(|d| &d.root));
-        self.catalog.changes.push(Change { id:id_hash,object_id:id.into(),property_path:String::new(),kind,status,reason:Some("object addition/deletion, class identity, or stripped state requires an object-level decision".into()),base:base.map(|d|summary(self.base,&d.root)),target:target.map(|d|summary(self.target,&d.root)),source:source.map(|d|summary(self.source,&d.root)) });
+        self.catalog.changes.push(Change { id:id_hash,object_id:id.into(),property_path:String::new(),kind,status,reason:Some(reason.into()),base:base.map(|d|summary(self.base,&d.root)),target:target.map(|d|summary(self.target,&d.root)),source:source.map(|d|summary(self.source,&d.root)) });
         let region = |d: &Document| Region {
             span: d.span,
             kind: RegionKind::Document,
@@ -1002,6 +1248,77 @@ impl Builder<'_, '_> {
         Ok(())
     }
 
+    /// Identity-keyed three-way merge of block sequences. Each element is an
+    /// independent change: additions, deletions and element edits from either
+    /// side combine, and only same-element disagreements conflict.
+    #[allow(clippy::too_many_arguments)]
+    fn keyed_sequence(
+        &mut self,
+        object_id: &str,
+        path: &str,
+        (b, bk): (&Node, &[String]),
+        (t, tk): (&Node, &[String]),
+        (s, sk): (&Node, &[String]),
+    ) -> Result<(), CoreError> {
+        let (Some(bi), Some(ti), Some(si)) = (b.items(), t.items(), s.items()) else {
+            return Ok(());
+        };
+        let index = |keys: &[String]| -> HashMap<String, usize> {
+            keys.iter().enumerate().map(|(i, k)| (k.clone(), i)).collect()
+        };
+        let (bmap, tmap, smap) = (index(bk), index(tk), index(sk));
+        // A managed reference is only used through the fields that point to it;
+        // name them so a restore can bring the pointer along.
+        let registry = path.ends_with("/references/RefIds");
+        let pointers = |asset: &Asset, key: &str| -> String {
+            let Some(rid) = key.strip_prefix("@rid=").filter(|_| registry) else {
+                return String::new();
+            };
+            let found = rid_pointers(asset, object_id, rid);
+            if found.is_empty() {
+                String::new()
+            } else {
+                format!(" (pointed to by {})", found.join(", "))
+            }
+        };
+        for (position, key) in sk.iter().enumerate() {
+            let base = bmap.get(key).map(|&i| Point::in_sequence(&bi[i], b));
+            let target = tmap.get(key).map(|&i| Point::in_sequence(&ti[i], t));
+            let source = Some(Point::in_sequence(&si[position], s));
+            let insertion = target
+                .is_none()
+                .then(|| sequence_insertion(sk, position, &tmap, ti, t));
+            let reason = match (base.is_some(), target.is_some()) {
+                (true, false) if registry => Some(format!(
+                    "the destination deleted this managed reference while the source modified it; to restore it, resolve side='source' and also take the source fields that point to it{}; 'target' keeps it deleted",
+                    pointers(self.source, key)
+                )),
+                (true, false) => Some("the destination deleted this element while the source modified it; resolve side='source' to restore the source element or 'target' to keep it deleted".into()),
+                (false, true) => Some("both sides added this element with different content; resolve side='source' or 'target', or set it explicitly".into()),
+                _ => None,
+            };
+            self.node(object_id, &path_child(path, key), base, target, source, insertion, reason)?;
+        }
+        for (position, key) in bk.iter().enumerate() {
+            if smap.contains_key(key) {
+                continue;
+            }
+            let base = Some(Point::in_sequence(&bi[position], b));
+            let target = tmap.get(key).map(|&i| Point::in_sequence(&ti[i], t));
+            let reason = if registry {
+                format!(
+                    "the source deleted this managed reference while the destination modified it{}; resolve side='source' to delete it or 'target' to keep the destination version",
+                    pointers(self.target, key)
+                )
+            } else {
+                "the source deleted this element while the destination modified it; resolve side='source' to delete it or 'target' to keep the destination element".into()
+            };
+            self.node(object_id, &path_child(path, key), base, target, None, None, Some(reason))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn node(
         &mut self,
         object_id: &str,
@@ -1010,6 +1327,7 @@ impl Builder<'_, '_> {
         target: Option<Point<'_>>,
         source: Option<Point<'_>>,
         insertion: Option<(usize, usize)>,
+        context_reason: Option<String>,
     ) -> Result<(), CoreError> {
         if points_equal(base, source) {
             return Ok(());
@@ -1057,6 +1375,7 @@ impl Builder<'_, '_> {
                             tchild,
                             schild,
                             Some((t.node.span.end, t.node.indent)),
+                            None,
                         )?;
                     }
                     return Ok(());
@@ -1085,29 +1404,39 @@ impl Builder<'_, '_> {
                             self.node(
                                 object_id,
                                 &path_child(path, key),
-                                Some(Point {
-                                    node: &bi[i].value,
-                                    entry: None,
-                                    parent: Some(b.node),
-                                }),
-                                Some(Point {
-                                    node: &ti[i].value,
-                                    entry: None,
-                                    parent: Some(t.node),
-                                }),
-                                Some(Point {
-                                    node: &si[i].value,
-                                    entry: None,
-                                    parent: Some(s.node),
-                                }),
+                                Some(Point::in_sequence(&bi[i], b.node)),
+                                Some(Point::in_sequence(&ti[i], t.node)),
+                                Some(Point::in_sequence(&si[i], s.node)),
+                                None,
                                 None,
                             )?;
                         }
                         return Ok(());
                     }
-                    reason=Some(if identity_collision{"both snapshots independently introduced the same managed-reference rid; explicitly choose or remap the complete identity closure"}else{"identity sequence membership/order changed; explicit whole-sequence resolution preserves order and graph closure"}.into());
+                    let unordered = ListIdentity::of(path).is_some_and(ListIdentity::unordered);
+                    let reordered = !unordered && relative_order_changed(&bk, &sk);
+                    // Elements are patched into the destination's block list. An
+                    // empty base (Unity writes `[]`) only contributes no elements.
+                    let block = (!b.node.flow || bi.is_empty()) && !t.node.flow && !s.node.flow;
+                    if !identity_collision && !reordered && block {
+                        return self.keyed_sequence(
+                            object_id,
+                            path,
+                            (b.node, &bk),
+                            (t.node, &tk),
+                            (s.node, &sk),
+                        );
+                    }
+                    reason = Some(if identity_collision {
+                        "both snapshots independently introduced the same managed-reference rid; explicitly choose or remap the complete identity closure"
+                    } else if reordered {
+                        "the source reordered identity elements whose order is significant; choose the complete sequence (resolve side='source' or 'target')"
+                    } else {
+                        "identity sequence membership changed in a flow/empty sequence; choose the complete sequence (resolve side='source' or 'target')"
+                    }
+                    .into());
                 } else {
-                    reason=Some("sequence has no proven unique Unity identity; positional pairing would be ambiguous".into());
+                    reason = Some(identityless_reason(b.node, t.node, s.node).into());
                 }
             }
         }
@@ -1120,6 +1449,11 @@ impl Builder<'_, '_> {
         } else {
             ChangeStatus::Conflict
         };
+        if reason.is_none() && status == ChangeStatus::Conflict {
+            reason = Some(context_reason.unwrap_or_else(|| {
+                "the destination and the source changed this value differently; resolve side='source', 'target' or 'base', or set a typed value".into()
+            }));
+        }
         let kind = if base.is_none() {
             ChangeKind::AddField
         } else if source.is_none() {
@@ -1199,11 +1533,7 @@ fn point_at<'a>(
     let Some(doc) = asset.document(object_id) else {
         return Ok(None);
     };
-    let mut point = Point {
-        node: &doc.root,
-        entry: None,
-        parent: None,
-    };
+    let mut point = Point::root(&doc.root);
     if path.is_empty() {
         return Ok(Some(point));
     }
@@ -1225,6 +1555,7 @@ fn point_at<'a>(
                 point = Point {
                     node: &entry.value,
                     entry: Some(entry),
+                    item: None,
                     parent: Some(point.node),
                 };
             }
@@ -1238,11 +1569,7 @@ fn point_at<'a>(
                 let Some(item) = index.and_then(|i| items.get(i)) else {
                     return Ok(None);
                 };
-                point = Point {
-                    node: &item.value,
-                    entry: None,
-                    parent: Some(point.node),
-                };
+                point = Point::in_sequence(item, point.node);
             }
             _ => return Ok(None),
         }
@@ -1316,8 +1643,96 @@ fn entry_point<'a>(entry: Option<&&'a Entry>, parent: &'a Node) -> Option<Point<
     entry.map(|entry| Point {
         node: &entry.value,
         entry: Some(*entry),
+        item: None,
         parent: Some(parent),
     })
+}
+
+/// The next step for a list whose elements carry no Unity identity, by what
+/// the two sides did to it.
+fn identityless_reason(base: &Node, target: &Node, source: &Node) -> &'static str {
+    let prints = |node: &Node| {
+        node.items()
+            .map(|items| items.iter().map(|item| item.value.fingerprint).collect::<Vec<_>>())
+    };
+    match (prints(base), prints(target), prints(source)) {
+        (Some(b), Some(t), Some(s)) if t.len() > b.len() && s.len() > b.len() && t.starts_with(&b) && s.starts_with(&b) => {
+            "both sides appended to a list whose elements have no Unity identity, so the combined order is ambiguous; keep one side with resolve, or fields.set this path to the combined list (the destination's elements, then the source's new ones)"
+        }
+        (Some(b), Some(t), Some(s)) if b.len() == t.len() && b.len() == s.len() => {
+            "both sides edited elements of a list whose elements have no Unity identity; resolve one side, then fields.take the other side's changed element paths (this path followed by /<index>)"
+        }
+        _ => "the list's elements have no Unity identity, so pairing them by position would be ambiguous; choose a side with resolve, or fields.set the complete list",
+    }
+}
+
+/// Paths in one object that hold a `{rid: N}` pointer to a managed reference.
+fn rid_pointers(asset: &Asset, object_id: &str, rid: &str) -> Vec<String> {
+    fn walk(asset: &Asset, node: &Node, path: &str, rid: &str, found: &mut Vec<String>) {
+        if found.len() >= 5 {
+            return;
+        }
+        if super::identity::managed_reference(node) {
+            if node.get("rid").and_then(|n| decoded_scalar(asset, n)).as_deref() == Some(rid) {
+                found.push(path.to_string());
+            }
+            return;
+        }
+        match &node.kind {
+            NodeKind::Mapping(entries) => {
+                for entry in entries {
+                    walk(asset, &entry.value, &path_child(path, &entry.key), rid, found);
+                }
+            }
+            NodeKind::Sequence(items) => {
+                let keys = sequence_keys(asset, node, path);
+                for (index, item) in items.iter().enumerate() {
+                    let key = keys.as_ref().map(|k| k[index].clone()).unwrap_or_else(|| index.to_string());
+                    walk(asset, &item.value, &path_child(path, &key), rid, found);
+                }
+            }
+            NodeKind::Scalar(_) => {}
+        }
+    }
+    let mut found = Vec::new();
+    if let Some(doc) = asset.document(object_id) {
+        walk(asset, &doc.root, "", rid, &mut found);
+    }
+    found
+}
+
+/// Whether the elements two snapshots share appear in a different relative order.
+pub(super) fn relative_order_changed(a: &[String], b: &[String]) -> bool {
+    let in_a: HashSet<&String> = a.iter().collect();
+    let in_b: HashSet<&String> = b.iter().collect();
+    let left: Vec<&String> = a.iter().filter(|k| in_b.contains(k)).collect();
+    let right: Vec<&String> = b.iter().filter(|k| in_a.contains(k)).collect();
+    left != right
+}
+
+/// Where a chosen element enters a target block sequence: after the nearest
+/// preceding element (in the chosen order) that the target also contains,
+/// otherwise before the nearest following one, otherwise at the end.
+pub(super) fn sequence_insertion(
+    chosen_keys: &[String],
+    position: usize,
+    target_index: &HashMap<String, usize>,
+    target_items: &[Item],
+    target: &Node,
+) -> (usize, usize) {
+    let at = chosen_keys[..position]
+        .iter()
+        .rev()
+        .find_map(|key| target_index.get(key))
+        .map(|&i| target_items[i].span.end)
+        .or_else(|| {
+            chosen_keys[position + 1..]
+                .iter()
+                .find_map(|key| target_index.get(key))
+                .map(|&i| target_items[i].span.start)
+        })
+        .unwrap_or_else(|| target_items.last().map(|i| i.span.end).unwrap_or(target.span.end));
+    (at, target.indent)
 }
 fn change_id(object_id: &str, path: &str, base: Option<&Node>, source: Option<&Node>) -> String {
     let mut hash = blake3::Hasher::new();
@@ -1356,54 +1771,47 @@ fn summary(asset: &Asset, node: &Node) -> ValueSummary {
     }
 }
 
+/// Stable element identities. Identity text is decoded, so a quoted and a
+/// plain spelling of the same propertyPath/rid/fileID address one element.
 pub(crate) fn sequence_keys(asset: &Asset, node: &Node, path: &str) -> Option<Vec<String>> {
+    let kind = ListIdentity::of(path)?;
     let items = node.items()?;
     let mut keys = Vec::with_capacity(items.len());
     let mut seen = HashSet::new();
+    let text = |node: Option<&Node>| node.and_then(|n| decoded_scalar(asset, n));
+    let file_id = |node: Option<&Node>| node.filter(|n| pptr(n)).and_then(|n| text(n.get("fileID")));
     for item in items {
-        let key = if path.ends_with("/references/RefIds") {
-            let rid = item.value.get("rid").and_then(|n| scalar_text(asset, n))?;
-            if rid.parse::<i64>().is_err() {
-                return None;
+        let key = match kind {
+            ListIdentity::Rid => {
+                let rid = text(item.value.get("rid"))?;
+                if rid.parse::<i64>().is_err() {
+                    return None;
+                }
+                format!("@rid={rid}")
             }
-            format!("@rid={rid}")
-        } else if path.ends_with("/m_Modifications") {
-            let target = item.value.get("target")?;
-            if !pptr(target) {
-                return None;
+            ListIdentity::Override => {
+                let target = item.value.get("target")?;
+                if !pptr(target) {
+                    return None;
+                }
+                let property = text(item.value.get("propertyPath"))?;
+                format!(
+                    "@override={}:{}",
+                    blake3::Hash::from_bytes(identity_fingerprint(asset, target)).to_hex(),
+                    property
+                )
             }
-            let property = item
-                .value
-                .get("propertyPath")
-                .and_then(|n| scalar_text(asset, n))?;
-            format!(
-                "@override={}:{}",
-                blake3::Hash::from_bytes(target.fingerprint).to_hex(),
-                property
-            )
-        } else if path.ends_with("/m_Component") {
-            let component = item.value.get("component")?;
-            if !pptr(component) {
-                return None;
+            ListIdentity::Added => format!("@added={}", file_id(item.value.get("addedObject"))?),
+            ListIdentity::Removed => {
+                let guid = match item.value.get("guid") {
+                    Some(guid) => text(Some(guid))?,
+                    None => String::new(),
+                };
+                format!("@removed={guid}:{}", file_id(Some(&item.value))?)
             }
-            format!(
-                "@component={}",
-                component
-                    .get("fileID")
-                    .and_then(|n| scalar_text(asset, n))?
-            )
-        } else if path.ends_with("/m_Children") {
-            if !pptr(&item.value) {
-                return None;
-            }
-            format!(
-                "@child={}",
-                item.value
-                    .get("fileID")
-                    .and_then(|n| scalar_text(asset, n))?
-            )
-        } else {
-            return None;
+            ListIdentity::Component => format!("@component={}", file_id(item.value.get("component"))?),
+            ListIdentity::Child => format!("@child={}", file_id(Some(&item.value))?),
+            ListIdentity::Root => format!("@root={}", file_id(Some(&item.value))?),
         };
         if !seen.insert(key.clone()) {
             return None;
@@ -1413,9 +1821,28 @@ pub(crate) fn sequence_keys(asset: &Asset, node: &Node, path: &str) -> Option<Ve
     Some(keys)
 }
 
+/// Convert copied bytes to the destination's line ending. Git blobs are LF
+/// while Windows working files may be CRLF; mixed endings are never produced.
+fn with_newline(bytes: &[u8], newline: &str) -> Vec<u8> {
+    let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
+    let has_lf = bytes
+        .iter()
+        .enumerate()
+        .any(|(i, b)| *b == b'\n' && (i == 0 || bytes[i - 1] != b'\r'));
+    if (newline == "\n" && !has_crlf) || (newline == "\r\n" && !has_lf) {
+        return bytes.to_vec();
+    }
+    let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    if newline == "\n" {
+        text.into_bytes()
+    } else {
+        text.replace('\n', "\r\n").into_bytes()
+    }
+}
+
 fn reindent(bytes: &[u8], old: usize, new: usize, newline: &str) -> Vec<u8> {
     if old == new {
-        return bytes.to_vec();
+        return with_newline(bytes, newline);
     }
     let text = std::str::from_utf8(bytes).expect("validated UTF-8");
     let mut out = String::new();
@@ -1437,7 +1864,7 @@ fn reindent(bytes: &[u8], old: usize, new: usize, newline: &str) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn yaml_key(key: &str) -> String {
+pub(super) fn yaml_key(key: &str) -> String {
     if key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         key.into()
     } else {
@@ -1445,20 +1872,38 @@ fn yaml_key(key: &str) -> String {
     }
 }
 pub(crate) fn json_yaml(value: &serde_json::Value) -> Result<String, CoreError> {
+    render_json(value, None)
+}
+
+/// Unity-style rendering for merge writes: unambiguous text stays plain (as
+/// Unity writes it) and every other string is double-quoted. `block_context`
+/// is true for an entry/element value; nested values are flow context.
+pub(crate) fn json_yaml_unity(
+    value: &serde_json::Value,
+    block_context: bool,
+) -> Result<String, CoreError> {
+    render_json(value, Some(!block_context))
+}
+
+/// `plain_flow`: `None` quotes every string; `Some(flow)` writes safe text plain.
+fn render_json(value: &serde_json::Value, plain_flow: Option<bool>) -> Result<String, CoreError> {
     // JSON is a safe subset of flow YAML for Unity's structural fields. Reject
     // numbers outside JSON's finite representation in the caller/JSON decoder.
+    let nested = plain_flow.map(|_| true);
     match value {
         serde_json::Value::Null => Ok("null".into()),
         serde_json::Value::Bool(b) => Ok(if *b { "1" } else { "0" }.into()),
         serde_json::Value::Number(n) => Ok(n.to_string()),
-        serde_json::Value::String(s) => {
-            serde_json::to_string(s).map_err(|e| CoreError::new("typed_value", e.to_string(), 0))
-        }
+        serde_json::Value::String(s) => match plain_flow {
+            Some(flow) => Ok(super::identity::new_string(s, flow)),
+            None => serde_json::to_string(s)
+                .map_err(|e| CoreError::new("typed_value", e.to_string(), 0)),
+        },
         serde_json::Value::Array(items) => Ok(format!(
             "[{}]",
             items
                 .iter()
-                .map(json_yaml)
+                .map(|item| render_json(item, nested))
                 .collect::<Result<Vec<_>, _>>()?
                 .join(", ")
         )),
@@ -1478,7 +1923,7 @@ pub(crate) fn json_yaml(value: &serde_json::Value) -> Result<String, CoreError> 
                             let guid = v.as_str().filter(|guid| guid.len() == 32 && guid.bytes().all(|byte| byte.is_ascii_hexdigit()))
                                 .ok_or_else(|| CoreError::new("invalid_guid", "reference GUID must contain exactly 32 hexadecimal characters", 0))?;
                             guid.to_string()
-                        } else { json_yaml(v)? };
+                        } else { render_json(v, nested)? };
                         Ok(format!("{}: {}", yaml_key(k), rendered))
                     })
                     .collect::<Result<Vec<_>, CoreError>>()?

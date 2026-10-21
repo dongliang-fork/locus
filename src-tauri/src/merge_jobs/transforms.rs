@@ -315,44 +315,57 @@ pub fn apply(
             ));
             continue;
         }
-        let conflict = job.selection.files.contains_key(&path)
-            || choices.iter().any(|choice| {
-                job.selection
-                    .objects
-                    .values()
-                    .any(|object| object.path == path && object.object_id == choice.object_id)
-                    || job.selection.fields.values().any(|other| {
-                        other.path == path
-                            && other.object_id == choice.object_id
-                            && other.property_path != choice.property_path
-                            && overlaps(&other.property_path, &choice.property_path)
-                    })
-                    || job
-                        .deltas
-                        .iter()
-                        .filter(|d| d.path == path)
-                        .flat_map(|d| &d.changes)
-                        .any(|change| {
-                            change["object_id"].as_str() == Some(&choice.object_id)
-                                && change["property_path"]
-                                    .as_str()
-                                    .map(|p| overlaps(p, &choice.property_path))
-                                    .unwrap_or(false)
-                                && job
-                                    .selection
-                                    .decisions
-                                    .get(change["id"].as_str().unwrap_or(""))
-                                    .map(|v| {
-                                        !matches!(
-                                            resolution_name(v),
-                                            "exclude" | "defer" | "target"
-                                        )
-                                    })
-                                    .unwrap_or(false)
-                        })
-            });
-        if conflict {
-            issues.push(error_value("overlapping_selection",&path,"Explicit field transformations overlap a selected source, object, file, or ancestor field operation"));
+        // Explicit field operations run after catalog decisions, on their
+        // result. A field operation strictly inside a selected catalog change
+        // refines it (e.g. take a source sequence, then delete one element);
+        // operations on the same node or an enclosing one are ambiguous.
+        let mut overlapping = Vec::new();
+        if let Some(file) = job.selection.files.get(&path) {
+            overlapping.push(json!({"kind":"file_operation","version":file.version}));
+        }
+        for choice in &choices {
+            for object in job.selection.objects.values() {
+                if object.path == path && object.object_id == choice.object_id {
+                    overlapping.push(json!({"kind":"object_operation","object_id":object.object_id,
+                        "operation":object.operation,"field":choice.property_path}));
+                }
+            }
+            for other in job.selection.fields.values() {
+                if other.path == path
+                    && other.object_id == choice.object_id
+                    && other.property_path != choice.property_path
+                    && overlaps(&other.property_path, &choice.property_path)
+                    && other.property_path.len() < choice.property_path.len()
+                {
+                    overlapping.push(json!({"kind":"field_operation","object_id":other.object_id,
+                        "property_path":other.property_path,"field":choice.property_path}));
+                }
+            }
+            for change in job.deltas.iter().filter(|d| d.path == path).flat_map(|d| &d.changes) {
+                let Some(change_path) = change["property_path"].as_str() else {
+                    continue;
+                };
+                let active = job
+                    .selection
+                    .decisions
+                    .get(change["id"].as_str().unwrap_or(""))
+                    .is_some_and(|v| !matches!(resolution_name(v), "exclude" | "defer" | "target"));
+                let encloses_change = change_path == choice.property_path
+                    || change_path
+                        .strip_prefix(choice.property_path.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'));
+                if active
+                    && change["object_id"].as_str() == Some(&choice.object_id)
+                    && encloses_change
+                {
+                    overlapping.push(json!({"kind":"change","change_id":change["id"],
+                        "property_path":change_path,"field":choice.property_path}));
+                }
+            }
+        }
+        if !overlapping.is_empty() {
+            issues.push(json!({"code":"overlapping_selection","path":path,"overlaps":overlapping,
+                "detail":"An explicit field operation covers the same node as another selected operation or contains a selected change. Field operations may refine a selected change inside it; exclude the listed change_ids or clear the conflicting operation"}));
             continue;
         }
         let target = result.get(&path).cloned().unwrap_or(None);

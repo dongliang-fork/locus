@@ -5,8 +5,10 @@
 //! sequence identity and unsupported syntax are errors, never guessed repairs.
 
 mod edit;
+mod identity;
 mod merge;
 mod parser;
+mod set_patch;
 mod packed;
 mod validation;
 pub mod semantic;

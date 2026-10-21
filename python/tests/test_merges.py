@@ -128,6 +128,42 @@ class MergeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await job.inspect_asset("Assets/a.asset", version="live")
 
+    async def test_set_text_is_a_plan_file_operation_with_explicit_line_endings(self):
+        client = MergeClient()
+        job = await client.merges.prepare(sources=[{"commits": ["one"]}], workspace_ref=locus.WorkspaceRef("A"))
+        plan = job.plan()
+        await plan.files.set_text("Assets/Code/Motor.cs", "merged\n")
+        method, params = client.calls[-1]
+        self.assertEqual(method, "merges.files.set_text")
+        self.assertEqual((params["path"], params["content"], params["eol"]),
+                         ("Assets/Code/Motor.cs", "merged\n", "target"))
+        await plan.files.set_text("notes.txt", "x", eol="exact")
+        self.assertEqual(client.calls[-1][1]["eol"], "exact")
+        for kwargs in ({"eol": "auto"},):
+            with self.assertRaises(ValueError):
+                await plan.files.set_text("notes.txt", "x", **kwargs)
+        with self.assertRaises(ValueError):
+            await plan.files.set_text("notes.txt", b"bytes")
+
+    async def test_all_changes_follows_pages(self):
+        class PagedClient(MergeClient):
+            async def rpc(self, method, params=None, **kwargs):
+                if method == "merges.changes":
+                    self.calls.append((method, params))
+                    offset = params["offset"]
+                    changes = [{"id": f"c{i}", "status": "clean"} for i in range(offset, min(offset + 2, 5))]
+                    return {"changes": changes, "total": 5,
+                            "next_offset": offset + 2 if offset + 2 < 5 else None}
+                return await super().rpc(method, params, **kwargs)
+
+        client = PagedClient()
+        job = await client.merges.prepare(sources=[{"commits": ["one"]}], workspace_ref=locus.WorkspaceRef("A"))
+        changes = await job.all_changes(page_size=2)
+        self.assertEqual([c.id for c in changes], ["c0", "c1", "c2", "c3", "c4"])
+        self.assertEqual([p["offset"] for m, p in client.calls if m == "merges.changes"], [0, 2, 4])
+        with self.assertRaises(ValueError):
+            await job.all_changes(page_size=0)
+
 
 if __name__ == "__main__":
     unittest.main()

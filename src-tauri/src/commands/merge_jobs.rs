@@ -60,10 +60,14 @@ pub async fn merge_job_execute(
         }
         return crate::merge_jobs::validate_unity(&root, &job_id).await;
     }
-    crate::merge_jobs::coordination::run_blocking(_guard, move || {
+    let (sync_root, sync_id, is_apply) = (root.clone(), job_id.clone(), action == "apply");
+    let result = crate::merge_jobs::coordination::run_blocking(_guard, move || {
         let _scope = scope;
         crate::merge_jobs::execute(&root, &job_id, &action, params)
     })
-    .await
-    ?
+    .await??;
+    if is_apply {
+        return Ok(crate::merge_jobs::sync_editor_after_apply(&sync_root, &sync_id, result).await);
+    }
+    Ok(result)
 }

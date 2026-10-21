@@ -520,11 +520,11 @@ async fn validate_inner(
     let registry = app.state::<Arc<ProjectRegistry>>().inner().clone();
     let source_identity = crate::workspace_service::identity::ProjectIdResolver::resolve(&source)
         .map_err(|e| e.to_string())?;
-    let pool_root = repo
-        .parent()
-        .ok_or("Repository has no parent for the validation pool")?
-        .join(".locus-merge-validation")
-        .join(source_identity.project_id.as_str());
+    let policy = crate::commands::worktree_policy(
+        &app.state::<Arc<crate::config::AppConfig>>(),
+        &registry,
+    )?;
+    let pool_root = policy.merge_validation_root(&source, source_identity.project_id.as_str())?;
     std::fs::create_dir_all(&pool_root).map_err(|e| e.to_string())?;
     let assignment = format!("merge-validation-{}", uuid::Uuid::new_v4().simple());
     let common = crate::workspace_service::identity::resolve_git_common_dir(&source)
@@ -543,11 +543,7 @@ async fn validate_inner(
         pool_root: pool_root.to_string_lossy().into(),
         commit: commit.clone(),
         branch: None,
-        max_slots: registry
-            .resource_policy()
-            .snapshot()
-            .limits
-            .max_unity_editors,
+        max_slots: policy.max_slots,
         assignment_id: Some(assignment.clone()),
     };
     let acquisition = tauri::async_runtime::spawn_blocking(move || pool::acquire(&request))

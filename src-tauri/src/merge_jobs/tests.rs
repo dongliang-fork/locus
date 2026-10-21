@@ -1,4 +1,5 @@
 use super::*;
+use crate::workspace_service::worktrees::location::WorktreePolicy;
 use tempfile::TempDir;
 
 #[path = "performance_tests.rs"]
@@ -285,6 +286,7 @@ fn new_worktree_preserves_dirty_base_head_index_and_disk_layers() {
             ..Default::default()
         },
         &json!({"kind":"new_branch","name":"integrated","location":"new_worktree","path":path}),
+        &WorktreePolicy::beside_repository(1),
     )
     .unwrap();
     assert_eq!(index_entries(Path::new(&job.root)).unwrap(), original);
@@ -335,6 +337,7 @@ fn new_worktree_without_explicit_path_creates_container_and_preserves_dirty_base
             ..Default::default()
         },
         &json!({"kind":"new_branch","name":"codex/default-destination","location":"new_worktree"}),
+        &WorktreePolicy::beside_repository(1),
     ).unwrap();
     let target = Path::new(&job.root);
     assert_eq!(target.parent().unwrap(), dunce::canonicalize(&container).unwrap());
@@ -365,6 +368,7 @@ fn new_worktree_transfers_long_frozen_working_paths_and_preserves_staging() {
             ..Default::default()
         },
         &json!({"kind":"new_branch","name":"codex/long-frozen-destination","location":"new_worktree"}),
+        &WorktreePolicy::beside_repository(1),
     ).unwrap();
     let target = Path::new(&job.root);
     let transferred = target.join(&relative);
@@ -374,36 +378,6 @@ fn new_worktree_transfers_long_frozen_working_paths_and_preserves_staging() {
     assert_eq!(git(target, &["show", &format!(":{relative}")]).unwrap(), b"staged long-path bytes\n");
     assert_eq!(index_entries(target).unwrap(), original_index);
     assert_eq!(index_entries(&repo.root).unwrap(), original_index);
-}
-
-#[test]
-fn default_worktree_container_rejects_existing_files() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    std::fs::create_dir(&root).unwrap();
-    let container = temp.path().join("project.worktrees");
-    std::fs::write(&container, b"preserve existing file").unwrap();
-    let error = default_worktree_destination(&root).unwrap_err();
-    assert!(error.contains("without links") && error.contains("project.worktrees"));
-    assert_eq!(std::fs::read(&container).unwrap(), b"preserve existing file");
-}
-
-#[test]
-fn default_worktree_container_rejects_directory_links() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    std::fs::create_dir(&root).unwrap();
-    let container = temp.path().join("project.worktrees");
-    #[cfg(windows)]
-    let link = std::os::windows::fs::symlink_dir(&root, &container);
-    #[cfg(unix)]
-    let link = std::os::unix::fs::symlink(&root, &container);
-    if let Err(error) = link {
-        if error.kind() == std::io::ErrorKind::PermissionDenied { return; }
-        panic!("Could not create directory link fixture: {error}");
-    }
-    assert!(default_worktree_destination(&root).unwrap_err().contains("without links"));
-    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
 }
 
 #[test]
@@ -1455,4 +1429,350 @@ fn removed_document_does_not_match_same_file_id_under_another_guid() {
         std::fs::read_to_string(repo.root.join("Assets/Referrer.unity")).unwrap(),
         external_scene_reference(EXTERNAL_OTHER_GUID, 3)
     );
+}
+
+/// A repository whose base commit also contains `files`, with a source worktree.
+fn repo_with(files: &[(&str, &str)]) -> Repo {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("target");
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-b", "main"]).unwrap();
+    git(&root, &["config", "user.email", "merge-test@example.invalid"]).unwrap();
+    git(&root, &["config", "user.name", "Merge Test"]).unwrap();
+    git(&root, &["config", "core.autocrlf", "false"]).unwrap();
+    std::fs::write(root.join("asset.asset"), yaml(100, 5, "base")).unwrap();
+    std::fs::write(root.join("notes.txt"), "base notes\n").unwrap();
+    for (path, content) in files {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, content).unwrap();
+    }
+    git(&root, &["add", "."]).unwrap();
+    git(&root, &["commit", "-m", "base"]).unwrap();
+    git(&root, &["worktree", "add", "-b", "source", "--", source.to_str().unwrap()]).unwrap();
+    Repo { _dir: dir, root, source }
+}
+
+impl Repo {
+    /// One source commit writing (`Some`) or deleting (`None`) several files.
+    fn commit_files(&self, files: &[(&str, Option<&str>)]) -> String {
+        for (path, content) in files {
+            let file = self.source.join(path);
+            match content {
+                Some(content) => {
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::fs::write(&file, content).unwrap();
+                    git(&self.source, &["add", "--", path]).unwrap();
+                }
+                None => {
+                    git(&self.source, &["rm", "-q", "--", path]).unwrap();
+                }
+            }
+        }
+        git(&self.source, &["commit", "-m", "source change"]).unwrap();
+        git_text(&self.source, &["rev-parse", "HEAD"]).unwrap()
+    }
+}
+
+fn catalog_change(repo: &Repo, job: &MergeJob, path: &str) -> Value {
+    let changes = execute(&repo.root, &job.id, "changes", json!({"limit":1000})).unwrap();
+    changes["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"] == path)
+        .cloned()
+        .unwrap_or_else(|| panic!("no change for {path}: {changes:#}"))
+}
+
+#[test]
+fn text_catalog_classifies_line_merges_line_endings_and_conflicts() {
+    let repo = repo_with(&[
+        ("eol.txt", "one\ntwo\nthree\n"),
+        ("merge.txt", "1\n2\n3\n4\n5\n6\n"),
+        ("conflict.txt", "a\nb\nc\n"),
+    ]);
+    let source = repo.commit_files(&[
+        ("eol.txt", Some("one\nTWO\nthree\n")),
+        ("merge.txt", Some("1\n2\n3\n4\n5\nSIX\n")),
+        ("conflict.txt", Some("a\nX\nc\n")),
+    ]);
+    // A Windows checkout that only differs by line endings, an independent
+    // destination edit, and an edit to the same line.
+    std::fs::write(repo.root.join("eol.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
+    std::fs::write(repo.root.join("merge.txt"), "ONE\n2\n3\n4\n5\n6\n").unwrap();
+    std::fs::write(repo.root.join("conflict.txt"), "a\nB\nc\n").unwrap();
+    let job = repo.job(vec![source]);
+    let eol = catalog_change(&repo, &job, "eol.txt");
+    assert_eq!((eol["status"].as_str(), eol["merge"].as_str()), (Some("clean"), Some("source_lines")), "{eol:#}");
+    let merged = catalog_change(&repo, &job, "merge.txt");
+    assert_eq!((merged["status"].as_str(), merged["merge"].as_str()), (Some("clean"), Some("line_merge")), "{merged:#}");
+    assert!(merged["reason"].as_str().unwrap().contains("different lines"));
+    let conflict = catalog_change(&repo, &job, "conflict.txt");
+    assert_eq!(conflict["status"], "conflict");
+    assert!(conflict["reason"].as_str().unwrap().contains("files.set_text"));
+    assert_eq!(conflict["hunks"][0]["base_lines"], json!([2, 3]));
+
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let blocked = preview(&repo.root, &job.id).unwrap();
+    assert_eq!(blocked.issues.len(), 1, "{:#?}", blocked.issues);
+    assert_eq!(blocked.issues[0]["code"], "text_conflict");
+    assert_eq!(blocked.issues[0]["change_id"], conflict["id"]);
+    assert_eq!(blocked.issues[0]["hunks"][0]["source"], "X\n");
+    let marked = execute(&repo.root, &job.id, "inspect_asset", json!({"path":"conflict.txt","version":"result"})).unwrap();
+    assert_eq!(marked["conflicted"], true);
+    assert_eq!(
+        marked["text"],
+        "a\n<<<<<<< destination\nB\n||||||| base\nb\n=======\nX\n>>>>>>> source\nc\n"
+    );
+    assert!(execute(&repo.root, &job.id, "files.set_text", json!({"path":"conflict.txt","content":marked["text"]}))
+        .unwrap_err()
+        .contains("conflict marker"));
+    execute(&repo.root, &job.id, "files.set_text", json!({"path":"conflict.txt","content":"a\nB\nX\nc\n"})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    execute(&repo.root, &job.id, "apply", json!({"expected_plan_hash":plan.plan_hash})).unwrap();
+    assert_eq!(std::fs::read(repo.root.join("eol.txt")).unwrap(), b"one\r\nTWO\r\nthree\r\n");
+    assert_eq!(std::fs::read(repo.root.join("merge.txt")).unwrap(), b"ONE\n2\n3\n4\n5\nSIX\n");
+    assert_eq!(std::fs::read(repo.root.join("conflict.txt")).unwrap(), b"a\nB\nX\nc\n");
+    // Supplied text is part of the journal: abort restores it with the rest.
+    execute(&repo.root, &job.id, "abort", json!({})).unwrap();
+    assert_eq!(std::fs::read(repo.root.join("conflict.txt")).unwrap(), b"a\nB\nc\n");
+    assert_eq!(std::fs::read(repo.root.join("eol.txt")).unwrap(), b"one\r\ntwo\r\nthree\r\n");
+}
+
+#[test]
+fn text_deletions_require_a_side_and_set_text_is_validated() {
+    let repo = repo_with(&[("gone.txt", "keep\n"), ("crlf.txt", "x\ny\n")]);
+    let source = repo.commit_files(&[("gone.txt", None), ("crlf.txt", Some("x\nY\n"))]);
+    std::fs::write(repo.root.join("gone.txt"), "keep\nlocal\n").unwrap();
+    std::fs::write(repo.root.join("crlf.txt"), "x\r\nz\r\n").unwrap();
+    let job = repo.job(vec![source]);
+    let gone = catalog_change(&repo, &job, "gone.txt");
+    assert_eq!(gone["status"], "conflict");
+    assert!(gone["reason"].as_str().unwrap().contains("source deletes this file"));
+    execute(&repo.root, &job.id, "include", json!({"path":"gone.txt"})).unwrap();
+    let blocked = preview(&repo.root, &job.id).unwrap();
+    assert!(blocked.issues[0]["detail"].as_str().unwrap().contains("source deletes"));
+    execute(&repo.root, &job.id, "resolve", json!({"path":"gone.txt","side":"source"})).unwrap();
+    let deleted = preview(&repo.root, &job.id).unwrap();
+    assert!(deleted.ready_to_apply, "{:?}", deleted.issues);
+    assert_eq!(deleted.files.get("gone.txt"), Some(&None));
+
+    for (params, error) in [
+        (json!({"path":"asset.asset","content":"x"}), "has no change"),
+        (json!({"path":"crlf.txt","content":"x\n<<<<<<< destination\n"}), "conflict marker"),
+        (json!({"path":"crlf.txt","content":"x","eol":"auto"}), "eol must be"),
+    ] {
+        let message = execute(&repo.root, &job.id, "files.set_text", params).unwrap_err();
+        assert!(message.contains(error), "{message}");
+    }
+    // Agent-written LF text follows the destination's CRLF convention.
+    execute(&repo.root, &job.id, "files.set_text", json!({"path":"crlf.txt","content":"x\nY\nz\n"})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    let state = plan.files["crlf.txt"].clone().unwrap();
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    assert_eq!(read_blob(&dir, &state).unwrap(), b"x\r\nY\r\nz\r\n");
+    execute(&repo.root, &job.id, "files.set_text", json!({"path":"crlf.txt","content":"x\nY\n","eol":"exact"})).unwrap();
+    let exact = preview(&repo.root, &job.id).unwrap();
+    assert_eq!(read_blob(&dir, exact.files["crlf.txt"].as_ref().unwrap()).unwrap(), b"x\nY\n");
+}
+
+#[test]
+fn set_text_refuses_unity_yaml() {
+    let repo = Repo::new();
+    let source = repo.commit("asset.asset", yaml(120, 5, "base"));
+    let job = repo.job(vec![source]);
+    let message = execute(&repo.root, &job.id, "files.set_text", json!({"path":"asset.asset","content":"x"})).unwrap_err();
+    assert!(message.contains("Unity YAML"), "{message}");
+}
+
+#[test]
+fn field_operation_refines_a_selected_change_and_overlaps_name_their_change_ids() {
+    let repo = Repo::new();
+    let list = |values: &[u32]| {
+        let items: String = values.iter().map(|v| format!("  - {v}\n")).collect();
+        format!("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!114 &11400000\nMonoBehaviour:\n  m_Name: base\n  values:\n{items}")
+    };
+    std::fs::write(repo.root.join("list.asset"), list(&[1, 1, 2])).unwrap();
+    git(&repo.root, &["add", "list.asset"]).unwrap();
+    git(&repo.root, &["commit", "-m", "list"]).unwrap();
+    git(&repo.source, &["merge", "-q", "--ff-only", "main"]).unwrap();
+    let source = repo.commit("list.asset", list(&[9, 1, 2]));
+    std::fs::write(repo.root.join("list.asset"), list(&[1, 1, 2, 5])).unwrap();
+    let job = repo.job(vec![source]);
+    let change = execute(&repo.root, &job.id, "changes", json!({})).unwrap()["changes"][0].clone();
+    assert_eq!(change["property_path"], "/MonoBehaviour/values");
+    assert_eq!(change["status"], "conflict");
+    assert!(change["reason"].as_str().unwrap().contains("no Unity identity"));
+    execute(&repo.root, &job.id, "resolve", json!({"change_ids":[change["id"]],"side":"source"})).unwrap();
+    // Refine the selected source list: delete one of its elements.
+    execute(&repo.root, &job.id, "fields.delete", json!({"path":"list.asset","object_id":"11400000","property_path":"/MonoBehaviour/values/1"})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    assert_eq!(
+        String::from_utf8(read_blob(&dir, plan.files["list.asset"].as_ref().unwrap()).unwrap()).unwrap(),
+        list(&[9, 2])
+    );
+    // An operation on an enclosing node is ambiguous and names the change.
+    execute(&repo.root, &job.id, "fields.set", json!({"path":"list.asset","object_id":"11400000","property_path":"/MonoBehaviour","value":{"m_Name":"x","values":[]}})).unwrap();
+    let overlap = preview(&repo.root, &job.id).unwrap();
+    let issue = overlap.issues.iter().find(|i| i["code"] == "overlapping_selection").unwrap();
+    assert!(issue["overlaps"].as_array().unwrap().iter().any(|o| o["change_id"] == change["id"]), "{issue:#}");
+}
+
+#[test]
+fn editor_sync_reimports_assets_and_leaves_scripts_to_compilation() {
+    let repo = Repo::new();
+    let mut job = repo.job(vec![repo.commit("notes.txt", "selected\n")]);
+    let state = |blob: &str| Some(FileState { blob: blob.into(), mode: "100644".into() });
+    job.applied_files = BTreeMap::from([
+        ("Assets/Scene.unity".to_string(), state("after")),
+        ("Assets/Scene.unity.meta".to_string(), state("after")),
+        ("Assets/Code/Motor.cs".to_string(), state("after")),
+        ("Assets/Code/Motor.cs.meta".to_string(), state("after")),
+        ("Assets/Unchanged.asset".to_string(), state("same")),
+        ("notes.txt".to_string(), state("after")),
+    ]);
+    job.applied_before = job
+        .applied_files
+        .keys()
+        .map(|path| (path.clone(), if path.ends_with("Unchanged.asset") { state("same") } else { state("before") }))
+        .collect();
+    let (assets, scripts) = editor_sync_paths(&job).unwrap();
+    assert_eq!(assets, ["Assets/Scene.unity"]);
+    assert_eq!(scripts, ["Assets/Code/Motor.cs"]);
+}
+
+#[tokio::test]
+async fn editor_sync_is_skipped_for_editor_transactions_and_non_unity_roots() {
+    let repo = Repo::new();
+    let job = repo.job(vec![repo.commit("notes.txt", "selected\n")]);
+    let editor = json!({"state":"applied","editor_applied":true});
+    assert_eq!(sync_editor_after_apply(&repo.root, &job.id, editor.clone()).await, editor);
+    let direct = sync_editor_after_apply(&repo.root, &job.id, json!({"state":"applied","editor_applied":false})).await;
+    assert_eq!(direct["editor_sync"]["status"], "not_unity_project");
+    assert!(direct.get("warnings").is_none());
+}
+
+fn override_item(target: &str, property: &str, value: &str) -> String {
+    format!("    - target: {{fileID: {target}, guid: cba0fbbfd3cdbce499475af4af43a2e3,\n        type: 3}}\n      propertyPath: {property}\n      value: {value}\n      objectReference: {{fileID: 0}}\n")
+}
+
+fn instance(id: &str, overrides: &[(&str, &str, &str)]) -> String {
+    let items: String = overrides.iter().map(|(t, p, v)| override_item(t, p, v)).collect();
+    format!("--- !u!1001 &{id}\nPrefabInstance:\n  m_ObjectHideFlags: 0\n  serializedVersion: 2\n  m_Modification:\n    serializedVersion: 3\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications:\n{items}    m_RemovedComponents: []\n  m_SourcePrefab: {{fileID: 100100000, guid: cba0fbbfd3cdbce499475af4af43a2e3, type: 3}}\n")
+}
+
+fn scene(enemy: &[(&str, &str, &str)], player: &[(&str, &str, &str)]) -> String {
+    format!("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n{}{}", instance("1050404689", enemy), instance("2040113738", player))
+}
+
+/// The 白盒-7 integration distilled: Prefab override lists changed on both
+/// sides, code edited on both sides, a CRLF-only working file and a deleted
+/// document all merge through the plan with decisions only for real conflicts.
+#[test]
+fn session_regression_integrates_overrides_text_and_line_endings_through_the_plan() {
+    const ROOT: &str = "600249992675133040";
+    const NAME: &str = "1937218400633567911";
+    const VIEW: &str = "7468865217963383891";
+    const PLAYER: &str = "8726720174468721065";
+    let name = "\"C1010_\\u9B54\\u65CF\\u58EB\\u5175_01\"";
+    let base_enemy = [
+        (ROOT, "m_LocalPosition.x", "-126.74875"),
+        (ROOT, "m_LocalRotation.x", "-0"),
+        (ROOT, "m_LocalRotation.z", "-0"),
+        (NAME, "m_Name", name),
+        (VIEW, "legacyRenderers.Array.size", "0"),
+    ];
+    let base_player = [
+        (PLAYER, "m_LocalPosition.x", "-108.739"),
+        (PLAYER, "m_LocalPosition.y", "55.691"),
+        (VIEW, "legacyRenderers.Array.size", "0"),
+    ];
+    let code = "using System;\n\nclass Motor\n{\n    void Step() { }\n\n    void Land() { }\n}\n";
+    let replay = "class Replay\n{\n    void Seek() { }\n}\n";
+    let repo = repo_with(&[
+        ("Assets/Scenes/Entities.unity", &scene(&base_enemy, &base_player)),
+        ("Assets/Code/Motor.cs", code),
+        ("Assets/Code/Replay.cs", replay),
+        ("Docs/Design.md", "# Squads\n"),
+    ]);
+    let source = repo.commit_files(&[
+        (
+            "Assets/Scenes/Entities.unity",
+            Some(&scene(
+                &[(ROOT, "m_LocalPosition.x", "-127.19"), (NAME, "m_Name", name), (VIEW, "legacyRenderers.Array.size", "0")],
+                &[(PLAYER, "m_LocalPosition.x", "-108.42"), (PLAYER, "m_LocalPosition.y", "48.188004"), (VIEW, "legacyRenderers.Array.size", "0")],
+            )),
+        ),
+        ("Assets/Code/Motor.cs", Some(&code.replace("void Land() { }", "void Land() { Validate(); }"))),
+        ("Assets/Code/Replay.cs", Some(&replay.replace("void Seek() { }", "void Seek() { Reset(); }"))),
+        ("Docs/Design.md", None),
+    ]);
+    // Destination: removed the legacy overrides, moved the player, edited
+    // another Motor method, and holds Replay.cs with CRLF line endings.
+    let destination_scene = scene(
+        &base_enemy[..4],
+        &[(PLAYER, "m_LocalPosition.x", "-144.65"), (PLAYER, "m_LocalPosition.y", "36")],
+    );
+    std::fs::write(repo.root.join("Assets/Scenes/Entities.unity"), &destination_scene).unwrap();
+    std::fs::write(repo.root.join("Assets/Code/Motor.cs"), code.replace("using System;", "using System;\nusing System.Linq;")).unwrap();
+    std::fs::write(repo.root.join("Assets/Code/Replay.cs"), replay.replace('\n', "\r\n")).unwrap();
+    let job = repo.job(vec![source]);
+    let changes = execute(&repo.root, &job.id, "changes", json!({"limit":1000})).unwrap();
+    let conflicts: Vec<&Value> = changes["changes"].as_array().unwrap().iter().filter(|c| c["status"] == "conflict").collect();
+    // Only the two player position values were changed differently.
+    assert_eq!(conflicts.len(), 2, "{conflicts:#?}");
+    assert!(conflicts.iter().all(|c| c["property_path"].as_str().unwrap().contains(":m_LocalPosition.") && c["reason"].is_string()));
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let blocked = preview(&repo.root, &job.id).unwrap();
+    let issue = blocked.issues.iter().find(|i| i["code"] == "asset_conflict").unwrap();
+    assert_eq!(issue["change_ids"].as_array().unwrap().len(), 2, "{issue:#}");
+    execute(&repo.root, &job.id, "resolve", json!({"change_ids":issue["change_ids"],"side":"target"})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    let applied = execute(&repo.root, &job.id, "apply", json!({"expected_plan_hash":plan.plan_hash})).unwrap();
+    assert_eq!(applied["editor_applied"], false);
+    assert_eq!(
+        std::fs::read_to_string(repo.root.join("Assets/Scenes/Entities.unity")).unwrap(),
+        scene(
+            &[(ROOT, "m_LocalPosition.x", "-127.19"), (NAME, "m_Name", name)],
+            &[(PLAYER, "m_LocalPosition.x", "-144.65"), (PLAYER, "m_LocalPosition.y", "36")],
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.root.join("Assets/Code/Motor.cs")).unwrap(),
+        code.replace("using System;", "using System;\nusing System.Linq;").replace("void Land() { }", "void Land() { Validate(); }")
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.root.join("Assets/Code/Replay.cs")).unwrap(),
+        replay.replace("void Seek() { }", "void Seek() { Reset(); }").replace('\n', "\r\n")
+    );
+    assert!(!repo.root.join("Docs/Design.md").exists());
+}
+
+/// Scoped preparation lists only the requested files from Git; their names
+/// are literal paths even when they contain pattern characters.
+#[test]
+fn scoped_prepare_reads_paths_with_pattern_characters_literally() {
+    let repo = repo_with(&[("Assets/odd [1].txt", "base\n"), ("Assets/odd 1.txt", "other\n")]);
+    let source = repo.commit_files(&[("Assets/odd [1].txt", Some("source\n")), ("Assets/odd 1.txt", Some("changed\n"))]);
+    let job = prepare(
+        &repo.root,
+        &PrepareRequest {
+            sources: vec![SourceSelection { commits: vec![source], ..Default::default() }],
+            paths: Some(vec!["Assets/odd [1].txt".into()]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // The asset and its paired meta enter the scope; the similarly named file does not.
+    let paths: Vec<_> = job.deltas.iter().map(|d| d.path.as_str()).collect();
+    assert_eq!(paths, ["Assets/odd [1].txt", "Assets/odd [1].txt.meta"]);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    assert_eq!(state_bytes(&dir, &job.deltas[0].base).unwrap(), b"base\n");
+    assert_eq!(state_bytes(&dir, &job.deltas[0].source).unwrap(), b"source\n");
 }

@@ -13,6 +13,7 @@ mod snapshot;
 pub(crate) mod io;
 mod schema;
 mod scratch_validation;
+mod text_merge;
 mod transforms;
 pub use commit_validation::validate_commit_unity;
 mod types;
@@ -103,6 +104,46 @@ pub fn load(root: &Path, id: &str) -> Result<MergeJob, String> {
     }
     Ok(job)
 }
+/// Recent three-way sessions. Building the change catalog and the first
+/// preview of the same snapshots otherwise each parse all three versions and
+/// rebuild the catalog. Bounded by entry count and input size, since a
+/// session keeps the parsed assets alive.
+fn merge_session(
+    base: &[u8],
+    target: &[u8],
+    source: &[u8],
+    aliases: &[crate::unity_asset_core::FieldAlias],
+) -> Result<std::sync::Arc<crate::unity_asset_core::MergeSession>, crate::unity_asset_core::CoreError> {
+    use std::sync::{Arc, LazyLock, Mutex};
+    type Sessions = Vec<(blake3::Hash, Arc<crate::unity_asset_core::MergeSession>)>;
+    static SESSIONS: LazyLock<Mutex<Sessions>> = LazyLock::new(|| Mutex::new(Vec::new()));
+    const ENTRIES: usize = 2;
+    const INPUT_BYTES: usize = 32 * 1024 * 1024;
+    let mut key = blake3::Hasher::new();
+    for bytes in [base, target, source] {
+        key.update(&(bytes.len() as u64).to_le_bytes());
+        key.update(bytes);
+    }
+    key.update(&serde_json::to_vec(aliases).unwrap_or_default());
+    let key = key.finalize();
+    if let Some(session) = SESSIONS
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.iter().find(|(k, _)| *k == key).map(|(_, s)| s.clone()))
+    {
+        return Ok(session);
+    }
+    let session = Arc::new(crate::unity_asset_core::prepare_merge_with_aliases(base, target, source, aliases)?);
+    if base.len() + target.len() + source.len() <= INPUT_BYTES {
+        if let Ok(mut sessions) = SESSIONS.lock() {
+            sessions.retain(|(k, _)| *k != key);
+            sessions.insert(0, (key, session.clone()));
+            sessions.truncate(ENTRIES);
+        }
+    }
+    Ok(session)
+}
+
 fn namespaced(commit: &str, path: &str, id: &str) -> String {
     format!("{commit}:{path}:{id}")
 }
@@ -136,7 +177,7 @@ fn ensure_catalog(dir: &Path, job: &mut MergeJob) -> Result<(), String> {
         }
     }
     let folder = dir.parent().ok_or("Missing catalog cache parent")?
-        .join(format!("catalog-cache-{}-v2", crate::unity_asset_core::PARSER_VERSION));
+        .join(format!("catalog-cache-{}-v3", crate::unity_asset_core::PARSER_VERSION));
     std::fs::create_dir_all(&folder).map_err(|e|e.to_string())?;
     let structural = job.mode == PrepareMode::Structural;
     let changes: Result<Vec<_>, String> = parallel::pool().install(|| job.deltas.par_iter().map(|delta| {
@@ -171,6 +212,55 @@ pub fn summary(job: &MergeJob) -> Value {
             "materialization_epoch":job.snapshot.materialization_epoch,"file_count":job.snapshot.files.len(),
             "dependency_file_count":job.dependency_files.len()}})
 }
+/// Byte equality, or text equality that ignores CRLF/LF differences.
+fn eol_equal(left: &[u8], right: &[u8]) -> bool {
+    left == right
+        || match (std::str::from_utf8(left), std::str::from_utf8(right)) {
+            (Ok(left), Ok(right)) => left.replace("\r\n", "\n") == right.replace("\r\n", "\n"),
+            _ => false,
+        }
+}
+
+/// Status of a whole-file change. `clean` means `include` applies without a
+/// decision (for text this may be a three-way line merge, see `merge`);
+/// `conflict` always carries a `reason`, and text conflicts list `hunks`.
+fn file_status(
+    delta: &CommitDelta,
+    target_state: &Option<FileState>,
+    base: &[u8],
+    target: &[u8],
+    source: &[u8],
+    structural_error: Option<String>,
+) -> (&'static str, Value) {
+    let present = (delta.base.is_some(), target_state.is_some(), delta.source.is_some());
+    let text = delta.kind == "text";
+    let same = |a: &[u8], b: &[u8]| if text { eol_equal(a, b) } else { a == b };
+    if present.1 == present.0 && same(target, base) {
+        if target != base {
+            return ("clean", json!({"merge":"source_lines","reason":"the destination differs from the base only by line endings; include applies the source lines in the destination's line endings"}));
+        }
+        return ("clean", Value::Null);
+    }
+    if present.1 == present.2 && same(target, source) {
+        if target != source {
+            return ("already_applied", json!({"reason":"the destination already contains these source lines (line endings ignored)"}));
+        }
+        return ("already_applied", Value::Null);
+    }
+    let conflict = |reason: String| ("conflict", json!({ "reason": reason }));
+    match present {
+        (true, true, true) if text => text_merge::classify(base, target, source),
+        (true, true, false) => conflict("the source deletes this file while the destination modified it; resolve side='source' to delete it or 'target' to keep the destination version".into()),
+        (true, false, true) => conflict("the destination deleted this file while the source modified it; resolve side='source' to restore the source version or 'target' to keep it deleted".into()),
+        (false, true, true) => conflict("both sides added this path with different content; resolve side='source' or 'target', or supply merged text with files.set_text".into()),
+        _ if delta.kind == "binary" => conflict("the destination and the source both changed this binary/opaque file; choose a complete version with files.take".into()),
+        _ => conflict(match structural_error {
+            Some(error) => format!("structural Unity YAML merge is unavailable for this file ({error}); choose a complete version with files.take"),
+            None => "the destination and the source both changed this file; choose a complete version with files.take".into(),
+        }),
+    }
+}
+
 fn catalog(
     dir: &Path,
     delta: &CommitDelta,
@@ -187,9 +277,11 @@ fn catalog(
         })),
         _ => None,
     };
+    let target_state = target;
     let base = state_bytes(dir, &delta.base)?;
     let source = state_bytes(dir, &delta.source)?;
     let target = state_bytes(dir, target)?;
+    let mut structural_error = None;
     if structural && delta.kind == "unity_yaml"
         && delta.base.is_some()
         && delta.source.is_some()
@@ -202,7 +294,7 @@ fn catalog(
             schemas.get(&delta.commit).unwrap_or(&empty),
             schemas.get("target").unwrap_or(&empty),
         );
-        match crate::unity_asset_core::prepare_merge_with_aliases(&base, &target, &source, &aliases)
+        match merge_session(&base, &target, &source, &aliases)
         {
             Ok(session) => {
                 let value = serde_json::to_value(session.catalog()).map_err(|e| e.to_string())?;
@@ -226,15 +318,23 @@ fn catalog(
                     return Ok(changes);
                 }
             }
-            Err(_) => {} // Inspection remains available as an explicit whole-file choice.
+            // Inspection remains available as an explicit whole-file choice.
+            Err(error) => structural_error = Some(error.to_string()),
         }
     }
     let mut changes = vec![];
-    if base != source {
-        changes.push(json!({"id":namespaced(&delta.commit,&delta.path,"file"),"core_id":null,
+    if base != source || delta.base.is_some() != delta.source.is_some() {
+        let (status, details) = file_status(delta, target_state, &base, &target, &source, structural_error);
+        let mut change = json!({"id":namespaced(&delta.commit,&delta.path,"file"),"core_id":null,
         "commit":delta.commit,"parent":delta.parent,"path":delta.path,"kind":"file",
-        "file_kind":delta.kind,"status":if target==base||target==source {"clean"}else{"conflict"},
-        "base":delta.base,"source":delta.source,"requires_whole_file_choice":delta.kind=="binary" || delta.kind=="unity_yaml"}));
+        "file_kind":delta.kind,"status":status,"reason":null,
+        "base":delta.base,"source":delta.source,"requires_whole_file_choice":delta.kind=="binary" || delta.kind=="unity_yaml"});
+        if let Some(details) = details.as_object() {
+            for (key, value) in details {
+                change[key] = value.clone();
+            }
+        }
+        changes.push(change);
     }
     if let Some(mode_change) = mode_change {
         changes.push(mode_change);
@@ -263,15 +363,18 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
     {
         return Err("Resolve the destination's existing unmerged index entries before preparing a new integration".into());
     }
-    for marker in [
-        "MERGE_HEAD",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "rebase-merge",
-        "rebase-apply",
-    ] {
-        let path = git_text(&root, &["rev-parse", "--git-path", marker])?;
-        let path = Path::new(&path);
+    let markers = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"];
+    let mut args = vec!["rev-parse"];
+    for marker in &markers {
+        args.extend(["--git-path", marker]);
+    }
+    let marker_paths = git_text(&root, &args)?;
+    let marker_paths: Vec<&str> = marker_paths.lines().collect();
+    if marker_paths.len() != markers.len() {
+        return Err("Git did not resolve the operation marker paths".into());
+    }
+    for (marker, path) in markers.iter().zip(marker_paths) {
+        let path = Path::new(path);
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -541,50 +644,14 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
     Ok(job)
 }
 
-fn default_worktree_destination(root: &Path) -> Result<std::path::PathBuf, String> {
-    use crate::workspace_service::worktrees::{canonical, path_key};
-    let root = canonical(root)?;
-    let parent = root.parent().ok_or("A default worktree requires a repository parent directory")?;
-    let name = root.file_name().ok_or("A default worktree requires a named repository directory")?;
-    let container = parent.join(format!("{}.worktrees", name.to_string_lossy()));
-    let container_key = path_key(&container);
-    let source_key = path_key(&root);
-    if container_key == source_key || container_key.starts_with(&(source_key + "/")) {
-        return Err("Default worktrees must be outside the source checkout".into());
-    }
-    let validate_container = || -> Result<(), String> {
-        let metadata = std::fs::symlink_metadata(&container)
-            .map_err(|e| format!("Could not inspect worktree container {}: {e}", container.display()))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink()
-            || path_key(&canonical(&container)?) != container_key
-        {
-            return Err(format!("Default worktree container must be a directory without links: {}", container.display()));
-        }
-        Ok(())
-    };
-    match std::fs::symlink_metadata(&container) {
-        Ok(_) => validate_container()?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // The canonical source parent already exists. Create only our
-            // generated sibling container, never an arbitrary ancestor chain.
-            match std::fs::create_dir(&container) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(format!("Could not create worktree container {}: {error}", container.display())),
-            }
-            validate_container()?;
-        }
-        Err(error) => return Err(format!("Could not inspect worktree container {}: {error}", container.display())),
-    }
-    Ok(container.join(format!("merge-{}", uuid::Uuid::new_v4().simple())))
-}
-
 /// An explicit destination branch can inherit a dirty base without a stash or
 /// user-visible snapshot commit. HEAD, index and disk contents remain separate.
+/// Without an explicit `path`, a new worktree goes to the policy's container.
 pub fn prepare_with_destination(
     project_root: &Path,
     request: &PrepareRequest,
     destination: &Value,
+    policy: &crate::workspace_service::worktrees::location::WorktreePolicy,
 ) -> Result<MergeJob, String> {
     let kind = destination
         .get("kind")
@@ -620,7 +687,7 @@ pub fn prepare_with_destination(
     check_target(&root, &base_dir, &base)?;
     let destination_path = match destination.get("path").and_then(Value::as_str) {
         Some(path) => std::path::PathBuf::from(path),
-        None => default_worktree_destination(&root)?,
+        None => policy.new_checkout(&root, "merge")?,
     };
     let record = crate::workspace_service::worktrees::create(
         &crate::workspace_service::worktrees::CreateWorktreeRequest {
@@ -723,7 +790,37 @@ pub fn preview(root: &Path, id: &str) -> Result<Preview, String> {
     let job = load(root, id)?;
     preview_job(&job_dir(Path::new(&job.root), id)?, &job)
 }
+/// A preview is a pure function of the job record and its immutable,
+/// content-addressed blobs. An agent previews, then applies, and apply and the
+/// Editor preflight each preview again: the latest result is kept per job so an
+/// unchanged plan renders once. Any change to the record misses the cache.
 fn preview_job(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
+    let key = blake3::hash(&serde_json::to_vec(job).map_err(|e| e.to_string())?)
+        .to_hex()
+        .to_string();
+    let cache = dir.join("preview-latest.json");
+    if let Some(preview) = std::fs::read(&cache)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<(String, Preview)>(&bytes).ok())
+        .and_then(|(cached, preview)| (cached == key).then_some(preview))
+    {
+        return Ok(preview);
+    }
+    let preview = compute_preview(dir, job)?;
+    // Best effort: a failed cache write only costs the next render.
+    if let Ok(mut temp) = tempfile::NamedTempFile::new_in(dir) {
+        use std::io::Write;
+        if serde_json::to_vec(&(&key, &preview))
+            .ok()
+            .is_some_and(|bytes| temp.write_all(&bytes).is_ok())
+        {
+            let _ = temp.persist(&cache);
+        }
+    }
+    Ok(preview)
+}
+
+fn compute_preview(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
     let mut result = job.snapshot.files.clone();
     let mut issues = vec![];
     let mut excluded = vec![];
@@ -760,12 +857,16 @@ fn preview_job(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
             issues.push(error_value("outside_destination_scope",&delta.path,"This change is outside the destination Unity project root; use an explicitly authorized repository-root workspace or another job"));
             continue;
         }
-        if job.selection.files.contains_key(&delta.path) {
-            issues.push(error_value(
-                "overlapping_selection",
-                &delta.path,
-                "Whole-file and interior selections overlap; clear one scope explicitly",
-            ));
+        if let Some(choice) = job.selection.files.get(&delta.path) {
+            // Supplied merged text is the explicit resolution of this file's
+            // text change; it supersedes include/resolve for the same path.
+            if choice.version == "content" && delta.kind == "text" {
+                continue;
+            }
+            let ids: Vec<_> = selected.iter().map(|(change, _)| change["id"].clone()).collect();
+            issues.push(json!({"code":"overlapping_selection","path":delta.path,"change_ids":ids,
+                "file_operation":choice.version,
+                "detail":"A whole-file operation and interior change selections overlap; files.clear the file operation or exclude these change_ids"}));
             continue;
         }
         let target = result.get(&delta.path).cloned().unwrap_or(None);
@@ -811,24 +912,50 @@ fn preview_job(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
                     Some(delta.source.clone())
                 }
                 "include" if delta.kind == "text" => {
-                    match merge_text(
-                        &state_bytes(dir, &delta.base)?,
-                        &state_bytes(dir, &target)?,
-                        &state_bytes(dir, &delta.source)?,
-                    ) {
-                        Ok(bytes) => Some(Some(store_blob(
-                            dir,
-                            &bytes,
-                            target.as_ref().map(|s| s.mode.as_str()).unwrap_or("100644"),
-                        )?)),
-                        Err(reason) => {
-                            issues.push(error_value("text_conflict", &delta.path, reason));
+                    let (base_bytes, target_bytes, source_bytes) = (
+                        state_bytes(dir, &delta.base)?,
+                        state_bytes(dir, &target)?,
+                        state_bytes(dir, &delta.source)?,
+                    );
+                    let change_id = selected[0].0["id"].clone();
+                    let present = (delta.base.is_some(), target.is_some(), delta.source.is_some());
+                    match present {
+                        (true, true, true) => match text_merge::merge(&base_bytes, &target_bytes, &source_bytes) {
+                            Ok(outcome) => match outcome.bytes(&target_bytes) {
+                                Some(bytes) => Some(Some(store_blob(
+                                    dir,
+                                    &bytes,
+                                    target.as_ref().map(|s| s.mode.as_str()).unwrap_or("100644"),
+                                )?)),
+                                None => {
+                                    let hunks = match outcome {
+                                        text_merge::Outcome::Conflict { hunks, .. } => hunks,
+                                        _ => vec![],
+                                    };
+                                    issues.push(json!({"code":"text_conflict","path":delta.path,"change_id":change_id,
+                                        "detail":format!("{} overlapping line region(s) changed on both sides; inspect_asset(path, version='result') shows conflict markers; resolve with files.set_text or resolve side='source'/'target'", hunks.len()),
+                                        "hunks":hunks}));
+                                    None
+                                }
+                            },
+                            Err(reason) => {
+                                issues.push(json!({"code":"text_conflict","path":delta.path,"change_id":change_id,"detail":reason}));
+                                None
+                            }
+                        },
+                        (true, true, false) if eol_equal(&target_bytes, &base_bytes) => Some(None),
+                        (false, true, true) if eol_equal(&target_bytes, &source_bytes) => Some(target.clone()),
+                        _ => {
+                            let reason = file_status(delta, &target, &base_bytes, &target_bytes, &source_bytes, None).1;
+                            issues.push(json!({"code":"text_conflict","path":delta.path,"change_id":change_id,
+                                "detail":reason["reason"].as_str().unwrap_or("the destination differs from this commit's parent")}));
                             None
                         }
                     }
                 }
                 _ => {
-                    issues.push(error_value("file_conflict",&delta.path,"Select source/base/target explicitly; the destination differs from this commit's parent"));
+                    issues.push(json!({"code":"file_conflict","path":delta.path,"change_id":selected[0].0["id"],
+                        "detail":"Select source/base/target explicitly; the destination differs from this commit's parent"}));
                     None
                 }
             };
@@ -914,9 +1041,7 @@ fn preview_job(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
             job.schemas.get(&delta.commit).unwrap_or(&empty),
             result_schema,
         );
-        match crate::unity_asset_core::prepare_merge_with_aliases(
-            &base, &current, &source, &aliases,
-        ) {
+        match merge_session(&base, &current, &source, &aliases) {
             Ok(session) => {
                 let mut decisions = vec![];
                 for (change, decision) in selected {
@@ -964,7 +1089,31 @@ fn preview_job(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
                                 )?),
                             );
                         } else {
-                            issues.push(json!({"code":"asset_conflict","path":delta.path,"commit":delta.commit,"conflicts":output.conflicts,"diagnostics":output.diagnostics}));
+                            let conflicts: Vec<Value> = output
+                                .conflicts
+                                .iter()
+                                .map(|conflict| {
+                                    let mut value = json!(conflict);
+                                    if !conflict.change_id.is_empty()
+                                        && !conflict.change_id.starts_with('$')
+                                    {
+                                        value["change_id"] = json!(namespaced(
+                                            &delta.commit,
+                                            &delta.path,
+                                            &conflict.change_id
+                                        ));
+                                    }
+                                    value
+                                })
+                                .collect();
+                            let change_ids: Vec<_> = conflicts
+                                .iter()
+                                .filter_map(|c| c["change_id"].as_str().filter(|id| id.contains(':')))
+                                .map(str::to_string)
+                                .collect();
+                            issues.push(json!({"code":"asset_conflict","path":delta.path,"commit":delta.commit,
+                                "change_ids":change_ids,"conflicts":conflicts,"diagnostics":output.diagnostics,
+                                "detail":"resolve each listed change with plan.resolve(change_id, side=...) or a typed field operation"}));
                         }
                     }
                     Err(e) => issues.push(error_value("asset_render", &delta.path, e.to_string())),
@@ -996,6 +1145,12 @@ fn preview_job(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
                 .cloned()
                 .unwrap_or(None),
             "delete" => None,
+            "content" => Some(
+                choice
+                    .content
+                    .clone()
+                    .ok_or("Supplied text content is missing from the plan; call files.set_text again")?,
+            ),
             "move" => job
                 .snapshot
                 .files
@@ -1209,71 +1364,75 @@ fn dependency_issues(
     Ok(())
 }
 
-/// Three-way line edits use base coordinates, preserving independent target edits.
-/// Overlapping edits and insertions at the same boundary are explicit conflicts.
+/// Three-way line merge in destination terms (see `text_merge`). Overlapping
+/// or touching edits, including insertions at one boundary, are conflicts.
+#[cfg(test)]
 fn merge_text(base: &[u8], target: &[u8], source: &[u8]) -> Result<Vec<u8>, String> {
-    let base = std::str::from_utf8(base).map_err(|e| e.to_string())?;
-    let target = std::str::from_utf8(target).map_err(|e| e.to_string())?;
-    let source = std::str::from_utf8(source).map_err(|e| e.to_string())?;
-    if source == base || target == source {
-        return Ok(target.as_bytes().to_vec());
+    text_merge::merge(base, target, source)?.bytes(target).ok_or_else(|| {
+        "Selected source change overlaps or touches destination edits".to_string()
+    })
+}
+
+/// Record agent-merged code/plain text as this path's resolution inside the
+/// plan. The content is stored in the job, bound to the plan hash, applied by
+/// `apply` and restored by `abort`, so manual merges never bypass the journal.
+fn set_text(root: &Path, dir: &Path, job: &mut MergeJob, path: &str, params: &Value) -> Result<(), String> {
+    if !scope_allows(job, path) {
+        return Err("files.set_text is outside the prepared destination scope".into());
     }
-    if target == base {
-        return Ok(source.as_bytes().to_vec());
+    safe_path(root, path)?;
+    let content = params
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or("files.set_text requires content as a string")?;
+    let eol = params.get("eol").and_then(Value::as_str).unwrap_or("target");
+    if !matches!(eol, "target" | "exact") {
+        return Err("eol must be 'target' (convert to the destination's line ending) or 'exact'".into());
     }
-    // Git blobs normally use LF while a Windows working file may use CRLF.
-    // Normalize only a uniformly-CRLF destination, then restore its convention.
-    if target.contains("\r\n") && !target.replace("\r\n", "").contains('\n') {
-        let merged = merge_text(
-            base.replace("\r\n", "\n").as_bytes(),
-            target.replace("\r\n", "\n").as_bytes(),
-            source.replace("\r\n", "\n").as_bytes(),
-        )?;
-        return Ok(String::from_utf8(merged)
-            .map_err(|e| e.to_string())?
-            .replace('\n', "\r\n")
-            .into_bytes());
+    let deltas: Vec<_> = job.deltas.iter().filter(|d| d.path == path).collect();
+    if deltas.is_empty() {
+        return Err("files.set_text resolves a selected source change; this path has no change in the selected commits".into());
     }
-    fn edits(base: &str, side: &str) -> Vec<(usize, usize, Vec<String>)> {
-        let diff = similar::TextDiff::from_lines(base, side);
-        let lines: Vec<_> = side.split_inclusive('\n').map(str::to_string).collect();
-        diff.ops()
-            .iter()
-            .filter(|op| op.tag() != similar::DiffTag::Equal)
-            .map(|op| {
-                let old = op.old_range();
-                let new = op.new_range();
-                (old.start, old.end, lines[new].to_vec())
-            })
-            .collect()
+    if deltas.iter().any(|d| d.kind != "text") {
+        return Err("files.set_text supplies merged code/plain text only; resolve Unity YAML with field/object operations and binary files with files.take".into());
     }
-    let mut target_edits = edits(base, target);
-    for incoming in edits(base, source) {
-        let mut same = false;
-        for existing in &target_edits {
-            if *existing == incoming {
-                same = true;
-                break;
-            }
-            let overlap = if incoming.0 == incoming.1 || existing.0 == existing.1 {
-                incoming.0 <= existing.1 && existing.0 <= incoming.1
-            } else {
-                incoming.0 < existing.1 && existing.0 < incoming.1
-            };
-            if overlap {
-                return Err("Selected source change overlaps target edits or depends on a missing prior change".into());
+    if content.contains('\0') {
+        return Err("files.set_text content must be text without NUL bytes".into());
+    }
+    if let Some(line) = content.lines().find(|line| {
+        line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> ") || line.starts_with("||||||| ")
+    }) {
+        return Err(format!("files.set_text content still contains a conflict marker line: {line}"));
+    }
+    let target = job.snapshot.files.get(path).cloned().unwrap_or(None);
+    let mut text = content.to_string();
+    if eol == "target" {
+        if let Some(state) = &target {
+            if let Ok(existing) = String::from_utf8(read_blob(dir, state)?) {
+                let crlf = existing.matches("\r\n").count();
+                if crlf > existing.matches('\n').count() - crlf {
+                    text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+                }
             }
         }
-        if !same {
-            target_edits.push(incoming);
-        }
     }
-    target_edits.sort_by_key(|e| e.0);
-    let mut lines: Vec<_> = base.split_inclusive('\n').map(str::to_string).collect();
-    for (start, end, new) in target_edits.into_iter().rev() {
-        lines.splice(start..end, new);
-    }
-    Ok(lines.concat().into_bytes())
+    let mode = target
+        .as_ref()
+        .map(|state| state.mode.clone())
+        .or_else(|| deltas.iter().find_map(|d| d.source.as_ref().map(|s| s.mode.clone())))
+        .unwrap_or_else(|| "100644".into());
+    let state = store_blob(dir, text.as_bytes(), &mode)?;
+    job.selection.files.insert(
+        path.into(),
+        FileChoice {
+            path: path.into(),
+            version: "content".into(),
+            commit: None,
+            destination: None,
+            content: Some(state),
+        },
+    );
+    Ok(())
 }
 
 fn action_ids(job: &MergeJob, params: &Value) -> Result<Vec<String>, String> {
@@ -1461,6 +1620,7 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
         "assets.preview" | "assets.apply" => Some(&["path", "operations", "expected_revision", "persist"]),
         "files.take" => Some(&["path", "version", "commit"]),
         "files.delete" | "files.clear" => Some(&["path"]),
+        "files.set_text" => Some(&["path", "content", "eol"]),
         "files.move" => Some(&["path", "destination"]),
         "objects.take" | "objects.add" => Some(&["path", "object_id", "commit", "side"]),
         "objects.delete" => Some(&["path", "object_id", "commit"]),
@@ -1718,8 +1878,14 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
                     version: version.into(),
                     commit,
                     destination,
+                    content: None,
                 },
             );
+        }
+        "files.set_text" => {
+            editable(&job)?;
+            let path = param_str(&params, "path")?.to_string();
+            set_text(&root, &dir, &mut job, &path, &params)?;
         }
         "files.clear" => {
             editable(&job)?;
@@ -1817,7 +1983,7 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
             job.state = "applied".into();
             save(&dir, &job)?;
             return Ok(
-                json!({"job_id":id,"state":job.state,"plan_hash":expected,"files":job.applied_files,"index_preserved":true,"unity_validated":false}),
+                json!({"job_id":id,"state":job.state,"plan_hash":expected,"files":job.applied_files,"index_preserved":true,"unity_validated":false,"editor_applied":editor_applied}),
             );
         }
         "abort" => {
@@ -2201,6 +2367,90 @@ pub async fn preflight_apply(root: &Path, id: &str) -> Result<(), String> {
         return Err(format!("Unity did not confirm the targeted merge apply barrier: {output}"));
     }
     Ok(())
+}
+
+/// Paths an Editor must reimport after a direct disk apply. Scripts and
+/// assemblies are left to the normal compile refresh.
+fn editor_sync_paths(job: &MergeJob) -> Result<(Vec<String>, Vec<String>), String> {
+    let changed: Vec<&str> = job
+        .applied_files
+        .iter()
+        .filter(|(path, state)| job.applied_before.get(*path) != Some(*state))
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let assets = asset_preflight::project_asset_paths(
+        Path::new(&job.root),
+        Path::new(&job.project_root),
+        changed.iter().copied(),
+    )?;
+    let script = |path: &str| {
+        let lower = path.to_ascii_lowercase();
+        [".cs", ".asmdef", ".asmref", ".dll"].iter().any(|ext| lower.ends_with(ext))
+    };
+    let (scripts, assets): (Vec<_>, Vec<_>) = assets.into_iter().partition(|p| script(p));
+    Ok((assets, scripts))
+}
+
+/// A plan with code, text or new files is written directly by Rust instead of
+/// the Editor's disk transaction. Afterwards a connected Editor reimports the
+/// written assets and reloads affected open scenes/Prefab Stage, so it never
+/// keeps (and later saves) the previous in-memory version. The outcome is
+/// reported as `editor_sync`; a failed sync is a warning, the apply stands.
+pub async fn sync_editor_after_apply(root: &Path, id: &str, mut result: Value) -> Value {
+    if result["editor_applied"].as_bool() != Some(false) {
+        return result;
+    }
+    let sync = async {
+        let job = load(root, id)?;
+        let project = job.project_root.clone();
+        if !crate::unity_bridge::is_unity_project(&project) {
+            return Ok::<Value, String>(json!({"status":"not_unity_project"}));
+        }
+        let (assets, scripts) = editor_sync_paths(&job)?;
+        let script_note = (!scripts.is_empty()).then(|| {
+            json!({"scripts_changed":scripts,"hint":"the Editor recompiles changed scripts on its next refresh; run unity_recompile before relying on new types"})
+        });
+        if !crate::unity_bridge::is_unity_connected(&project).await {
+            let probe = project.clone();
+            let closed = tokio::task::spawn_blocking(move || {
+                matches!(
+                    crate::unity_bridge::query_current_project_editor_process_uncached(probe).state,
+                    crate::unity_bridge::UnityEditorProcessState::NotRunning
+                )
+            })
+            .await
+            .unwrap_or(false);
+            let status = if closed { "editor_closed" } else { "editor_not_connected" };
+            return Ok(json!({"status":status,"assets":assets,"scripts":script_note}));
+        }
+        if assets.is_empty() {
+            return Ok(json!({"status":"no_assets","scripts":script_note}));
+        }
+        let response = crate::unity_bridge::asset_api(&project, &json!({"action":"disk_reload","paths":assets})).await?;
+        Ok(json!({"status":"synced","reloaded":response,"scripts":script_note}))
+    };
+    match sync.await {
+        Ok(status) => {
+            let stale = status["reloaded"]["stale"].as_array().filter(|s| !s.is_empty()).cloned();
+            if let Some(stale) = stale {
+                result["warnings"] = json!([format!(
+                    "Unity kept unsaved in-memory edits for {}; these were not reloaded. Revert them in the Editor (or reload the scene) before saving, otherwise the merged files will be overwritten",
+                    stale.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+                )]);
+            }
+            if status["status"] == "editor_not_connected" {
+                result["warnings"] = json!(["A Unity Editor may be running without a Locus connection; if it has these assets or scenes open, reload them before saving"]);
+            }
+            result["editor_sync"] = status;
+        }
+        Err(error) => {
+            result["editor_sync"] = json!({"status":"failed","error":error});
+            result["warnings"] = json!([format!(
+                "The merged files are on disk, but the connected Unity Editor did not confirm reloading them ({error}). Reload affected open scenes/assets before saving in the Editor; an older Locus Unity package may need updating"
+            )]);
+        }
+    }
+    result
 }
 
 /// Validate the applied, journaled destination in its exact Unity 6.5 Editor.

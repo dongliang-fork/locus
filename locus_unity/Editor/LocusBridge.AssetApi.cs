@@ -105,6 +105,18 @@ namespace Locus
                     AssetApiPreflightDiskPaths(paths);
                     return AssetApiJson(new Dictionary<string, object> { { "ready", true }, { "checked_paths", paths.ToArray() } });
                 }
+                if (request.action == "disk_reload")
+                {
+                    var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (string path in request.paths ?? new string[0])
+                    {
+                        if (string.IsNullOrEmpty(path) || (!path.StartsWith("Assets/", StringComparison.Ordinal) && !path.StartsWith("Packages/", StringComparison.Ordinal))
+                            || path.Contains('\\') || path.Contains(':') || path.Split('/').Any(part => part.Length == 0 || part == "." || part == ".."))
+                            throw new Exception("invalid_path: disk reload requires project-relative asset paths");
+                        paths.Add(path.EndsWith(".meta", StringComparison.Ordinal) ? path.Substring(0, path.Length - 5) : path);
+                    }
+                    return AssetApiJson(AssetApiReloadChangedPaths(paths));
+                }
                 if (request.action == "disk_apply") return ExecuteAssetApiDiskEdits(request);
                 if (request.action != "read") return ExecuteAssetApiEdits(request);
                 using (AssetApiScope scope = OpenAssetApiScope(request.path))
@@ -292,9 +304,17 @@ namespace Locus
                 }
                 if (scenes.Length > 0)
                 {
-                    // Unity cannot close its last scene; an empty temporary scene
-                    // lets us reload targets without closing unrelated scenes.
-                    scratch = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+                    // Unity cannot close its last scene. Only when every loaded scene
+                    // is a target does an empty temporary scene keep one open; Unity
+                    // refuses to add it while an untitled scene exists, and then that
+                    // untitled scene already stays loaded.
+                    bool othersLoaded = false;
+                    for (int i = 0; i < SceneManager.sceneCount; i++)
+                    {
+                        Scene loaded = SceneManager.GetSceneAt(i);
+                        if (loaded.isLoaded && !scenes.Contains(loaded.path, StringComparer.OrdinalIgnoreCase)) othersLoaded = true;
+                    }
+                    if (!othersLoaded) scratch = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
                     foreach (string path in scenes)
                     {
                         Scene scene = SceneManager.GetSceneByPath(path);
@@ -316,6 +336,55 @@ namespace Locus
                 if (scratch.IsValid() && scratch.isLoaded && !scratch.isDirty) EditorSceneManager.CloseScene(scratch, true);
                 if (reloadStage) PrefabStageUtility.OpenPrefab(context.prefabStagePath);
             }
+        }
+
+        // Files were already written outside the Editor (a merge apply with code,
+        // text or new files). Reimport them and reload clean open scenes and the
+        // Prefab Stage from disk so the Editor never saves its previous version.
+        // Anything with unsaved in-memory edits is reported, never overwritten.
+        private static Dictionary<string, object> AssetApiReloadChangedPaths(HashSet<string> paths)
+        {
+            string project = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            var stale = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var reload = new AssetApiReloadContext { activeScenePath = SceneManager.GetActiveScene().path };
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                Scene scene = SceneManager.GetSceneAt(i);
+                if (!scene.isLoaded || !paths.Contains(scene.path)) continue;
+                if (scene.isDirty) stale.Add(scene.path);
+                else reload.scenePaths.Add(scene.path);
+            }
+            var stage = PrefabStageUtility.GetCurrentPrefabStage();
+            if (stage != null && paths.Contains(stage.assetPath))
+            {
+                if (stage.scene.isDirty) stale.Add(stage.assetPath);
+                else reload.prefabStagePath = stage.assetPath;
+            }
+            foreach (UnityEngine.Object target in Resources.FindObjectsOfTypeAll<UnityEngine.Object>())
+            {
+                if (target == null || !EditorUtility.IsPersistent(target) || !EditorUtility.IsDirty(target)) continue;
+                string path = AssetDatabase.GetAssetPath(target);
+                if (paths.Contains(path)) stale.Add(path);
+            }
+            var imported = new List<string>();
+            var missing = new List<string>();
+            foreach (string path in paths)
+            {
+                if (stale.Contains(path)) continue;
+                if (File.Exists(Path.Combine(project, path)) || Directory.Exists(Path.Combine(project, path))) imported.Add(path);
+                else missing.Add(path);
+            }
+            reload.scenePaths = reload.scenePaths.Where(path => !stale.Contains(path)).ToList();
+            AssetApiReloadDiskPaths(reload, imported);
+            var reloadedScenes = reload.scenePaths.Where(path => imported.Contains(path, StringComparer.OrdinalIgnoreCase)).ToArray();
+            return new Dictionary<string, object> {
+                { "reloaded", true },
+                { "imported", imported.ToArray() },
+                { "reloaded_scenes", reloadedScenes },
+                { "reloaded_prefab_stage", reload.prefabStagePath ?? "" },
+                { "stale", stale.ToArray() },
+                { "pending_refresh", missing.ToArray() }
+            };
         }
 
         private static void AssetApiReplaceFile(string path, byte[] bytes, byte[] expected)
@@ -725,7 +794,7 @@ namespace Locus
                 case SerializedPropertyType.LayerMask:
                 case SerializedPropertyType.Character:
                 case SerializedPropertyType.Enum:
-                    value = property.type == "ulong" ? AssetApiUnsignedInteger(property.ulongValue) : AssetApiInteger(property.longValue); kind = "integer"; break;
+                    value = property.type == "ulong" ? AssetApiUnsignedInteger(GetSerializedUInt64(property)) : AssetApiInteger(property.longValue); kind = "integer"; break;
                 case SerializedPropertyType.Float:
                     double number = property.doubleValue;
                     value = double.IsNaN(number) || double.IsInfinity(number)
@@ -941,7 +1010,7 @@ namespace Locus
                     {
                         ulong unsigned;
                         if (!ulong.TryParse(AssetApiIntegerText(json), NumberStyles.None, CultureInfo.InvariantCulture, out unsigned)) throw new Exception("type_mismatch: expected unsigned integer");
-                        property.ulongValue = unsigned;
+                        SetSerializedUInt64(property, unsigned);
                         return;
                     }
                     long integer = AssetApiParseInteger(json);

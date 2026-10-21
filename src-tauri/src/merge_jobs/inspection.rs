@@ -148,6 +148,41 @@ pub(super) fn inspect(dir: &Path, job: &MergeJob, params: &Value) -> Result<Valu
     if !unity_yaml(path, &bytes) {
         result["kind"] = json!("text");
         result["structural"] = json!(false);
+        let mut shown = bytes.clone();
+        if version == "result" && !job.selection.files.contains_key(path) {
+            // An included text change that cannot merge has no result bytes;
+            // show the destination with diff3 markers for a manual resolution.
+            for delta in job.deltas.iter().filter(|d| d.path == path && d.kind == "text") {
+                let included = delta.changes.iter().any(|change| {
+                    change["id"]
+                        .as_str()
+                        .and_then(|id| job.selection.decisions.get(id))
+                        .is_some_and(|decision| resolution_name(decision) == "include")
+                });
+                let target = job.snapshot.files.get(path).cloned().unwrap_or(None);
+                if !included || delta.base.is_none() || delta.source.is_none() || target.is_none() {
+                    continue;
+                }
+                if let Ok(text_merge::Outcome::Conflict { hunks, marked }) = text_merge::merge(
+                    &state_bytes(dir, &delta.base)?,
+                    &state_bytes(dir, &target)?,
+                    &state_bytes(dir, &delta.source)?,
+                ) {
+                    result["conflicted"] = json!(true);
+                    result["hunks"] = json!(hunks);
+                    shown = marked;
+                }
+            }
+        }
+        const TEXT_LIMIT: usize = 1 << 20;
+        let text = String::from_utf8_lossy(&shown);
+        let mut end = text.len().min(TEXT_LIMIT);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        result["text"] = json!(&text[..end]);
+        result["text_bytes"] = json!(text.len());
+        result["text_truncated"] = json!(end < text.len());
         return Ok(result);
     }
     let asset = match core::parse_shared(&bytes) {

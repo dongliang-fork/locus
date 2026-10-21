@@ -3,7 +3,7 @@
 use super::*;
 use crate::workspace_service::worktrees::{self, CreateWorktreeRequest};
 
-fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+pub(super) fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = crate::process_util::command("git")
         .arg("-C")
         .arg(root)
@@ -19,6 +19,19 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
             String::from_utf8_lossy(&output.stderr)
         ))
     }
+}
+
+/// The production apply path (IPC command and SDK): Editor preflight, the
+/// blocking merge transaction off the async executor, then the Editor reload.
+pub(super) async fn apply_plan(root: &Path, job_id: &str, params: Value) -> Result<Value, String> {
+    crate::merge_jobs::preflight_apply(root, job_id).await?;
+    let (blocking_root, blocking_id) = (root.to_path_buf(), job_id.to_string());
+    let result = tokio::task::spawn_blocking(move || {
+        crate::merge_jobs::execute(&blocking_root, &blocking_id, "apply", params)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(crate::merge_jobs::sync_editor_after_apply(root, job_id, result).await)
 }
 
 fn check(condition: bool, detail: &str) -> Result<(), String> {
@@ -369,10 +382,11 @@ pub(super) async fn run_asset_merge(
         ));
     }
     let apply = json!({"expected_plan_hash":preview.plan_hash,"index_policy":"preserve"});
-    merge_jobs::execute(root, &job.id, "apply", apply.clone())?;
+    apply_plan(root, &job.id, apply.clone()).await?;
     let merged_graph = std::fs::read(root.join(&graph)).map_err(|e| e.to_string())?;
     let merged_prefab = std::fs::read(root.join(&prefab)).map_err(|e| e.to_string())?;
-    merge_jobs::execute(root, &job.id, "apply", apply)?;
+    let retry = apply_plan(root, &job.id, apply).await?;
+    check(retry["idempotent"] == true, "Apply retry was not reported as idempotent")?;
     check(
         std::fs::read(root.join(&graph)).map_err(|e| e.to_string())? == merged_graph,
         "Retry applied a graph change twice",
@@ -577,12 +591,12 @@ pub(super) async fn run_asset_merge(
     let mut concurrent = merged_graph.clone();
     concurrent.push(b'\n');
     std::fs::write(root.join(&graph), &concurrent).map_err(|e| e.to_string())?;
-    let stale_result = merge_jobs::execute(
+    let stale_result = apply_plan(
         root,
         &stale.id,
-        "apply",
         json!({"expected_plan_hash":stale_preview.plan_hash,"index_policy":"preserve"}),
-    );
+    )
+    .await;
     check(
         stale_result.is_err(),
         "Post-plan local edit was overwritten",
@@ -593,17 +607,24 @@ pub(super) async fn run_asset_merge(
     )?;
     std::fs::write(root.join(&graph), &merged_graph).map_err(|e| e.to_string())?;
     let corpus = corpus_roundtrip(root)?;
-    let schema = run_schema_alias_acceptance(project, &folder, &token).await?;
-    let sdk = super::merge_sdk_acceptance::run(app, project, config, sink).await?;
-    let commit_scope = super::merge_sdk_commit_acceptance::run(app, project, config, sink).await?;
-    let report = json!({"suite":"asset-merge","passed":29,"failed":0,"unityVersion":version,"jobId":job.id,"fixture":folder,
-        "selectedCommits":[c1,c3],"omittedCommit":c2,"unity":inspected,"typeChange":type_report,"listReorder":reorder_report,"corpus":corpus,"schemaMigration":schema,"sdk":sdk,"commitScope":commit_scope,"snapshots":snapshots});
+    // Boxed: each sub-acceptance is a large state machine, and nesting them
+    // inline overflows a worker stack in debug builds.
+    let schema = Box::pin(run_schema_alias_acceptance(project, &folder, &token)).await?;
+    let sdk = Box::pin(super::merge_sdk_acceptance::run(app, project, config, sink)).await?;
+    let commit_scope = Box::pin(super::merge_sdk_commit_acceptance::run(app, project, config, sink)).await?;
+    let matrix = Box::pin(super::merge_matrix::run(project, sink)).await?;
+    let matrix_failed = matrix["failed"].as_u64().unwrap_or(1);
+    let report = json!({"suite":"asset-merge","passed":29 + matrix["passed"].as_u64().unwrap_or(0),"failed":matrix_failed,"unityVersion":version,"jobId":job.id,"fixture":folder,
+        "selectedCommits":[c1,c3],"omittedCommit":c2,"unity":inspected,"typeChange":type_report,"listReorder":reorder_report,"corpus":corpus,"schemaMigration":schema,"sdk":sdk,"commitScope":commit_scope,"matrix":matrix,"snapshots":snapshots});
     std::fs::write(
         snapshots.join("acceptance.json"),
         serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     sink.emit("suite_result", report);
+    if matrix_failed > 0 {
+        return Err(format!("asset-merge matrix: {matrix_failed} case(s) failed"));
+    }
     Ok(())
 }
 
@@ -701,12 +722,12 @@ print("SCHEMA_TARGET_RENAMED");
             json!(preview.issues)
         ));
     }
-    merge_jobs::execute(
+    let applied = apply_plan(
         root,
         &job.id,
-        "apply",
         json!({"expected_plan_hash":preview.plan_hash,"index_policy":"preserve"}),
-    )?;
+    )
+    .await?;
     merge_jobs::validate_unity(root, &job.id).await?;
     let result=execute_capture(project,&format!(r#"
 var asset = UnityEditor.AssetDatabase.LoadMainAssetAtPath({asset});
@@ -727,11 +748,12 @@ print("SCHEMA_MERGE_VERIFIED");
         "Schema merge changed the existing index",
     )?;
     Ok(
-        json!({"jobId":job.id,"commit":source,"script":script,"asset":asset,"oldField":"legacyValue","newField":"currentValue","mergedValue":20,"localValue":99,"unityVerified":true}),
+        json!({"jobId":job.id,"commit":source,"script":script,"asset":asset,"oldField":"legacyValue","newField":"currentValue","mergedValue":20,"localValue":99,"unityVerified":true,
+            "editorApplied":applied["editor_applied"],"editorSync":applied["editor_sync"]}),
     )
 }
 
-fn capture_json(text: &str) -> Result<Value, String> {
+pub(super) fn capture_json(text: &str) -> Result<Value, String> {
     for line in text.lines() {
         if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
             if value.is_object() {
@@ -839,7 +861,7 @@ fn snapshot_commit(root: &Path, paths: &[&str], message: &str) -> Result<String,
     finish_commit(root, &index, parent.trim(), message)
 }
 
-fn patch_commit(
+pub(super) fn patch_commit(
     root: &Path,
     parent: &str,
     replacements: &[(String, Vec<u8>)],

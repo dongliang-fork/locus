@@ -18,8 +18,7 @@ static STORAGE_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, Option<Storage>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 pub fn init_storage(root: &Path, dir: &Path) -> Result<(), String> {
-    let common = git_text(root, &["rev-parse", "--git-common-dir"])?;
-    let git_dir = dunce::canonicalize(root.join(common)).map_err(|e| e.to_string())?;
+    let git_dir = dunce::canonicalize(checkout_dirs(root)?.1).map_err(|e| e.to_string())?;
     let storage = Storage { version: 2, git_dir };
     fs::create_dir_all(shared_blobs(dir)?).map_err(|e| e.to_string())?;
     fs::create_dir_all(dir.parent().ok_or("Missing journal parent")?.join("git-blobs-v2"))
@@ -216,19 +215,37 @@ pub fn git_output_input(root: &Path, args: &[&str], input: Vec<u8>) -> Result<Ve
     if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).into_owned()); }
     Ok(output.stdout)
 }
+/// Checkout toplevel and common Git directory of a requested root. Both are
+/// fixed for a checkout, while one merge action needs them several times;
+/// resolving them once per root saves repeated `git rev-parse` processes. An
+/// entry is resolved again once its Git directory or toplevel disappears.
+fn checkout_dirs(root: &Path) -> Result<(PathBuf, PathBuf), String> {
+    static CHECKOUTS: LazyLock<Mutex<BTreeMap<PathBuf, (PathBuf, PathBuf)>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+    let cached = CHECKOUTS.lock().ok().and_then(|cache| cache.get(root).cloned());
+    if let Some((toplevel, common)) = cached {
+        if toplevel.is_dir() && common.join("HEAD").is_file() {
+            return Ok((toplevel, common));
+        }
+    }
+    let toplevel = dunce::canonicalize(git_text(root, &["rev-parse", "--show-toplevel"])?)
+        .map_err(|e| e.to_string())?;
+    let common = git_text(root, &["rev-parse", "--git-common-dir"])?;
+    let common = if Path::new(&common).is_absolute() {
+        PathBuf::from(common)
+    } else {
+        root.join(common)
+    };
+    if let Ok(mut cache) = CHECKOUTS.lock() {
+        cache.insert(root.to_path_buf(), (toplevel.clone(), common.clone()));
+    }
+    Ok((toplevel, common))
+}
 pub fn repository(root: &Path) -> Result<PathBuf, String> {
-    dunce::canonicalize(git_text(root, &["rev-parse", "--show-toplevel"])?)
-        .map_err(|e| e.to_string())
+    Ok(checkout_dirs(root)?.0)
 }
 pub fn journal_root(root: &Path) -> Result<PathBuf, String> {
-    let common = git_text(root, &["rev-parse", "--git-common-dir"])?;
-    let path = Path::new(&common);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let path = path.join("locus").join("merge-jobs");
+    let path = checkout_dirs(root)?.1.join("locus").join("merge-jobs");
     fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     Ok(path)
 }
@@ -393,7 +410,19 @@ pub fn tree_files(
     paths: &[String],
 ) -> Result<BTreeMap<String, Option<FileState>>, String> {
     let mut result: BTreeMap<_, _> = paths.iter().map(|p| (p.clone(), None)).collect();
-    let records = git(root, &["ls-tree", "-r", "-z", tree])?;
+    if paths.is_empty() {
+        return Ok(result);
+    }
+    // List only the requested files when they fit on one command line; a full
+    // recursive listing costs time proportional to the repository's size.
+    let pathspec_bytes: usize = paths.iter().map(|p| p.len() + 3).sum();
+    let records = if paths.len() <= 512 && pathspec_bytes <= 16 * 1024 {
+        let mut args = vec!["--literal-pathspecs", "ls-tree", "-r", "-z", tree, "--"];
+        args.extend(paths.iter().map(String::as_str));
+        git(root, &args)?
+    } else {
+        git(root, &["ls-tree", "-r", "-z", tree])?
+    };
     let mut entries = BTreeMap::new();
     for raw in records.split(|b| *b == 0).filter(|b| !b.is_empty()) {
         let record = std::str::from_utf8(raw).map_err(|e| e.to_string())?;

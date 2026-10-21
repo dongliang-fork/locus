@@ -75,6 +75,9 @@ pub struct FileChoice {
     pub commit: Option<String>,
     #[serde(default)]
     pub destination: Option<String>,
+    /// Agent-supplied merged text (`version == "content"`), stored in the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<FileState>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

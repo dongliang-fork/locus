@@ -97,6 +97,23 @@ class MergeJob:
             raise ValueError("The catalog includes all source changes; filter status locally to retain selection control")
         return await self._call("changes", {"offset": offset, "limit": limit})
 
+    async def all_changes(self, *, page_size: int = 1000) -> list[MergeResult]:
+        """Every catalog change, following ``next_offset`` across pages.
+
+        Statuses: ``clean`` (include applies; for text ``merge`` names a line
+        merge), ``already_applied``, ``conflict`` (with ``reason``; text adds
+        ``hunks``) and ``explicit_choice`` (file mode).
+        """
+        if not 1 <= page_size <= 1000:
+            raise ValueError("page_size must be between 1 and 1000")
+        items: list[MergeResult] = []
+        offset: int | None = 0
+        while offset is not None:
+            page = await self.changes(offset=offset, limit=page_size)
+            items.extend(MergeResult(change) for change in page.get("changes", []))
+            offset = page.get("next_offset")
+        return items
+
     async def snapshot_page(self, *, kind: str = "target", offset: int = 0, limit: int = 100) -> MergeResult:
         """Page immutable file identities; ``snapshot`` contains only summary metadata."""
         if kind not in {"target", "dependencies"}:
@@ -156,6 +173,21 @@ class _Files(_Scope):
     async def clear(self, path: str) -> MergeResult:
         """Remove a whole-file operation before using interior field selections."""
         return await self._plan._call("files.clear", {"path": path})
+
+    async def set_text(self, path: str, content: str, *, eol: str = "target") -> MergeResult:
+        """Resolve a code/plain-text change with merged content inside the plan.
+
+        The text is stored in the job (bound to the plan hash, written by
+        ``apply`` and restored by ``abort``) and supersedes include/resolve for
+        this path. ``eol="target"`` converts LF to the destination's CRLF
+        convention; ``eol="exact"`` writes the content unchanged. Unity YAML
+        and binary files are rejected: use field/object operations or ``take``.
+        """
+        if not isinstance(content, str):
+            raise ValueError("content must be a str")
+        if eol not in {"target", "exact"}:
+            raise ValueError("eol must be 'target' or 'exact'")
+        return await self._plan._call("files.set_text", {"path": path, "content": content, "eol": eol})
 
 
 class _Objects(_Scope):

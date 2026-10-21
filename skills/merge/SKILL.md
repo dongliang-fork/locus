@@ -33,7 +33,7 @@ tools:
 通过 `python` 工具调用已内置的 `locus.merges`，执行修改的 Python body 使用 `readonly=false`。参数不熟悉时，从 `python` 工具描述给出的 SDK 文档目录读取 `merges.md`；同一任务内复用已读契约。
 
 1. 以当前脏工作区准备一个 job，通常一个请求包含本次所选的全部 commits。范围明确时在 `prepare(paths=[...])` 传入精确文件路径；完整替换场景、Prefab 或其他文件时使用 `mode="files"`，直接 `job.plan().files.take(path, version="source", commit=oid)`，无需预先生成字段目录。资产/meta 会成对进入可选范围，但仍分别显式选择。需要字段合并时使用默认 `mode="structural"`。`new_plan(default="keep_target")` 默认保留目标，然后按用户范围批量 include/exclude。用户要全部所选提交时可直接 `include(all=True)`，无需逐字段确认。
-2. 范围明确时直接按路径或 commit 选择。需要了解内容时分页读 `job.changes()`，只返回文件、状态与相关 change ID；需要字段上下文时才调用 `job.inspect_asset(path, version=...)`。大场景无需完整展开对象树。
+2. 范围明确时直接按路径或 commit 选择。需要了解内容时用 `job.all_changes()`（或分页读 `job.changes()`），返回文件、状态、`reason` 与相关 change ID；需要字段上下文时才调用 `job.inspect_asset(path, version=...)`。大场景无需完整展开对象树。
 3. 一批选择完成后执行一次 `preview()`。直接处理返回的冲突和依赖问题；`preview`、`validate(level="static")`、`check_dependencies` 当前共享静态预览，不连续调用三遍。
 4. `ready_to_apply` 后直接 `apply(expected_plan_hash=preview.plan_hash)`，只应用既定计划。没有新信息时不再要求用户确认同一范围。返回后核对应用路径与变更摘要。
 
@@ -59,8 +59,12 @@ else:
 
 “手工”是理解两边意图后明确组合结果，不是将所有冲突统一选成 ours/theirs。
 
-- **Unity YAML**：简单字段、对象和文件差异直接用 Locus 自研合并 API。按需读取冻结的 base/target/source/result，再使用 `fields.take/set`、`objects.*` 或 `files.*` 表达结果。`include` 只表示纳入，不等于解决冲突；`plan.resolve(change_id, side=...)` 使用 catalog 中的 change ID。只有需要双方行为信息时才进一步查询 Editor。
-- **代码和普通文本**：保留双方必要逻辑，用普通文件工具拼接。如果必须修改计划涉及的目标文件，先完成文本编辑，再 prepare，并 exclude 已解决路径；若已有计划，完成手工编辑后重新 prepare。不要编辑目标后继续 apply 旧 hash。
+- **Unity YAML**：简单字段、对象和文件差异直接用 Locus 自研合并 API。按需读取冻结的 base/target/source/result，再使用 `fields.take/set`、`objects.*` 或 `files.*` 表达结果。`include` 只表示纳入，不等于解决冲突；`plan.resolve(change_id, side=...)` 使用 catalog 中的 change ID，每个 `conflict` 都带 `reason` 说明分歧和可选的边。
+- **Prefab 覆盖等身份序列**：`m_Modifications`、实例上新增/移除的对象（`m_Added*`、`m_Removed*`）、`RefIds`、`m_Component`、`m_Children`、场景 `m_Roots` 按元素合并，两侧对不同元素的增删改直接组合，冲突落在具体元素或其字段上。需要“取一侧整段再去掉某项”时，先 `resolve(序列 change_id, side="source")`，再对元素路径 `fields.delete`；缺失的元素用 `fields.take(side=...)` 原样复制。不要用 `fields.set` 重写整段来代替元素操作，也不要回到 Editor 里手工撤销覆盖。
+- **没有元素身份的列表**（普通值/结构体列表、`[SerializeReference]` 的 `{rid: N}` 列表）：冲突的 `reason` 给出下一步。两侧都只追加时，用 `fields.set` 把该路径设为“目标元素 + 来源新增元素”；两侧改了不同元素时，先 `resolve` 一侧，再 `fields.take` 另一侧的 `<路径>/<序号>`。`fields.set` 落在冲突 change 的同一路径上即是该冲突的解决，不需要先 exclude。
+- **SerializeReference 删除/修改**：一侧删掉、另一侧改了同一个托管引用时，冲突在 `RefIds/@rid=` 元素上，`reason` 列出指向它的字段。要保留来源的修改，`resolve(side="source")` 之外还要对这些字段 `fields.take(side="source")`，否则恢复的引用没有人指向，Unity 下次保存会丢弃它。
+- **同一 fileID 的两个不同对象**：`reason` 为 “both sides added an object with this fileID” 时只能保留一侧，向用户说明另一侧的对象需要重新添加。同一个 Editor 进程里对同一场景基线编辑两次（例如在打开的 Editor 里切换分支）会出现这种情况。
+- **代码和普通文本**：先 `include`。两侧改了不同行时，它直接做三方行合并并保留目标的换行；仅换行不同的工作区文件按未修改处理。对 `conflict`（带 `hunks`）用 `inspect_asset(path, version="result")` 读出带冲突标记的文本，理解两边意图后组合，再用 `plan.files.set_text(path, merged)` 写进计划：它随 plan hash 应用、可 abort，不需要改目标文件或重新 prepare。删除/新增分歧用 `resolve(change_id, side=...)`。不要用 `git merge-file` 或普通文件工具绕过计划写目标。
 - **二进制/完整选边**：按用户目的明确选取完整版本，用 `files.take(path, version="source", commit=oid)` 等操作。不能把 `include` 当作二进制内容选择。
 - **引用、类型或依赖冲突**：只检查问题涉及的对象与依赖；必要修改一起纳入，其余保持排除。不要为方便直接选择整张 Scene/Prefab，也不要通过通用文件工具手写 Unity YAML。对象 ID/rid 选择器用字符串；设置数值引用字段时用 Python 整数。
 
@@ -74,6 +78,8 @@ else:
 - Editor 观察用于帮助选择；冻结快照才是计划依据。首次导入、复杂运行时复现不是每次合并的固定步骤。
 
 ## 验证与完成
+
+`apply` 的返回包含 `editor_sync` 和 `warnings`。计划里同时有代码、文本、meta 或新文件时，写盘后会让已连接的 Editor 重新导入资产，并从磁盘重载受影响的已打开场景和 Prefab Stage，无需手动重开场景。若 `warnings` 报告某资产在 Editor 中有未保存修改（stale），先向用户说明，再处理该资产，避免保存时覆盖合并结果。脚本改动在 Editor 下次刷新时编译，依赖新类型前先 `unity_recompile`。
 
 验证与本次变化相称：简单改动看计划、应用结果及局部 diff；代码改动用项目现有的相关检查；确有 Unity 导入/行为疑问时再验证受影响资产。仅应用 YAML 修改不要求必启 Editor。后端报告具体阻塞时处理该项，不额外设置“必须工作区干净”“必须全量扫描/编译/测试”的入口条件。
 

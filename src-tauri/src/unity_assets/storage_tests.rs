@@ -310,6 +310,7 @@ async fn actual_unity2022_thirteen_primitive_array_matrix_previews_and_persists_
     assert!(text.contains("booleans: 0101010101"));
     assert!(text.contains("characters: 7a007a00410041004100"));
     assert!(text.contains("modes: 0700000007000000fefffffffefffffffeffffff"));
-    assert!(text.contains("floats: ["));
-    assert!(text.contains("doubles: ["));
+    // Unity's block lists keep their layout; only changed elements are written.
+    assert!(text.contains("  floats:\n  - 7.75\n  - 7.75\n  - 0.125\n  - 0.125\n  - 0.125\n"), "{text}");
+    assert!(text.contains("  doubles:\n  - 7.75\n  - 7.75\n  - 0.125\n  - 0.125\n  - 0.125\n"), "{text}");
 }

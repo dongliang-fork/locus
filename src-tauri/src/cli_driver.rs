@@ -24,6 +24,7 @@ mod worktree_merge;
 mod project_pool_acceptance;
 mod merge_sdk_commit_acceptance;
 mod merge_sdk_acceptance;
+mod merge_matrix;
 mod worktree_sdk_acceptance;
 mod property_sdk_read;
 mod headless_development;
@@ -57,6 +58,7 @@ pub enum CliDriverSuite {
     WorktreeSdk,
     Worktrees,
     AssetMerge,
+    AssetMergeMatrix,
     AssetApi,
     ProjectPool,
     Workspace,
@@ -90,6 +92,7 @@ impl CliDriverSuite {
             CliDriverSuite::WorktreeSdk => "worktree-sdk",
             CliDriverSuite::Worktrees => "worktrees",
             CliDriverSuite::AssetMerge => "asset-merge",
+            CliDriverSuite::AssetMergeMatrix => "asset-merge-matrix",
             CliDriverSuite::AssetApi => "asset-api",
             CliDriverSuite::ProjectPool => "project-pool",
             CliDriverSuite::Workspace => "workspace",
@@ -122,7 +125,7 @@ impl CliDriverSuite {
             CliDriverSuite::HeadlessDevelopment => None,
             CliDriverSuite::WorktreeSdk => None,
             CliDriverSuite::AssetApi => None,
-            CliDriverSuite::Worktrees | CliDriverSuite::AssetMerge | CliDriverSuite::ProjectPool => None,
+            CliDriverSuite::Worktrees | CliDriverSuite::AssetMerge | CliDriverSuite::AssetMergeMatrix | CliDriverSuite::ProjectPool => None,
             CliDriverSuite::Workspace => None,
             CliDriverSuite::WorkspaceSwitch => None,
             CliDriverSuite::SessionUndo => None,
@@ -660,6 +663,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         "headless-development" => CliDriverSuite::HeadlessDevelopment,
         "worktree-sdk" => CliDriverSuite::WorktreeSdk,
         "asset-merge" => CliDriverSuite::AssetMerge,
+        "asset-merge-matrix" | "merge-matrix" => CliDriverSuite::AssetMergeMatrix,
         "asset-api" => CliDriverSuite::AssetApi,
         "project-pool" => CliDriverSuite::ProjectPool,
         "workspace" | "multi-workspace" | "multi_workspace" => CliDriverSuite::Workspace,
@@ -916,7 +920,8 @@ async fn run_driver(
             CliDriverSuite::HeadlessDevelopment => Err("headless-development must be dispatched before connection".into()),
             CliDriverSuite::WorktreeSdk => Err("worktree-sdk must be dispatched before connection".into()),
             CliDriverSuite::Worktrees => Err("worktrees must be dispatched before connection".into()),
-            CliDriverSuite::AssetMerge => worktree_merge::run_asset_merge(&app_handle, &project, &config, &sink).await,
+            CliDriverSuite::AssetMerge => Box::pin(worktree_merge::run_asset_merge(&app_handle, &project, &config, &sink)).await,
+            CliDriverSuite::AssetMergeMatrix => Box::pin(merge_matrix::run_suite(&project, &config, &sink)).await,
             CliDriverSuite::AssetApi => Err("asset-api must be dispatched before connection".into()),
             CliDriverSuite::ProjectPool => project_pool_acceptance::run(&app_handle, &project, &config, &sink).await,
             CliDriverSuite::Workspace => Err(
@@ -1266,19 +1271,7 @@ async fn run_workspace_suite(
         .inner()
         .clone();
     let policy_before = resource_policy.snapshot();
-    let mut workspace_limits = policy_before.limits.clone();
-    workspace_limits.max_running_workspace_services = workspace_limits
-        .max_running_workspace_services
-        .max(projects.len());
-    workspace_limits.max_lsp_processes = workspace_limits.max_lsp_processes.max(projects.len());
-    let policy_after = if workspace_limits == policy_before.limits {
-        policy_before.clone()
-    } else {
-        resource_policy
-            .update(workspace_limits)
-            .map_err(|error| format!("Failed to prepare workspace test resource policy: {error}"))?
-    };
-    registry.notify_policy_changed();
+    let policy_after = policy_before.clone();
     registry.converge_resource_policy().await;
     sink.emit(
         "workspace_policy",
@@ -1935,18 +1928,7 @@ async fn run_workspace_switch_suite(
         .inner()
         .clone();
     let policy_before = resource_policy.snapshot();
-    let mut workspace_limits = policy_before.limits.clone();
-    workspace_limits.max_running_workspace_services = workspace_limits
-        .max_running_workspace_services
-        .max(projects.len());
-    let policy_after = if workspace_limits == policy_before.limits {
-        policy_before.clone()
-    } else {
-        resource_policy
-            .update(workspace_limits)
-            .map_err(|error| format!("Failed to prepare workspace test resource policy: {error}"))?
-    };
-    registry.notify_policy_changed();
+    let policy_after = policy_before.clone();
     registry.converge_resource_policy().await;
     sink.emit(
         "workspace_policy",
