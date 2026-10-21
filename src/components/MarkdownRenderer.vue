@@ -888,19 +888,34 @@ function handleMarkdownWheel(event: WheelEvent) {
   opacity: 0.8;
 }
 
+/* The frame draws the border and clips the rounded corners and edge shadows;
+   .md-table-scroll inside it is the horizontal scroller. */
 .markdown-body .md-table-wrap {
+  --md-table-edge-shadow: rgba(17, 19, 24, 0.12);
+  position: relative;
+  isolation: isolate;
   width: fit-content;
   max-width: 100%;
   box-sizing: border-box;
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--border-color) 88%, transparent);
   border-radius: 8px;
   background: color-mix(in srgb, var(--panel-bg) 90%, var(--sidebar-bg) 10%);
 }
 
+:root[data-theme="dark"] .markdown-body .md-table-wrap {
+  --md-table-edge-shadow: rgba(0, 0, 0, 0.48);
+}
+
+.markdown-body .md-table-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* Auto width wraps long cells inside the available width; the table scrolls
+   only once the per-column minimum widths no longer fit. */
 .markdown-body table {
-  width: max-content;
+  width: auto;
   min-width: 100%;
   margin: 0;
   border-collapse: separate;
@@ -942,6 +957,78 @@ function handleMarkdownWheel(event: WheelEvent) {
 
 .markdown-body tbody tr:nth-child(even) td {
   background: color-mix(in srgb, var(--panel-bg) 82%, var(--hover-bg) 18%) !important;
+}
+
+/* The first column stays pinned while wider tables scroll; the opaque cell
+   backgrounds above keep scrolled columns from showing through. */
+.markdown-body .md-table-scroll :is(th, td):first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+}
+
+/* Edge shadows follow the scroll position without script: the right one shows
+   while columns remain past the visible edge, the left one once columns have
+   scrolled under the pinned first column. A table that fits has an inactive
+   scroll timeline, so both keep their base opacity of 0. */
+@supports (animation-timeline: scroll()) {
+  .markdown-body .md-table-wrap {
+    timeline-scope: --md-table-scroll;
+  }
+
+  .markdown-body .md-table-scroll {
+    scroll-timeline: --md-table-scroll x;
+  }
+
+  .markdown-body .md-table-wrap::after,
+  .markdown-body .md-table-scroll :is(th, td):first-child::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    pointer-events: none;
+    opacity: 0;
+  }
+
+  .markdown-body .md-table-wrap::after {
+    right: 0;
+    bottom: 0;
+    z-index: 2;
+    width: 20px;
+    background: linear-gradient(to left, var(--md-table-edge-shadow), transparent);
+    animation: md-table-end-shadow linear both;
+    animation-timeline: --md-table-scroll;
+  }
+
+  .markdown-body .md-table-scroll :is(th, td):first-child::after {
+    bottom: -1px;
+    left: calc(100% + 1px);
+    width: 14px;
+    background: linear-gradient(to right, var(--md-table-edge-shadow), transparent);
+    animation: md-table-start-shadow linear both;
+    animation-timeline: --md-table-scroll;
+  }
+}
+
+@keyframes md-table-end-shadow {
+  0%,
+  92% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes md-table-start-shadow {
+  0% {
+    opacity: 0;
+  }
+
+  8%,
+  100% {
+    opacity: 1;
+  }
 }
 
 .markdown-body code {
