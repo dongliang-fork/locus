@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.9.0 (2026-10-18)"
+description: "Locus v0.9.1 (2026-10-21)"
 sidebarTitle: "Latest Version"
-version: "0.9.0"
-releasedAt: "2026-10-18"
+version: "0.9.1"
+releasedAt: "2026-10-21"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,66 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.0/locus_0.9.0_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.9.0/locus_0.9.0_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.9.1 (Added)
+
+- You can choose where new worktrees are stored in Settings; by default they go next to the repository. The `--locus-worktree-root` launch option or the `LOCUS_WORKTREE_ROOT` environment variable overrides it for one run.
+- Worktrees can now be created for repositories with submodules and for projects that use local packages inside the repository (`file:` dependencies).
+- Worktree creation shows how many files have been checked out. Closing the picker no longer stops it: creation continues in the background and appears in the background task list of every window.
+- A session that runs in a worktree stays in its workspace's layout, and its tab shows the worktree. New sessions start in the worktree you last chose for the project, and the chat input shows the current branch.
+- Worktrees created by Locus are no longer listed as separate recent workspaces; you open them from their source workspace.
+- The file explorer can create and delete folders. Select several items with Ctrl/Shift to copy their paths, delete, hide, or drag them together.
+- Editor tabs can open local files outside the workspace, for example from file references in chat. These tabs are marked "Outside workspace".
+- In a new session that has not started yet, the chat input attaches the text selected in the current document (path, line numbers, and content). You can remove the attachment.
+- You can `@` mention local and remote Git branches in the chat input.
+- The Collaboration and Agent pages now open on top of the list and editor tabs, and closing them restores the previous layout. On narrow widths the Collaboration page shows only the commit history.
+- Asset search finds glTF models, Shader Graph files, and common text, UI Toolkit, and assembly definition files. The asset index is rebuilt once when a project is first opened.
+- When merging branches, code and plain-text files merge line by line with a three-way merge. Conflicts are shown with diff3 markers, and the Agent can write the merged result directly.
+- Prefab overrides, objects added to or removed from prefab instances, managed references, and similar lists merge element by element.
+- After a merge is applied, Unity reimports the written assets and reloads open scenes and prefabs from disk. Assets with unsaved changes are reported and never overwritten.
+- OpenRouter endpoints can turn on server-side web search and choose the search engine (Auto, native, Exa, Parallel, Firecrawl, Perplexity). Search sources appear as citations, and later turns can use them without searching again.
+- When signed in with a Codex subscription, Codex models can use Codex's built-in web tool to search, open pages, and find text on a page.
+- The Agent can ask several questions at once. You can pick multiple options, write your own answer, move between questions, and submit all answers together. The Python SDK's `run.answer` accepts questionnaire answers.
+- Claude Code sessions show the current stage in the conversation, such as preparing, thinking, calling tools, or writing a reply.
+- When Claude Code fails to start in the background, the reason is shown in the status bar. After a lost connection, it reconnects and restores the conversation automatically.
+- You can set Claude Code's auto-compact threshold. Results of Claude's native task tools are shown as to-do lists.
+- Context statistics check prompt cache reuse for each request and show how many requests could be checked.
+- Cost shows only what the provider reports; when the provider reports none, it shows "Not reported".
+- The session database is cleaned up in the background: old request captures are removed and the file is compacted, with progress shown. Locus tells you when there is not enough disk space.
+- The Claude subscription model list now has Opus 5.5 (default), Fable 5.1, Sonnet 5.5, and Haiku 5.5.
+- Python SDK: new `worktrees.defaults()`, and the directory can be omitted when creating a worktree; merge jobs have new `all_changes()` and `set_text()`.
+
+### v0.9.1 (Fixed)
+
+- Workspace and Workbench windows opened while Locus is running now accept files dragged in from your computer.
+- Knowledge documents save in the background without locking the title or property buttons, and the page no longer shifts while saving.
+- Only CSV knowledge documents show the unsaved marker, and the file editor no longer flashes the disk conflict bar during autosave.
+- Renaming a Markdown document's title keeps focus in the input.
+- Long cells in Markdown tables wrap within the available width. When a table scrolls sideways, its first column stays in place and edge shadows appear.
+- In `@` mentions and global search, file-name matches come before path matches, and scattered matches across long paths no longer appear.
+- Queued messages and messages inserted mid-run are no longer lost or sent twice before delivery is confirmed. Undelivered messages are kept and marked "Not delivered" so you can edit or resend them.
+- When the Codex service refuses an inserted message, the session stops inserting messages and retries the request.
+- With web search on Anthropic-format endpoints, earlier search results are sent back to the model in their original format, so the model no longer treats them as its own text and makes up results.
+- `web_fetch` recognizes pages that do not declare their encoding, checks the destination of every redirect, and converts large HTML pages more reliably.
+- Grep and Claude Code's Grep now use the same search engine and are faster in large workspaces.
+- The Locus Unity plugin compiles on older Unity versions. Unsupported features (frame timing stats, spatial capture) state which Unity version they need.
+- When a Unity test run starts, it reports the number of tests that actually run after filtering.
+- Lists in Unity assets keep their original layout; only changed elements are written.
+- Exporting and forking sessions no longer copies the whole database, so they finish on large databases.
+- Full model request captures are recorded only in debug mode, which keeps the session database from growing quickly.
+- If the data directory is in use by another Locus process, startup shows a dialog explaining why instead of crashing.
+- The Git branch list correctly handles branches checked out in other worktrees and a detached HEAD.
+- "Delete workspace" in the workspace tree is now "Remove workspace"; it only removes the workspace from the tree and does not delete any files.
+
+### v0.9.1 (Removed)
+
+- The Resources settings page no longer limits how many sessions, Unity Editors, workspace services, code language services, and compile jobs run at once; only the idle timeout remains. These limits in older configs are ignored.
+- Claude Code and Codex sessions no longer offer Locus's `web_fetch` tool and use their own built-in web tools instead. Other models can still use `web_fetch`.
 
 ### v0.9.0 (Added)
 
