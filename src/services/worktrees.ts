@@ -36,6 +36,8 @@ export interface WorktreeCreationPlan {
   requiresNewProject: boolean;
   atCapacity: boolean;
   budget: WorktreeDiskBudget | null;
+  /** Pool root or container the reviewed creation will use. */
+  directory: string;
 }
 export interface WorktreePoolUsage {
   items: Array<{ worktree: ManagedWorktree; sizeBytes: number }>;
@@ -54,11 +56,13 @@ export interface PlanWorktreeCreationRequest {
   startRef: string;
   includeDirty: boolean;
   poolMode: boolean;
-  directory: string;
-  maxSlots: number;
+  /** Omit to use the configured container or a reusable pool slot's directory. */
+  directory?: string;
+  maxSlots: number | null;
 }
 export interface WorktreePlanProgress {
-  phase: "checking" | "checkout" | "untracked" | "cache" | "space" | "creating";
+  /** `creating` carries git's checked-out file count once the checkout starts. */
+  phase: "checking" | "checkout" | "untracked" | "cache" | "space" | "creating" | "finalizing";
   files: number;
   totalFiles: number | null;
   bytes: number;
@@ -94,9 +98,17 @@ export interface ManagedWorktree {
 }
 
 export interface CreateWorktreeRequest {
-  sourceRoot: string; destination: string; branch: string;
+  /** Omit to create a new directory in the configured container. */
+  sourceRoot: string; destination?: string; branch: string;
   startRef?: string | null; includeDirty: boolean;
 }
+
+/** Base directory for new worktrees; a process override wins over the setting. */
+export interface WorktreeRootSettings { settingsRoot: string | null; processRoot: string | null }
+export const getWorktreeRootSettings = () => ipcInvoke<WorktreeRootSettings>("get_worktree_root_settings");
+export const setWorktreeRootSetting = (root: string | null) => ipcInvoke<WorktreeRootSettings>("set_worktree_root_setting", { root });
+export interface WorktreeDefaults { container: string; rootSource: "process" | "settings" | "repository"; maxSlots: number | null }
+export const getWorktreeDefaults = (sourceRoot: string) => ipcInvoke<WorktreeDefaults>("get_worktree_defaults", { sourceRoot });
 
 export const createWorktree = (request: CreateWorktreeRequest) => ipcInvoke<ManagedWorktree>("create_worktree", { request });
 export const listManagedWorktrees = (sourceRoot: string) => ipcInvoke<ManagedWorktree[]>("list_managed_worktrees", { sourceRoot });
@@ -107,9 +119,6 @@ export const removeManagedWorktree = (sourceRoot: string, item: ManagedWorktree)
 });
 
 export interface WorkspaceResourceLimits {
-  maxRunningSessions: number; maxUnityEditors: number;
-  maxRunningWorkspaceServices: number; maxWatchedWorkspaces: number; maxLspProcesses: number;
-  maxConcurrentServiceStarts: number; maxConcurrentCompileJobs: number; maxCompileQueueDepth: number;
   workspaceIdleTimeoutSecs: number; serviceIdleTimeoutSecs: number; lspIdleTimeoutSecs: number;
 }
 export interface ResourcePolicySnapshot { revision: number; limits: WorkspaceResourceLimits }
@@ -129,7 +138,7 @@ export const getUnityEditorResources = () => ipcInvoke<UnityEditorResource[]>("g
 
 export interface AcquirePoolRequest {
   sourceRoot: string; poolRoot: string; commit: string; branch?: string | null;
-  maxSlots: number; assignmentId?: string | null;
+  maxSlots: number | null; assignmentId?: string | null;
 }
 export const acquireUnityProjectSlot = (request: AcquirePoolRequest, allowNewProject = false) => ipcInvoke<{
   worktree: ManagedWorktree; reused: boolean; preservedLibrary: boolean;

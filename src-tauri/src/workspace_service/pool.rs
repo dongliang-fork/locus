@@ -11,13 +11,15 @@ use super::worktrees::{self, ManagedWorktree, WorktreeStore};
 #[serde(rename_all = "camelCase")]
 pub struct AcquirePoolRequest {
     pub source_root: String,
+    /// Request handlers resolve an empty value through `WorktreePolicy`.
+    #[serde(default)]
     pub pool_root: String,
     pub commit: String,
     #[serde(default)]
     pub branch: Option<String>,
-    /// Upper bound on physical slots, supplied from the user's concurrency /
-    /// storage settings. Existing assignments survive lowering this limit.
-    pub max_slots: usize,
+    /// Optional caller-supplied storage budget. No application-wide slot cap.
+    #[serde(default)]
+    pub max_slots: Option<usize>,
     #[serde(default)]
     pub assignment_id: Option<String>,
 }
@@ -193,7 +195,7 @@ pub fn acquire(request: &AcquirePoolRequest) -> Result<PoolAcquisition, String> 
 pub const NEW_PROJECT_REQUIRED: &str = "WORKTREE_NEW_PROJECT_REQUIRED: No reusable project is available; creating a local project requires confirmation";
 
 pub fn acquire_with_creation_policy(request: &AcquirePoolRequest, allow_new_project: bool) -> Result<PoolAcquisition, String> {
-    if request.max_slots == 0 {
+    if request.max_slots == Some(0) {
         return Err("The project pool is disabled (maxSlots is zero)".into());
     }
     if request.commit.starts_with('-') {
@@ -224,7 +226,7 @@ pub fn acquire_with_creation_policy(request: &AcquirePoolRequest, allow_new_proj
             &format!("{}^{{commit}}", request.commit),
         ],
     )?;
-    worktrees::ensure_tree_supported(&repo, &oid, &relative)?;
+    let submodules = worktrees::ensure_tree_supported(&repo, &oid, &relative)?;
     let version = version_at(&repo, &oid, &relative)?;
     if !version.starts_with("6000.5.") {
         return Err(format!(
@@ -365,13 +367,18 @@ pub fn acquire_with_creation_policy(request: &AcquirePoolRequest, allow_new_proj
             .insert(record.checkout_id.clone(), record.clone());
         store.save()?;
         let result: Result<PoolAcquisition, String> = (|| {
-            worktrees::git(
+            // A superproject checkout neither moves nor removes submodule
+            // checkouts; retire those the target drops, then realign the rest.
+            worktrees::submodules::prune(slot, &submodules)?;
+            // git only meters a checkout on a terminal unless asked.
+            worktrees::git_checkout(
                 slot,
-                &["checkout", "--detach", "--no-overwrite-ignore", &oid, "--"],
+                &["checkout", "--progress", "--detach", "--no-overwrite-ignore", &oid, "--"],
             )?;
             if let Some(branch) = &request.branch {
                 worktrees::git(slot, &["checkout", "-b", branch])?;
             }
+            worktrees::submodules::materialize(slot, &submodules)?;
             invalidate_locus_projections(Path::new(&record.root))?;
             worktrees::ensure_lfs_materialized(slot)?;
             ensure_source_files_isolated(&record)?;
@@ -425,9 +432,9 @@ pub fn acquire_with_creation_policy(request: &AcquirePoolRequest, allow_new_proj
                     .is_some_and(|p| worktrees::path_key(p) == worktrees::path_key(&pool_root))
         })
         .count();
-    if occupied >= request.max_slots {
+    if let Some(limit) = request.max_slots.filter(|limit| occupied >= *limit) {
         let detail = if rejected_sources.is_empty() { String::new() } else { format!("; {}", rejected_sources.join("; ")) };
-        return Err(format!("Project pool is at capacity ({occupied}/{}); wait for a compatible clean slot or raise maxSlots{detail}", request.max_slots));
+        return Err(format!("Project pool is at capacity ({occupied}/{limit}); wait for a compatible clean slot or raise maxSlots{detail}"));
     }
     // Reserve capacity durably before releasing the registry lock to enter
     // create(); pending reservations count for every concurrent acquire.
@@ -517,6 +524,17 @@ fn complete_reservation(
             {
                 return Err("Interrupted pool directory no longer matches its reserved commit, branch or Editor version".into());
             }
+            // The interruption may have preceded submodule materialization.
+            let repo = worktrees::canonical(Path::new(&worktrees::git_text(
+                source,
+                &["rev-parse", "--show-toplevel"],
+            )?))?;
+            let submodules = worktrees::ensure_tree_supported(
+                &repo,
+                &reservation.head_oid,
+                &reservation.project_relative_path,
+            )?;
+            worktrees::submodules::materialize(destination, &submodules)?;
             let normalized = super::identity::normalize_existing_workspace_root(&reservation.root)
                 .map_err(|e| e.to_string())?;
             let id = super::identity::CheckoutId::from_normalized_root(&normalized).to_string();
@@ -644,6 +662,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn omitted_slot_budget_allows_new_assignments_while_explicit_budgets_are_respected() {
+        let (temp, repo) = worktrees::tests::fixture();
+        let pool_root = temp.path().join("pool");
+        std::fs::create_dir(&pool_root).unwrap();
+        let mut request = AcquirePoolRequest {
+            source_root: repo.to_string_lossy().into(),
+            pool_root: pool_root.to_string_lossy().into(),
+            commit: "HEAD".into(),
+            branch: None,
+            max_slots: Some(1),
+            assignment_id: Some("first".into()),
+        };
+        let first = acquire(&request).unwrap();
+        request.assignment_id = Some("second".into());
+        assert!(acquire(&request).unwrap_err().contains("at capacity"));
+        request.max_slots = None;
+        let second = acquire(&request).unwrap();
+        assert_ne!(first.worktree.checkout_id, second.worktree.checkout_id);
+        assert!(!second.reused);
+        assert_eq!(worktrees::list(&repo).unwrap().len(), 2);
+    }
+
+    #[test]
     fn ignored_scripts_and_settings_cannot_cross_pool_assignments() {
         for relative in ["Assets/Old.cs", "ProjectSettings/Old.json"] {
             let (temp, repo) = worktrees::tests::fixture();
@@ -658,7 +699,7 @@ mod tests {
             let mut request = AcquirePoolRequest {
                 source_root: repo.to_string_lossy().into(),
                 pool_root: pool_root.to_string_lossy().into(),
-                commit: "HEAD".into(), branch: None, max_slots: 1,
+                commit: "HEAD".into(), branch: None, max_slots: Some(1),
                 assignment_id: Some("old-source-a".into()),
             };
             let first = acquire(&request).unwrap();
@@ -701,7 +742,7 @@ mod tests {
             pool_root: pool_root.to_string_lossy().into(),
             commit: "HEAD".into(),
             branch: None,
-            max_slots: 1,
+            max_slots: Some(1),
             assignment_id: Some("inside-source".into()),
         });
         assert!(result
@@ -770,7 +811,7 @@ mod tests {
             pool_root: pool_root.to_string_lossy().into(),
             commit: "HEAD".into(),
             branch: None,
-            max_slots: 1,
+            max_slots: Some(1),
             assignment_id: Some("crash-job".into()),
         };
         assert!(acquire(&request).is_err());
@@ -825,7 +866,7 @@ mod tests {
             pool_root: pool_root.to_string_lossy().into(),
             commit: "HEAD".into(),
             branch: None,
-            max_slots: 1,
+            max_slots: Some(1),
             assignment_id: Some("interrupted-job".into()),
         };
         // A clean Git status alone must not authorize crash recovery.
@@ -854,7 +895,7 @@ mod tests {
             pool_root: pool_root.to_string_lossy().into(),
             commit: "HEAD".into(),
             branch: None,
-            max_slots: 1,
+            max_slots: Some(1),
             assignment_id: Some("job-a".into()),
         };
         let first = acquire(&request).unwrap();
@@ -941,7 +982,7 @@ mod tests {
             pool_root: pool_root.to_string_lossy().into(),
             commit: reservation.head_oid,
             branch: None,
-            max_slots: 1,
+            max_slots: Some(1),
             assignment_id: Some("interrupted-list-job".into()),
         };
         assert!(acquire(&request).unwrap_err().contains("no longer matches"));
@@ -962,7 +1003,7 @@ mod tests {
             pool_root: pool_root.to_string_lossy().into(),
             commit: "HEAD".into(),
             branch: None,
-            max_slots: 1,
+            max_slots: Some(1),
             assignment_id: Some("a".into()),
         };
         let first = acquire(&request).unwrap();

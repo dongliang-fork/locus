@@ -36,6 +36,10 @@ const props = defineProps<{
   worktreeEnabled?: boolean;
   worktreeLocked?: boolean;
   selectWorktree?: (item: ManagedWorktree) => Promise<void>;
+  /** Composer that adopts a worktree created in the background. */
+  worktreeOwnerKey?: string;
+  /** Branch of the session's checkout, shown after the effort when worktrees are enabled. */
+  worktreeBranch?: string;
 }>();
 
 const emit = defineEmits<{
@@ -168,10 +172,12 @@ const groupedModels = computed<ModelSelectorGroup[]>(() =>
   groupModelsForSelector(props.models, visibleProviderOrder, providerLabels.value),
 );
 
+const branchLabel = computed(() => (props.worktreeEnabled ? props.worktreeBranch?.trim() ?? "" : ""));
 const triggerTitle = computed(() => {
   const modelTitle = selectedModel.value?.id || t("model.select");
   const parts = [selectedAgent.value?.name, modelTitle].filter(Boolean);
   if (props.effortSupported && currentLevel.value) parts.push(currentLevel.value.desc);
+  if (branchLabel.value) parts.push(branchLabel.value);
   return parts.join(" / ");
 });
 
@@ -270,6 +276,7 @@ function onClickOutside(event: MouseEvent) {
       >
         {{ currentLevel.label }}
       </span>
+      <span v-if="branchLabel" class="model-effort-branch">{{ branchLabel }}</span>
       <span class="model-effort-chevron">&#9662;</span>
     </button>
 
@@ -392,6 +399,7 @@ function onClickOutside(event: MouseEvent) {
             :workspace-ref="workspaceRef"
             :locked="worktreeLocked || disabled"
             :select-worktree="selectWorktree"
+            :owner-key="worktreeOwnerKey"
             @busy="setWorktreeBusy"
             @selected="open = false"
           />
@@ -416,7 +424,8 @@ function onClickOutside(event: MouseEvent) {
   gap: 4px;
   min-width: 0;
   min-height: 28px;
-  max-width: min(280px, 100%);
+  /* Use the footer's free width; labels ellipsize only when it runs out. */
+  max-width: 100%;
   padding: 4px 7px;
   border: 1px solid transparent;
   border-radius: 6px;
@@ -463,15 +472,31 @@ function onClickOutside(event: MouseEvent) {
   text-overflow: ellipsis;
 }
 
-.model-effort-agent::after {
+/* On the model side so a truncated Agent name keeps its separator. */
+.model-effort-agent + .model-effort-model::before {
   content: "|";
-  margin-left: 4px;
+  margin-right: 4px;
   color: var(--text-secondary);
 }
 
 .model-effort-level {
   flex-shrink: 0;
   font-weight: 500;
+}
+
+.model-effort-branch {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-effort-branch::before {
+  content: "|";
+  margin-right: 4px;
+  color: var(--text-secondary);
 }
 
 .model-effort-chevron {

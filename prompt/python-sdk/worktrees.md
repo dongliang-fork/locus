@@ -8,8 +8,8 @@ for wt in worktrees:
     print(wt.checkout_id, wt.root, wt.branch, wt.lifecycle, wt.assignment_id)
 
 a = await locus.worktrees.create(
-    destination="F:/UnityWorktrees/feature-a",  # Absolute, unused directory; parent must exist.
     branch="feature-a", start_ref="HEAD", include_dirty=False,
+    # destination="F:/UnityWorktrees/feature-a",  # Optional absolute, unused directory; parent must exist.
 )
 # Explicitly resolve/reopen an existing active managed/imported checkout:
 a = await locus.worktrees.get(a.checkout_id)
@@ -19,6 +19,8 @@ external_paths = await locus.worktrees.discover()
 # external = await locus.worktrees.import_worktree(external_paths[0])
 ```
 
+Omitted directories use one container per repository: `<root>/<repository>.worktrees`. The root is the process override (`--locus-worktree-root` / `LOCUS_WORKTREE_ROOT`), else the app setting, else the main repository's parent. `await locus.worktrees.defaults()` returns the resolved `container`, `root_source` (`process`, `settings` or `repository`) and default `max_slots`. Changing the root never moves existing checkouts.
+
 `include_dirty=True` creates a private snapshot of the source's local state; the source HEAD/index/files remain intact. It cannot be combined with an unrelated `start_ref`. `list()` includes idle, removed and quarantined records; only active assignments can run tools. It does not start Editor/services. Use `get()` to explicitly register an active checkout after a Locus restart. Failed/interrupted operations can be inspected via `operations()`.
 
 The returned `Worktree` is accepted as `worktree=` by `call_tool`, `ToolInfo.call`, `list_tools`, `get_tool`, `get_workspace`, all Unity lifecycle/dialog/execution-wait APIs, and `merges.prepare/get`. Existing `workspace_ref=` remains supported. Do not supply both selectors. A bare checkout ID must first be resolved with `worktrees.get(id)`.
@@ -27,8 +29,9 @@ For managed worktrees, call Unity tools directly. Locus reuses an existing Edito
 
 ```python
 slot = await locus.worktrees.acquire(
-    pool_root="F:/UnityPool", commit=source_oid, max_slots=2,
+    commit=source_oid,
     assignment_id="merge-source-analysis",  # Optional idempotent assignment key.
+    # pool_root="F:/UnityPool", max_slots=2,  # Optional explicit pool and capacity.
 )
 b = slot.worktree
 print(slot.reused, slot.preserved_library, b.materialization_epoch)
@@ -46,7 +49,7 @@ for wt, result in zip((a, b), results):
     print(wt.checkout_id, result.output)
 ```
 
-`max_slots` bounds physical slots in this repository/project pool. It does not increase the app's Editor concurrency setting. An exact Unity Editor version match is required to reuse a private Library. There is no writable Library sharing between active checkouts. Ensure uses per-checkout lifecycle coordination; independent checkouts can start and execute concurrently, subject to existing service/Editor budgets.
+Without `pool_root`, a released compatible slot is reused wherever it lives; otherwise a new slot is created in the default container. `max_slots` is an optional physical-slot storage budget for that pool directory; omitting it leaves the slot count unlimited. An exact Unity Editor version match is required to reuse a private Library. There is no writable Library sharing between active checkouts. Ensure uses per-checkout lifecycle coordination; independent checkouts can start and execute concurrently, without a global service/Editor count limit.
 
 To finish an assignment, first close its Editor, preserve or commit source changes as appropriate, then release it. Source/index dirtiness, live runtime leases, open Editors, stale assignment IDs or epochs reject recycling. Removing a worktree never force-discards local work or deletes its branch.
 

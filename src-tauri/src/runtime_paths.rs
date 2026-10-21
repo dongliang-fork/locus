@@ -8,6 +8,8 @@ pub(crate) const RUNTIME_DATA_DIR_ENV: &str = "LOCUS_RUNTIME_DATA_DIR";
 pub(crate) const RUNTIME_CONFIG_DIR_ENV: &str = "LOCUS_RUNTIME_CONFIG_DIR";
 pub(crate) const RUNTIME_LOG_DIR_ENV: &str = "LOCUS_RUNTIME_LOG_DIR";
 pub(crate) const RUNTIME_WORKSPACE_DIR_ENV: &str = "LOCUS_RUNTIME_WORKSPACE_DIR";
+/// Process-wide base for new worktrees; overrides the persisted setting.
+pub(crate) const RUNTIME_WORKTREE_ROOT_ENV: &str = "LOCUS_WORKTREE_ROOT";
 pub(crate) const WEBVIEW_DATA_DIR_ENV: &str = "WEBVIEW2_USER_DATA_FOLDER";
 pub(crate) const SKIP_ONBOARDING_ENV: &str = "LOCUS_SKIP_ONBOARDING";
 pub(crate) const TEST_ROOT_ENV: &str = "LOCUS_TEST_ROOT";
@@ -28,6 +30,7 @@ pub(crate) struct RuntimeLaunchOptions {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) log_dir: Option<PathBuf>,
     pub(crate) workspace_dir: Option<PathBuf>,
+    pub(crate) worktree_root: Option<PathBuf>,
     pub(crate) webview_data_dir: Option<PathBuf>,
     pub(crate) skip_onboarding: bool,
 }
@@ -42,6 +45,7 @@ struct ParsedRuntimeArgs {
     config_dir: Option<PathBuf>,
     log_dir: Option<PathBuf>,
     workspace_dir: Option<PathBuf>,
+    worktree_root: Option<PathBuf>,
     webview_data_dir: Option<PathBuf>,
     skip_onboarding: bool,
 }
@@ -62,6 +66,7 @@ impl RuntimeLaunchOptions {
             config_dir: directory_from_env(RUNTIME_CONFIG_DIR_ENV, "config directory")?,
             log_dir: directory_from_env(RUNTIME_LOG_DIR_ENV, "log directory")?,
             workspace_dir: directory_from_env(RUNTIME_WORKSPACE_DIR_ENV, "workspace directory")?,
+            worktree_root: directory_from_env(RUNTIME_WORKTREE_ROOT_ENV, "worktree directory")?,
             webview_data_dir: directory_from_env(WEBVIEW_DATA_DIR_ENV, "WebView data directory")?,
             skip_onboarding: bool_from_env(SKIP_ONBOARDING_ENV),
         })
@@ -73,6 +78,7 @@ impl RuntimeLaunchOptions {
             && self.config_dir.is_none()
             && self.log_dir.is_none()
             && self.workspace_dir.is_none()
+            && self.worktree_root.is_none()
             && self.webview_data_dir.is_none()
         {
             return;
@@ -86,6 +92,7 @@ impl RuntimeLaunchOptions {
             "logDir": display_path(self.log_dir.as_deref()),
             "logFile": self.log_dir.as_ref().map(|path| path.join("locus.log").display().to_string()),
             "workspace": display_path(self.workspace_dir.as_deref()),
+            "worktreeRoot": display_path(self.worktree_root.as_deref()),
             "webviewDataDir": display_path(self.webview_data_dir.as_deref()),
             "skipOnboarding": self.skip_onboarding,
         });
@@ -121,6 +128,9 @@ impl ParsedRuntimeArgs {
                 }
                 "--locus-workspace" => {
                     parsed.workspace_dir = Some(read_path_value(name, inline, &args, &mut index)?)
+                }
+                "--locus-worktree-root" => {
+                    parsed.worktree_root = Some(read_path_value(name, inline, &args, &mut index)?)
                 }
                 "--locus-webview-data-dir" => {
                     parsed.webview_data_dir =
@@ -160,6 +170,10 @@ impl ParsedRuntimeArgs {
             self.log_dir.get_or_insert_with(|| root.join("logs"));
             self.workspace_dir
                 .get_or_insert_with(|| root.join("workspace"));
+            // Isolated runtimes keep generated checkouts beside their other
+            // state so removing the runtime root removes them too.
+            self.worktree_root
+                .get_or_insert_with(|| root.join("worktrees"));
             self.webview_data_dir
                 .get_or_insert_with(|| root.join("webview"));
         }
@@ -169,6 +183,7 @@ impl ParsedRuntimeArgs {
         apply_directory_override(RUNTIME_CONFIG_DIR_ENV, self.config_dir.as_deref())?;
         apply_directory_override(RUNTIME_LOG_DIR_ENV, self.log_dir.as_deref())?;
         apply_directory_override(RUNTIME_WORKSPACE_DIR_ENV, self.workspace_dir.as_deref())?;
+        apply_directory_override(RUNTIME_WORKTREE_ROOT_ENV, self.worktree_root.as_deref())?;
         apply_directory_override(WEBVIEW_DATA_DIR_ENV, self.webview_data_dir.as_deref())?;
         if self.skip_onboarding {
             std::env::set_var(SKIP_ONBOARDING_ENV, "1");
@@ -193,6 +208,7 @@ fn print_runtime_help() {
   --locus-config-dir <dir>         Persistent application configuration directory\n\
   --locus-log-dir <dir>            Directory containing locus.log\n\
   --locus-workspace <dir>          Initial workspace\n\
+  --locus-worktree-root <dir>      Base directory for new worktrees in this process\n\
   --locus-webview-data-dir <dir>   WebView2 profile and local storage\n\
   --locus-skip-onboarding          Open directly in Chat for this runtime\n\
   --locus-runtime-help             Show this help"
@@ -205,6 +221,12 @@ pub(crate) fn runtime_config_dir_from_env() -> Result<Option<PathBuf>, String> {
 
 pub(crate) fn runtime_log_dir_from_env() -> Result<Option<PathBuf>, String> {
     directory_from_env(RUNTIME_LOG_DIR_ENV, "log directory")
+}
+
+/// Process-level worktree base from `--locus-worktree-root` or
+/// `LOCUS_WORKTREE_ROOT`. Takes precedence over the persisted setting.
+pub(crate) fn runtime_worktree_root_from_env() -> Result<Option<PathBuf>, String> {
+    directory_from_env(RUNTIME_WORKTREE_ROOT_ENV, "worktree directory")
 }
 
 fn bool_from_env(key: &str) -> bool {
@@ -322,6 +344,7 @@ mod tests {
         let config = root.path().join("config");
         let log = root.path().join("log");
         let workspace = root.path().join("workspace");
+        let worktrees = root.path().join("worktrees");
         let parsed = ParsedRuntimeArgs::parse(args(&[
             "--locus-database-dir",
             data.to_str().unwrap(),
@@ -330,6 +353,7 @@ mod tests {
             log.to_str().unwrap(),
             "--locus-workspace",
             workspace.to_str().unwrap(),
+            &format!("--locus-worktree-root={}", worktrees.display()),
         ]))
         .expect("parse");
 
@@ -337,6 +361,14 @@ mod tests {
         assert_eq!(parsed.config_dir.as_deref(), Some(config.as_path()));
         assert_eq!(parsed.log_dir.as_deref(), Some(log.as_path()));
         assert_eq!(parsed.workspace_dir.as_deref(), Some(workspace.as_path()));
+        assert_eq!(parsed.worktree_root.as_deref(), Some(worktrees.as_path()));
+    }
+
+    #[test]
+    fn rejects_relative_worktree_root() {
+        let error = ParsedRuntimeArgs::parse(args(&["--locus-worktree-root", "worktrees"]))
+            .expect_err("relative path should fail");
+        assert!(error.contains("--locus-worktree-root"));
     }
 
     #[test]

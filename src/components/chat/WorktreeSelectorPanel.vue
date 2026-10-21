@@ -4,17 +4,20 @@ import { Check, GitBranch, LockKeyhole, Plus, Search } from "lucide";
 import { t } from "../../i18n";
 import type { WorkspaceRef } from "../../services/project";
 import { normalizeAppError } from "../../services/errors";
-import { listWorktreeBranches, planWorktreeSelection, selectWorktreeBranch, type ManagedWorktree, type WorktreeBranchOption, type WorktreeCreationPlan, type SelectWorktreeRequest, type WorktreePlanProgress as PlanProgress } from "../../services/worktrees";
+import { listWorktreeBranches, planWorktreeSelection, type ManagedWorktree, type WorktreeBranchOption, type WorktreeCreationPlan, type SelectWorktreeRequest, type WorktreePlanProgress as PlanProgress } from "../../services/worktrees";
 import LucideIcon from "../icons/LucideIcon.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import WorktreeCreationBudget from "../workbench/WorktreeCreationBudget.vue";
 import WorktreePlanProgress from "../workbench/WorktreePlanProgress.vue";
+import { dismissWorktreeCreation, startWorktreeCreation, worktreeCreationJob, worktreeSelectionError } from "./worktreeCreationJobs";
 
 const props = defineProps<{
   workspaceRef: WorkspaceRef;
   locked?: boolean;
   selectWorktree: (item: ManagedWorktree) => Promise<void>;
+  /** Composer that adopts a created worktree; defaults to the source checkout. */
+  ownerKey?: string;
 }>();
 const emit = defineEmits<{ busy: [value: boolean]; selected: [] }>();
 const options = ref<WorktreeBranchOption[]>([]);
@@ -23,7 +26,12 @@ const branch = ref("");
 const includeDirty = ref(true);
 const creating = ref(false);
 const loading = ref(false);
-const busy = ref(false);
+// Creation itself runs as a background job, so only the budget review holds the popup open.
+const busy = computed(() => pendingProject.value !== null);
+const owner = computed(() => props.ownerKey ?? `checkout:${props.workspaceRef.checkoutId}`);
+const job = computed(() => worktreeCreationJob(owner.value));
+const running = computed(() => job.value?.status === "running");
+const displayedError = computed(() => error.value || (job.value?.status === "failed" ? job.value.error : ""));
 const planning = ref(false);
 const progress = ref<PlanProgress | null>(null);
 const remoteSource = ref<string | null>(null);
@@ -40,7 +48,8 @@ const filtered = computed(() => options.value.filter((item) =>
 ));
 const branchExists = computed(() => options.value.some((item) => !item.remote && item.branch === branch.value.trim()));
 const valid = computed(() => !!branch.value.trim() && !branchExists.value);
-const disabled = computed(() => !!props.locked || busy.value || planning.value || loading.value);
+const blocked = computed(() => !!props.locked || planning.value || loading.value || running.value);
+const disabled = computed(() => blocked.value || busy.value);
 
 function cancelPlanning() {
   if (!planning.value) return;
@@ -69,6 +78,7 @@ async function load() {
 
 async function select(name: string, createBranch = false) {
   if (disabled.value || pendingProject.value || (createBranch && !valid.value)) return;
+  dismissWorktreeCreation(owner.value);
   const id = requestId;
   const operation = ++operationId;
   const request = { workspaceRef: { ...props.workspaceRef }, branch: name, createBranch, includeDirty: createBranch && !remoteSource.value && includeDirty.value,
@@ -82,56 +92,44 @@ async function select(name: string, createBranch = false) {
     if (disposed || operation !== operationId || id !== requestId || props.locked) return;
     planning.value = false; progress.value = null;
     if (plan.requiresNewProject || plan.atCapacity) pendingProject.value = { request, plan };
-    else {
-      busy.value = true;
-      await applySelection(request, plan, false, id);
-    }
+    else startCreation(request, plan, false);
   } catch (cause) {
-    if (!disposed && operation === operationId && id === requestId) setError(cause);
+    if (!disposed && operation === operationId && id === requestId) error.value = worktreeSelectionError(cause);
   } finally {
-    if (operation === operationId) { planning.value = false; busy.value = false; progress.value = null; }
+    if (operation === operationId) { planning.value = false; progress.value = null; }
   }
 }
 
-function setError(cause: unknown) {
-  const message = normalizeAppError(cause).message;
-  error.value = message.includes("WORKTREE_NEW_PROJECT_REQUIRED") ? t("worktrees.budget.retry") : message;
+/** Hands the reviewed creation to a background job; closing the popup no longer cancels it. */
+function startCreation(request: SelectWorktreeRequest, plan: WorktreeCreationPlan, allowNewProject: boolean) {
+  creating.value = false;
+  void startWorktreeCreation(owner.value, request, plan, allowNewProject, props.selectWorktree);
 }
 
-async function applySelection(request: SelectWorktreeRequest, plan: WorktreeCreationPlan, allowNewProject: boolean, id: number) {
-  progress.value = { phase: "checking", files: 0, totalFiles: null, bytes: 0 };
-  const item = await selectWorktreeBranch({ ...request, allowNewProject, expectedStartOid: plan.startOid }, value => {
-    if (!disposed && id === requestId) progress.value = value;
-  });
-  if (disposed || id !== requestId || props.locked) return;
-  await props.selectWorktree(item);
-  if (!disposed) emit("selected");
-}
-
-async function confirmNewProject() {
-  if (disabled.value || !pendingProject.value || pendingProject.value.plan.atCapacity) return;
+function confirmNewProject() {
+  if (blocked.value || !pendingProject.value || pendingProject.value.plan.atCapacity) return;
   const { request, plan } = pendingProject.value;
-  const id = requestId;
-  busy.value = true; error.value = "";
-  try { await applySelection(request, plan, true, id); }
-  catch (cause) { if (!disposed && id === requestId) setError(cause); }
-  finally { busy.value = false; progress.value = null; }
+  pendingProject.value = null; error.value = "";
+  startCreation(request, plan, true);
 }
 
 async function beginCreate(remote?: string) {
   if (disabled.value) return;
+  dismissWorktreeCreation(owner.value);
   remoteSource.value = remote ?? null;
   creating.value = true; branch.value = remote ? remote.slice(remote.indexOf('/') + 1) : query.value.trim() || "codex/"; error.value = "";
   await nextTick(); branchInput.value?.focus();
 }
 watch(() => [props.workspaceRef.checkoutId, props.workspaceRef.expectedGeneration, props.workspaceRef.expectedMaterializationEpoch], load, { immediate: true });
-watch([busy, pendingProject], () => emit("busy", busy.value || pendingProject.value !== null), { flush: "sync" });
+watch(busy, (value) => emit("busy", value), { flush: "sync" });
+// Whichever panel instance is open when the job adopts its worktree closes the popup.
+watch(job, (current, previous) => { if (previous?.status === "running" && !current && !disposed) emit("selected"); });
 watch(() => props.locked, (locked) => { if (locked) { if (planning.value) cancelPlanning(); creating.value = false; pendingProject.value = null; } });
 onUnmounted(() => { disposed = true; requestId++; emit("busy", false); });
 </script>
 
 <template>
-  <section class="worktree-selector-panel" :aria-label="t('worktrees.title')" :aria-busy="busy || planning || loading">
+  <section class="worktree-selector-panel" :aria-label="t('worktrees.title')" :aria-busy="busy || planning || loading || running">
     <div class="worktree-heading">
       <span>Worktree</span>
       <LucideIcon v-if="locked" :icon="LockKeyhole" :size="12" :title="t('worktrees.selector.locked')" :aria-label="t('worktrees.selector.locked')" />
@@ -158,21 +156,22 @@ onUnmounted(() => { disposed = true; requestId++; emit("busy", false); });
       </button>
       <span v-if="!loading && !filtered.length && !error" class="worktree-empty">{{ t('worktrees.selector.empty') }}</span>
     </div>
-    <p v-if="error" class="worktree-error" role="alert">{{ error }}</p>
+    <p v-if="displayedError" class="worktree-error" role="alert">{{ displayedError }}</p>
     <WorktreePlanProgress v-if="progress" :progress="progress" :cancellable="planning" @cancel="cancelPlanning" />
-    <WorktreeCreationBudget v-if="pendingProject && !locked" :plan="pendingProject.plan" :busy="busy" @confirm="confirmNewProject" @cancel="pendingProject = null" />
-    <form v-else-if="creating && !locked && !planning" class="worktree-create" @submit.prevent="select(branch.trim(), true)" @keydown.esc.stop="!busy && (creating = false)">
+    <WorktreePlanProgress v-else-if="job && running" :progress="job.progress" :started-at="job.startedAt" :branch="job.branch" background />
+    <WorktreeCreationBudget v-if="pendingProject && !locked" :plan="pendingProject.plan" @confirm="confirmNewProject" @cancel="pendingProject = null" />
+    <form v-else-if="creating && !locked && !planning && !running" class="worktree-create" @submit.prevent="select(branch.trim(), true)" @keydown.esc.stop="creating = false">
       <span v-if="remoteSource" class="worktree-source" :title="remoteSource">{{ t('worktrees.start') }} · {{ remoteSource }}</span>
       <label class="worktree-field">{{ t('worktrees.branch') }}<input ref="branchInput" v-model="branch" required :disabled="busy" :aria-invalid="branchExists" spellcheck="false" /></label>
       <span v-if="branchExists" class="worktree-error">{{ t('worktrees.selector.branchExists') }}</span>
       <label v-if="!remoteSource" class="worktree-dirty"><BaseCheckbox v-model="includeDirty" :disabled="busy" :aria-label="t('worktrees.includeDirty')" />{{ t('worktrees.includeDirty') }}</label>
       <div class="worktree-actions">
-        <BaseButton type="submit" :disabled="disabled || !valid">{{ t(busy ? 'worktrees.selector.creating' : 'worktrees.create') }}</BaseButton>
-        <BaseButton :disabled="busy" @click="creating = false">{{ t('common.cancel') }}</BaseButton>
+        <BaseButton type="submit" :disabled="disabled || !valid">{{ t('worktrees.create') }}</BaseButton>
+        <BaseButton @click="creating = false">{{ t('common.cancel') }}</BaseButton>
       </div>
     </form>
-    <button v-else-if="!planning && !busy" type="button" class="worktree-option worktree-create-action" :disabled="disabled || !options.length" :title="locked ? t('worktrees.selector.locked') : undefined" @click="beginCreate()">
-      <LucideIcon :icon="Plus" :size="14" /><span>{{ t(busy ? 'worktrees.selector.preparing' : 'worktrees.selector.create') }}</span>
+    <button v-else-if="!planning && !busy && !running" type="button" class="worktree-option worktree-create-action" :disabled="disabled || !options.length" :title="locked ? t('worktrees.selector.locked') : undefined" @click="beginCreate()">
+      <LucideIcon :icon="Plus" :size="14" /><span>{{ t('worktrees.selector.create') }}</span>
     </button>
   </section>
 </template>

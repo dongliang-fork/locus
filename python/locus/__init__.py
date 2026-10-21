@@ -48,7 +48,7 @@ from ._agent_rules import AgentRule
 from ._assets import AssetBackend, AssetResult, Assets, asset_integer, asset_unsigned_integer
 from ._csv import Csv, CsvColumnView, CsvViewSnapshot
 from ._merges import MergeAssets, MergeJob, MergePlan, MergeResult, Merges
-from ._worktrees import Worktree, Worktrees, PoolAcquisition
+from ._worktrees import Worktree, Worktrees, PoolAcquisition, WorktreeDefaults
 from ._sessions import SessionMessagePage, SessionSearchMatch, SessionSearchPage
 from ._captures import Capture, Captures
 
@@ -56,7 +56,7 @@ __all__ = [
     "captures", "Capture", "Captures",
     "csv", "Csv", "CsvColumnView", "CsvViewSnapshot",
     "assets", "AssetBackend", "AssetResult", "Assets", "asset_integer", "asset_unsigned_integer",
-    "worktrees", "Worktree", "Worktrees", "PoolAcquisition",
+    "worktrees", "Worktree", "Worktrees", "PoolAcquisition", "WorktreeDefaults",
     "close_unity_editor", "UnityEditorCloseResult",
     "merges",
     "MergeJob",

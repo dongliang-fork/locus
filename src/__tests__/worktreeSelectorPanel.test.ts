@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WorktreeSelectorPanel from "../components/chat/WorktreeSelectorPanel.vue";
 import ModelEffortSelector from "../components/ModelEffortSelector.vue";
 import type { ManagedWorktree, WorktreeBranchOption, WorktreeCreationPlan, WorktreeProgressHandler } from "../services/worktrees";
+import { resetWorktreeCreationJobsForTests } from "../components/chat/worktreeCreationJobs";
 
 const mocks = vi.hoisted(() => ({ list: vi.fn(), plan: vi.fn(), select: vi.fn(), selected: vi.fn(), bind: vi.fn(), busy: vi.fn() }));
 vi.mock("../services/worktrees", () => ({ listWorktreeBranches: mocks.list, planWorktreeSelection: mocks.plan, selectWorktreeBranch: mocks.select }));
@@ -14,7 +15,7 @@ const state = reactive({ locked: false, workspaceRef: { checkoutId: "source", ex
 const target = { checkoutId: "target", root: "F:/source.worktrees/slot", materializationEpoch: 2 } as ManagedWorktree;
 const newProjectPlan = { startOid: "frozen-head", requiresNewProject: true, atCapacity: false, budget: {
   checkoutBytes: 1024, referenceCacheBytes: 2048, estimatedBytes: 3072, cacheKnown: true, freeBytes: 1000000, directory: "F:/source.worktrees",
-} };
+}, directory: "F:/source.worktrees" };
 const items: WorktreeBranchOption[] = [
   { branch: "main", root: "F:/source", current: true, dirty: true, headOid: "abc", unavailable: false },
   { branch: "feature/one", root: null, current: false, dirty: false, headOid: "def", unavailable: false },
@@ -29,7 +30,7 @@ function mountPanel() {
 function row(name: string, root: ParentNode = host) { return [...root.querySelectorAll<HTMLButtonElement>(".worktree-option")].find((button) => button.textContent?.includes(name))!; }
 async function fill(selector: string, value: string) { const input = host.querySelector<HTMLInputElement>(selector)!; input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); await settle(); }
 beforeEach(() => {
-  vi.resetAllMocks(); state.locked = false; state.workspaceRef = { checkoutId: "source", expectedGeneration: 3, expectedMaterializationEpoch: 1 };
+  vi.resetAllMocks(); resetWorktreeCreationJobsForTests(); state.locked = false; state.workspaceRef = { checkoutId: "source", expectedGeneration: 3, expectedMaterializationEpoch: 1 };
   mocks.list.mockResolvedValue(items); mocks.select.mockResolvedValue(target); mocks.bind.mockResolvedValue(undefined);
   mocks.plan.mockResolvedValue({ startOid: "frozen-head", requiresNewProject: false, atCapacity: false, budget: null });
   host = document.createElement("div"); document.body.append(host);
@@ -113,18 +114,30 @@ describe("worktree picker", () => {
     expect(row(`locus/pool/unity-${"b".repeat(32)}`)).toBeDefined();
     expect(host.querySelectorAll(".worktree-options button")).toHaveLength(3);
   });
-  it("creates from the current workspace and prevents duplicate submissions until binding finishes", async () => {
+  it("creates in the background with checkout progress, survives closing the panel and adopts the result once", async () => {
     await mountPanel(); row("worktrees.selector.create").click(); await settle();
     await fill(".worktree-field input", "codex/new");
-    const binding = deferred<void>(); mocks.bind.mockReturnValueOnce(binding.promise);
+    const creating = deferred<ManagedWorktree>();
+    let report!: WorktreeProgressHandler;
+    mocks.select.mockImplementationOnce((_request, onProgress) => { report = onProgress; return creating.promise; });
     host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); await settle();
     expect(mocks.select).toHaveBeenCalledWith({ workspaceRef: state.workspaceRef, branch: "codex/new", createBranch: true, includeDirty: true, allowNewProject: false, expectedStartOid: "frozen-head" }, expect.any(Function));
-    expect(host.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true);
-    expect(mocks.busy).toHaveBeenLastCalledWith(true);
-    expect(mocks.selected).not.toHaveBeenCalled();
-    binding.resolve(); await settle();
-    expect(mocks.busy).toHaveBeenLastCalledWith(false);
+    // The popup may close while creating; no second creation can start meanwhile.
+    expect(mocks.busy).not.toHaveBeenCalledWith(true);
+    expect(host.querySelector("form")).toBeNull();
+    expect(row("feature/one").disabled).toBe(true);
+    const status = () => host.querySelector('[role="status"]')?.textContent ?? "";
+    expect(status()).toContain("codex/new"); expect(status()).toContain("worktrees.progress.background");
+    report({ phase: "creating", files: 45, totalFiles: 100, bytes: 0 }); await settle();
+    expect(status()).toContain("worktrees.progress.checkedOut 45 45 100");
+    app.unmount(); host.innerHTML = ""; await mountPanel();
+    expect(status()).toContain("worktrees.progress.checkedOut 45 45 100");
+    expect(row("feature/one").disabled).toBe(true);
+    creating.resolve(target); await settle();
+    expect(mocks.bind).toHaveBeenCalledExactlyOnceWith(target);
     expect(mocks.selected).toHaveBeenCalledOnce();
+    expect(host.querySelector('[role="status"]')).toBeNull();
+    expect(row("feature/one").disabled).toBe(false);
   });
   it("requires disk-budget confirmation when the pool needs a new project", async () => {
     mocks.plan.mockResolvedValue(newProjectPlan); await mountPanel();
@@ -157,21 +170,39 @@ describe("worktree picker", () => {
     expect([...host.querySelectorAll<HTMLButtonElement>("button")].every((button) => button.disabled)).toBe(true);
     row("feature/one").click(); await settle(); expect(mocks.select).not.toHaveBeenCalled();
   });
-  it("keeps failures visible and never binds a failed or stale selection", async () => {
+  it("keeps failures visible across reopening, never binds a failed creation and clears it on retry", async () => {
     await mountPanel(); mocks.select.mockRejectedValueOnce(new Error("Pool is at capacity"));
     row("feature/one").click(); await settle();
     expect(host.querySelector('[role="alert"]')?.textContent).toContain("Pool is at capacity");
     expect(mocks.bind).not.toHaveBeenCalled();
+    app.unmount(); host.innerHTML = ""; await mountPanel();
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain("Pool is at capacity");
     const preparing = deferred<ManagedWorktree>(); mocks.select.mockReturnValueOnce(preparing.promise);
     row("feature/one").click(); await settle();
-    state.workspaceRef = { ...state.workspaceRef, checkoutId: "other" }; await settle();
-    preparing.resolve(target); await settle(); expect(mocks.bind).not.toHaveBeenCalled();
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    app.unmount(); host.innerHTML = "";
+    preparing.resolve(target); await settle();
+    expect(mocks.bind).toHaveBeenCalledExactlyOnceWith(target);
+    expect(mocks.selected).not.toHaveBeenCalled();
+    await mountPanel(); expect(host.querySelector('[role="status"]')).toBeNull();
   });
   it("ignores late branch results after the workspace changes", async () => {
     const old = deferred<WorktreeBranchOption[]>(); mocks.list.mockReturnValueOnce(old.promise);
     await mountPanel(); state.workspaceRef = { ...state.workspaceRef, checkoutId: "other" }; await settle();
     old.resolve([{ ...items[0]!, branch: "stale" }]); await settle();
     expect(row("stale")).toBeUndefined(); expect(row("main")).toBeDefined();
+  });
+  it("shows the session branch after the effort only while worktrees are enabled", async () => {
+    const enabled = reactive({ value: true });
+    app = createApp({ render: () => h(ModelEffortSelector, { models: [], selectedId: "", effort: "high", effortSupported: true,
+      worktreeEnabled: enabled.value, worktreeBranch: "master", workspaceRef: state.workspaceRef, selectWorktree: mocks.bind }) }); app.mount(host);
+    await settle();
+    const trigger = host.querySelector<HTMLButtonElement>(".model-effort-trigger")!;
+    expect(trigger.querySelector(".model-effort-branch")?.textContent).toBe("master");
+    expect(trigger.lastElementChild?.previousElementSibling?.className).toBe("model-effort-branch");
+    expect(trigger.title).toContain("master");
+    enabled.value = false; await settle();
+    expect(trigger.querySelector(".model-effort-branch")).toBeNull();
   });
   it("adds the column only when enabled and keeps it to the right of effort", async () => {
     const enabled = reactive({ value: false });

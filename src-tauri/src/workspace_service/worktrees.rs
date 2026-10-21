@@ -24,6 +24,8 @@ const SCHEMA_VERSION: u32 = 1;
 pub mod selector;
 pub mod usage;
 pub mod estimate;
+pub mod location;
+pub(crate) mod submodules;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +51,9 @@ pub struct ManagedWorktree {
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorktreeRequest {
     pub source_root: String,
+    /// Absolute, unused directory. Request handlers replace an empty value
+    /// with a new directory in the configured container.
+    #[serde(default)]
     pub destination: String,
     pub branch: String,
     #[serde(default)]
@@ -127,18 +132,102 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         .output()
         .map_err(io_error)?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut tail = stderr.chars().rev().take(4096).collect::<Vec<_>>();
-        tail.reverse();
-        let detail: String = tail.into_iter().collect();
-        return Err(format!(
-            "git {} failed for project root {}: {}",
-            args.first().unwrap_or(&""),
-            root.display(),
-            detail.trim()
-        ));
+        return Err(git_failure(root, args, &output.stderr));
     }
     Ok(output.stdout)
+}
+
+fn git_failure(root: &Path, args: &[&str], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut tail = stderr.chars().rev().take(4096).collect::<Vec<_>>();
+    tail.reverse();
+    let detail: String = tail.into_iter().collect();
+    format!(
+        "git {} failed for project root {}: {}",
+        args.first().unwrap_or(&""),
+        root.display(),
+        detail.trim()
+    )
+}
+
+/// [`git`] for a command that populates a working tree. While a creation
+/// progress sink is installed on this thread, stderr is streamed and git's
+/// file counter becomes "creating" progress; otherwise this is plain `git`.
+pub(crate) fn git_checkout(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let Some(sink) = estimate::creation_progress() else {
+        return git(root, args);
+    };
+    let mut command = crate::process_util::command("git");
+    #[cfg(windows)]
+    command.args(["-c", "core.longpaths=true"]);
+    let mut child = command
+        .arg("-C")
+        .arg(git_cli_path(root))
+        .args(args.iter().map(|arg| git_cli_path(Path::new(arg))))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PROGRESS_DELAY", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(io_error)?;
+    // Drain stdout concurrently so neither pipe can fill and stall git.
+    let stdout = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        })
+    });
+    let mut progress = estimate::Progress::new(&*sink);
+    // Progress redraws are separated by CR; only message lines are kept for errors.
+    let mut messages = Vec::new();
+    let mut segment = Vec::new();
+    let mut consume = |segment: &[u8], messages: &mut Vec<u8>| {
+        let text = String::from_utf8_lossy(segment);
+        if let Some((done, total)) = estimate::git_progress_counts(&text) {
+            progress.send("creating", done, Some(total), 0);
+        } else if !text.trim().is_empty() {
+            messages.extend_from_slice(segment);
+            messages.push(b'\n');
+            if messages.len() > 64 * 1024 {
+                messages.drain(..messages.len() - 16 * 1024);
+            }
+        }
+    };
+    if let Some(mut stderr) = child.stderr.take() {
+        let mut buffer = [0u8; 4096];
+        // A read error ends streaming only; the exit status still decides.
+        while let Ok(read) = stderr.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            for &byte in &buffer[..read] {
+                if byte == b'\r' || byte == b'\n' {
+                    consume(&segment, &mut messages);
+                    segment.clear();
+                } else {
+                    segment.push(byte);
+                }
+            }
+        }
+        consume(&segment, &mut messages);
+    }
+    let status = child.wait().map_err(io_error)?;
+    let stdout = match stdout {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| "git output reader panicked".to_string())?
+            .map_err(io_error)?,
+        None => Vec::new(),
+    };
+    if !status.success() {
+        return Err(git_failure(root, args, &messages));
+    }
+    // Submodules, LFS verification and local changes follow the checkout.
+    sink(estimate::WorktreePlanProgress { phase: "finalizing", files: 0, total_files: None, bytes: 0 });
+    Ok(stdout)
 }
 
 pub(crate) fn git_text(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -356,40 +445,76 @@ pub(crate) fn safe_relative(value: &str) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-pub(crate) fn ensure_tree_supported(repo: &Path, oid: &str, relative: &str) -> Result<(), String> {
-    let tree = git(repo, &["ls-tree", "-r", "-z", oid])?;
-    for entry in tree.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-        if entry.starts_with(b"160000 ") || entry.starts_with(b"120000 ") {
-            return Err("Worktree creation currently requires submodules and symbolic links to be materialized independently".into());
-        }
-    }
+/// Validates the target tree and resolves the submodules a checkout of it must
+/// materialize from `repo` (the source checkout).
+pub(crate) fn ensure_tree_supported(
+    repo: &Path,
+    oid: &str,
+    relative: &str,
+) -> Result<Vec<submodules::PlannedSubmodule>, String> {
+    let planned = submodules::plan(repo, oid)?;
     let manifest = if relative.is_empty() {
         "Packages/manifest.json".into()
     } else {
         format!("{relative}/Packages/manifest.json")
     };
     if let Ok(contents) = git(repo, &["show", &format!("{oid}:{manifest}")]) {
-        ensure_local_packages_supported(&contents)?;
+        for path in local_package_paths(&contents, &manifest)? {
+            if !submodules::covers(&planned, &path)
+                && git(repo, &["cat-file", "-e", &format!("{oid}:{path}")]).is_err()
+            {
+                return Err(format!(
+                    "Local package {path} is not tracked in the target commit, so a new worktree would not contain it"
+                ));
+            }
+        }
     }
-    Ok(())
+    Ok(planned)
 }
 
-fn ensure_local_packages_supported(bytes: &[u8]) -> Result<(), String> {
-    let manifest: serde_json::Value = serde_json::from_slice(bytes).map_err(io_error)?;
-    if manifest
-        .get("dependencies")
-        .and_then(|d| d.as_object())
-        .is_some_and(|deps| {
-            deps.values()
-                .any(|v| v.as_str().is_some_and(|v| v.starts_with("file:")))
-        })
-    {
-        return Err(
-            "Local file: package dependencies require an explicit isolated dependency mapping"
-                .into(),
-        );
+/// Repository-relative paths of the manifest's `file:` dependencies. Unity
+/// resolves a relative one against the manifest's directory; one that stays
+/// inside the repository is checked out with every worktree and therefore
+/// isolated. Anything else would share one package directory between checkouts.
+fn local_package_paths(bytes: &[u8], manifest: &str) -> Result<Vec<String>, String> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).map_err(io_error)?;
+    let Some(dependencies) = json.get("dependencies").and_then(|d| d.as_object()) else {
+        return Ok(Vec::new());
+    };
+    let mut base: Vec<&str> = manifest.split('/').collect();
+    base.pop();
+    let mut paths = Vec::new();
+    for (name, value) in dependencies {
+        let Some(target) = value.as_str().and_then(|v| v.strip_prefix("file:")) else {
+            continue;
+        };
+        let outside = || {
+            format!("Local package {name} (file:{target}) resolves outside the repository; worktrees would share it, so move it into the repository first")
+        };
+        let target_path = target.replace('\\', "/");
+        // Absolute paths, drive letters and file:// URLs all name a location
+        // shared by every checkout.
+        if target_path.starts_with('/') || target_path.contains(':') {
+            return Err(outside());
+        }
+        let mut parts = base.clone();
+        for part in target_path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop().ok_or_else(outside)?;
+                }
+                part => parts.push(part),
+            }
+        }
+        if parts.is_empty() {
+            return Err(outside());
+        }
+        let path = parts.join("/");
+        safe_relative(&path).map_err(|_| outside())?;
+        paths.push(path);
     }
-    Ok(())
+    Ok(paths)
 }
 
 pub(crate) fn editor_version(root: &Path) -> Option<String> {
@@ -434,6 +559,9 @@ fn dirty_snapshot(repo: &Path) -> Result<DirtySnapshot, String> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.to_string()),
             Ok(meta) => {
+                if meta.is_dir() && path.join(".git").exists() {
+                    return Err(format!("Local changes inside submodule {name} cannot be copied to a new worktree; commit them in the submodule and record its commit in the superproject, or create the worktree without local changes"));
+                }
                 if !meta.is_file() || meta.file_type().is_symlink() {
                     return Err(format!("Cannot snapshot non-regular file {name}"));
                 }
@@ -449,7 +577,7 @@ fn dirty_snapshot(repo: &Path) -> Result<DirtySnapshot, String> {
         };
         if name.ends_with("Packages/manifest.json") {
             if let Some(bytes) = bytes.as_ref() {
-                ensure_local_packages_supported(bytes)?;
+                local_package_paths(bytes, &name)?;
             }
         }
         files.insert(name, bytes);
@@ -533,7 +661,7 @@ fn create_for_branch(request: &CreateWorktreeRequest, existing_branch: bool) -> 
     if request.include_dirty && oid != head {
         return Err("Including local changes requires the source HEAD as the start commit".into());
     }
-    ensure_tree_supported(&repo, &oid, &relative)?;
+    let planned_submodules = ensure_tree_supported(&repo, &oid, &relative)?;
     ensure_git_idle(&repo)?;
     let dirty = if request.include_dirty {
         Some(dirty_snapshot(&repo)?)
@@ -556,13 +684,14 @@ fn create_for_branch(request: &CreateWorktreeRequest, existing_branch: bool) -> 
     store.save()?;
     let result: Result<ManagedWorktree, String> = (|| {
         if existing_branch {
-            git(&repo, &["worktree", "add", "--", &destination.to_string_lossy(), &request.branch])?;
+            git_checkout(&repo, &["worktree", "add", "--", &destination.to_string_lossy(), &request.branch])?;
             if git_text(&destination, &["rev-parse", "HEAD"])? != oid {
                 return Err("Branch changed during preparation; worktree retained for inspection".into());
             }
         } else {
-            git(&repo, &["worktree", "add", "-b", &request.branch, "--", &destination.to_string_lossy(), &oid])?;
+            git_checkout(&repo, &["worktree", "add", "-b", &request.branch, "--", &destination.to_string_lossy(), &oid])?;
         }
+        submodules::materialize(&destination, &planned_submodules)?;
         if let Some(snapshot) = &dirty {
             if git_text(&repo, &["rev-parse", "HEAD"])? != head
                 || &dirty_snapshot(&repo)? != snapshot
@@ -850,11 +979,15 @@ pub fn remove(source_root: &Path, checkout_id: &str, expected_epoch: u64) -> Res
         return Err("Worktree repository identity changed".into());
     }
     let op = store.begin(&record, "remove")?;
-    // No --force: Git supplies a second independent clean/lock check.
-    let result = git(
-        source_root,
-        &["worktree", "remove", "--", &record.repo_root],
-    );
+    // Git refuses to remove a worktree around populated submodules; their
+    // linked checkouts go first. No --force anywhere: Git supplies a second
+    // independent clean/lock check for every checkout.
+    let result = submodules::prune(Path::new(&record.repo_root), &[]).and_then(|()| {
+        git(
+            source_root,
+            &["worktree", "remove", "--", &record.repo_root],
+        )
+    });
     match result {
         Ok(_) => {
             store.state.records.get_mut(checkout_id).unwrap().lifecycle = "removed".into();
@@ -1105,6 +1238,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn local_packages_must_be_tracked_inside_the_repository() {
+        let (_temp, repo) = fixture();
+        std::fs::create_dir_all(repo.join("Packages/com.local.pkg")).unwrap();
+        std::fs::write(repo.join("Packages/com.local.pkg/package.json"), "{}").unwrap();
+        std::fs::create_dir_all(repo.join("Packages/LocalTarballs")).unwrap();
+        std::fs::write(repo.join("Packages/LocalTarballs/tween.tgz"), "tgz").unwrap();
+        std::fs::write(
+            repo.join("Packages/manifest.json"),
+            r#"{"dependencies":{"com.local.pkg":"file:com.local.pkg","tween":"file:LocalTarballs/tween.tgz","com.unity.ugui":"2.0.0"}}"#,
+        )
+        .unwrap();
+        git(&repo, &["add", "."]).unwrap();
+        git(&repo, &["commit", "-m", "local packages"]).unwrap();
+        let oid = git_text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        ensure_tree_supported(&repo, &oid, "").unwrap();
+
+        assert_eq!(
+            local_package_paths(
+                br#"{"dependencies":{"a":"file:../Shared/a","b":"file:.\\b"}}"#,
+                "Project/Packages/manifest.json"
+            )
+            .unwrap(),
+            vec!["Project/Shared/a", "Project/Packages/b"]
+        );
+        for value in ["file:../../outside", "file:C:/shared/pkg", "file:///F:/pkg", "file:/abs/pkg"] {
+            let manifest = format!(r#"{{"dependencies":{{"a":"{value}"}}}}"#);
+            let error = local_package_paths(manifest.as_bytes(), "Packages/manifest.json").unwrap_err();
+            assert!(error.contains("outside the repository"), "{value}: {error}");
+        }
+
+        std::fs::write(
+            repo.join("Packages/manifest.json"),
+            r#"{"dependencies":{"com.missing":"file:com.missing"}}"#,
+        )
+        .unwrap();
+        git(&repo, &["commit", "-am", "missing local package"]).unwrap();
+        let oid = git_text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let error = ensure_tree_supported(&repo, &oid, "").unwrap_err();
+        assert!(error.contains("Packages/com.missing is not tracked"), "{error}");
+    }
+
+    #[test]
     fn explicit_missing_destination_parent_reports_the_path() {
         let (temp, repo) = fixture();
         let parent = temp.path().join("missing").join("parent");
@@ -1161,6 +1336,46 @@ pub(crate) mod tests {
         assert!(remove(&repo, &record.checkout_id, 1)
             .unwrap_err()
             .contains("changes"));
+    }
+
+    #[test]
+    fn creation_streams_git_checkout_progress_and_keeps_git_errors() {
+        let (temp, repo) = fixture();
+        for index in 0..40 {
+            std::fs::write(repo.join(format!("Assets/file-{index}.asset")), "x\n").unwrap();
+        }
+        git(&repo, &["add", "."]).unwrap();
+        git(&repo, &["commit", "-m", "more files"]).unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = std::sync::Arc::clone(&events);
+        let sink: estimate::ProgressSink =
+            std::sync::Arc::new(move |event| sink_events.lock().unwrap().push(event));
+        let request = CreateWorktreeRequest {
+            source_root: repo.to_string_lossy().into(),
+            destination: temp.path().join("target").to_string_lossy().into(),
+            branch: "feature/progress".into(),
+            start_ref: None,
+            include_dirty: false,
+        };
+        let record = estimate::with_creation_progress(sink.clone(), || create(&request)).unwrap();
+        assert!(Path::new(&record.root).join("Assets/file-39.asset").is_file());
+        {
+            let events = events.lock().unwrap();
+            let checkout = events
+                .iter()
+                .rfind(|event| event.phase == "creating")
+                .expect("git file counter is reported");
+            // .gitignore, ProjectVersion.txt, test.asset and 40 new assets.
+            assert_eq!((checkout.files, checkout.total_files), (43, Some(43)));
+            assert_eq!(events.last().unwrap().phase, "finalizing");
+        }
+        // The streamed path still reports git's message on failure.
+        let error = estimate::with_creation_progress(sink, || create(&CreateWorktreeRequest {
+            destination: temp.path().join("second").to_string_lossy().into(),
+            ..request
+        }))
+        .unwrap_err();
+        assert!(error.contains("git worktree failed") && error.contains("feature/progress"), "{error}");
     }
 
     #[test]

@@ -116,6 +116,7 @@ if (isolatedRuntime.enabled) {
   env.LOCUS_RUNTIME_CONFIG_DIR = manifest.configDir;
   env.LOCUS_RUNTIME_LOG_DIR = manifest.logDir;
   env.LOCUS_RUNTIME_WORKSPACE_DIR = manifest.workspace;
+  env.LOCUS_WORKTREE_ROOT = manifest.worktreeRoot;
   env.WEBVIEW2_USER_DATA_FOLDER = manifest.webviewDataDir;
   if (manifest.skipOnboarding) {
     env[SKIP_ONBOARDING_ENV_KEY] = "1";
@@ -152,6 +153,7 @@ function parseIsolatedRuntimeArgs(values, enabledByCommand) {
       "--log-dir": "logDir",
       "--workspace": "workspace",
       "--webview-data-dir": "webviewDataDir",
+      "--worktree-root": "worktreeRoot",
     }[name];
     if (!key) {
       remainingArgs.push(arg);
@@ -189,6 +191,7 @@ function prepareIsolatedRuntime(requestedPaths, skipOnboarding) {
     logDir: requestedPaths.logDir ?? path.join(runtimeRoot, "logs"),
     logFile: "",
     workspace: requestedPaths.workspace ?? path.join(runtimeRoot, "workspace"),
+    worktreeRoot: requestedPaths.worktreeRoot ?? path.join(runtimeRoot, "worktrees"),
     webviewDataDir:
       requestedPaths.webviewDataDir ?? path.join(runtimeRoot, "webview"),
     systemTempDir: path.join(runtimeRoot, "system-temp"),
@@ -203,6 +206,7 @@ function prepareIsolatedRuntime(requestedPaths, skipOnboarding) {
     manifest.configDir,
     manifest.logDir,
     manifest.workspace,
+    manifest.worktreeRoot,
     manifest.webviewDataDir,
     manifest.systemTempDir,
   ]) {
@@ -265,6 +269,7 @@ Options:
   --log-dir <dir>           Directory containing locus.log
   --workspace <dir>         Initial Locus workspace; created when missing
   --webview-data-dir <dir>  Isolated WebView2 profile and local storage
+  --worktree-root <dir>     Base directory for new worktrees (default: <runtime-root>/worktrees)
   --skip-onboarding         Open the isolated instance directly in Chat
 
 Generated runtime root precedence: --runtime-base,

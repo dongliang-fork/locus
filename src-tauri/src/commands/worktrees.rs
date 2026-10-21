@@ -1,5 +1,6 @@
 use std::{path::Path, sync::Arc};
 
+use crate::config::AppConfig;
 use crate::session::store::SessionStore;
 use crate::workspace_service::pool::{self, AcquirePoolRequest, PoolAcquisition};
 use crate::workspace_service::worktrees::{
@@ -7,10 +8,81 @@ use crate::workspace_service::worktrees::{
 };
 use crate::workspace_service::{CheckoutId, ProjectRegistry};
 use tauri::State;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use crate::workspace_service::WorkspaceRef;
-use worktrees::estimate::{Progress, WorktreePlanProgress};
+use crate::app_tasks::{AppTaskProgress, AppTaskRegistry};
+use worktrees::estimate::{with_creation_progress, Progress, ProgressSink, WorktreePlanProgress};
+use worktrees::location::{WorktreePolicy, WorktreeRootSource};
 use tauri::ipc::{Channel, JavaScriptChannelId};
+
+/// Resolve directories without coupling physical project slots to runtime
+/// concurrency. Callers can still supply an explicit storage budget.
+pub(crate) fn worktree_policy(config: &AppConfig, _registry: &ProjectRegistry) -> Result<WorktreePolicy, String> {
+    WorktreePolicy::resolve(config.worktree_root(), None)
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeRootSettings {
+    /// Persisted base directory; `None` places worktrees beside the repository.
+    settings_root: Option<String>,
+    /// `--locus-worktree-root` / `LOCUS_WORKTREE_ROOT` for this process; wins over the setting.
+    process_root: Option<String>,
+}
+
+fn root_settings(config: &AppConfig) -> Result<WorktreeRootSettings, String> {
+    Ok(WorktreeRootSettings {
+        settings_root: config.worktree_root().map(|path| path.to_string_lossy().into_owned()),
+        process_root: crate::runtime_paths::runtime_worktree_root_from_env()?
+            .map(|path| path.to_string_lossy().into_owned()),
+    })
+}
+
+#[tauri::command]
+pub fn get_worktree_root_settings(config: State<'_, Arc<AppConfig>>) -> Result<WorktreeRootSettings, String> {
+    root_settings(&config)
+}
+
+#[tauri::command]
+pub fn set_worktree_root_setting(root: Option<String>, config: State<'_, Arc<AppConfig>>) -> Result<WorktreeRootSettings, String> {
+    let root = non_empty(root)
+        .map(|value| worktrees::location::normalize_root_setting(Path::new(&value)))
+        .transpose()?;
+    config.set_worktree_root(root.as_deref())?;
+    root_settings(&config)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeDefaults {
+    /// Container for new checkouts of this source.
+    container: String,
+    root_source: WorktreeRootSource,
+    max_slots: Option<usize>,
+}
+
+#[tauri::command]
+pub async fn get_worktree_defaults(
+    source_root: String,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
+) -> Result<WorktreeDefaults, String> {
+    registered_source(&registry, &source_root)?;
+    let policy = worktree_policy(&config, &registry)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(WorktreeDefaults {
+            container: policy.container(Path::new(&source_root))?.to_string_lossy().into(),
+            root_source: policy.root_source(),
+            max_slots: policy.max_slots,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -29,14 +101,15 @@ pub struct SelectWorktreeRequest {
 pub async fn plan_worktree_selection(
     request: SelectWorktreeRequest,
     registry: State<'_, Arc<ProjectRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
     on_progress: Option<JavaScriptChannelId>,
     webview: tauri::Webview,
 ) -> Result<worktrees::usage::WorktreeCreationPlan, String> {
     let on_progress: Option<Channel<WorktreePlanProgress>> = on_progress.map(|id| id.channel_on(webview));
     let scope = registry.resolve_workspace_ref(&request.workspace_ref).map_err(|e| e.to_string())?;
-    let max_slots = registry.resource_policy().snapshot().limits.max_unity_editors;
+    let policy = worktree_policy(&config, &registry)?;
     tauri::async_runtime::spawn_blocking(move || worktrees::usage::selection_plan_with_progress(
-        scope.runtime().root(), &request.branch, request.create_branch, request.include_dirty, max_slots, request.start_ref.as_deref(),
+        scope.runtime().root(), &request.branch, request.create_branch, request.include_dirty, &policy, request.start_ref.as_deref(),
         &mut Progress::new(&|event| { if let Some(channel) = &on_progress { let _ = channel.send(event); } }),
     )).await.map_err(|e| e.to_string())?
 }
@@ -61,17 +134,25 @@ pub struct PlanWorktreeCreationRequest {
     start_ref: String,
     include_dirty: bool,
     pool_mode: bool,
-    directory: String,
-    max_slots: usize,
+    /// Empty uses the configured container (or a reusable pool slot's directory).
+    #[serde(default)]
+    directory: Option<String>,
+    #[serde(default)]
+    max_slots: Option<usize>,
 }
 
 #[tauri::command]
-pub async fn plan_worktree_creation(request: PlanWorktreeCreationRequest, registry: State<'_, Arc<ProjectRegistry>>, on_progress: Option<JavaScriptChannelId>, webview: tauri::Webview) -> Result<worktrees::usage::WorktreeCreationPlan, String> {
+pub async fn plan_worktree_creation(request: PlanWorktreeCreationRequest, registry: State<'_, Arc<ProjectRegistry>>, config: State<'_, Arc<AppConfig>>, on_progress: Option<JavaScriptChannelId>, webview: tauri::Webview) -> Result<worktrees::usage::WorktreeCreationPlan, String> {
     let on_progress: Option<Channel<WorktreePlanProgress>> = on_progress.map(|id| id.channel_on(webview));
     registered_source(&registry, &request.source_root)?;
+    let mut policy = worktree_policy(&config, &registry)?;
+    if let Some(max_slots) = request.max_slots {
+        policy.max_slots = Some(max_slots);
+    }
+    let directory = non_empty(request.directory);
     tauri::async_runtime::spawn_blocking(move || worktrees::usage::creation_plan_with_progress(
         Path::new(&request.source_root), &request.start_ref, request.include_dirty, request.pool_mode,
-        Some(Path::new(&request.directory)), request.max_slots,
+        directory.as_deref().map(Path::new), &policy,
         &mut Progress::new(&|event| { if let Some(channel) = &on_progress { let _ = channel.send(event); } }),
     )).await.map_err(|e| e.to_string())?
 }
@@ -91,28 +172,38 @@ pub async fn select_worktree_branch(
     request: SelectWorktreeRequest,
     registry: State<'_, Arc<ProjectRegistry>>,
     store: State<'_, Arc<SessionStore>>,
+    config: State<'_, Arc<AppConfig>>,
+    app_tasks: State<'_, Arc<AppTaskRegistry>>,
     on_progress: Option<JavaScriptChannelId>,
     webview: tauri::Webview,
 ) -> Result<ManagedWorktree, String> {
     let on_progress: Option<Channel<WorktreePlanProgress>> = on_progress.map(|id| id.channel_on(webview));
     let scope = registry.resolve_workspace_ref(&request.workspace_ref).map_err(|e| e.to_string())?;
-    let max_slots = registry.resource_policy().snapshot().limits.max_unity_editors;
-    let record = tauri::async_runtime::spawn_blocking(move || {
-        let report = |event| { if let Some(channel) = &on_progress { let _ = channel.send(event); } };
-        let plan = worktrees::usage::selection_plan_with_progress(scope.runtime().root(), &request.branch, request.create_branch, request.include_dirty, max_slots, request.start_ref.as_deref(), &mut Progress::new(&report))?;
+    let policy = worktree_policy(&config, &registry)?;
+    // Creation can outlive the selector that started it; a process-level task
+    // keeps it visible in every window until it settles.
+    let task = app_tasks.begin("worktree", request.branch.clone(), Some(scope.runtime().root().to_string_lossy().into()));
+    let reporter = task.reporter();
+    let sink: ProgressSink = Arc::new(move |event: WorktreePlanProgress| {
+        reporter.progress(AppTaskProgress { phase: event.phase.into(), completed: event.files, total: event.total_files });
+        if let Some(channel) = &on_progress { let _ = channel.send(event); }
+    });
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let plan = worktrees::usage::selection_plan_with_progress(scope.runtime().root(), &request.branch, request.create_branch, request.include_dirty, &policy, request.start_ref.as_deref(), &mut Progress::new(&*sink))?;
         if request.expected_start_oid.as_ref().is_some_and(|oid| *oid != plan.start_oid) { return Err("Source branch changed; review the worktree creation again".into()); }
         if plan.at_capacity { return Err("Project pool is at capacity; manually recycle a project in settings".into()); }
         if request.allow_new_project && plan.budget.as_ref().is_some_and(|budget| budget.free_bytes.is_some_and(|free| free < budget.estimated_bytes)) {
             return Err("Insufficient disk space for the estimated project size".into());
         }
-        report(WorktreePlanProgress { phase: "creating", files: 0, total_files: None, bytes: 0 });
-        worktrees::selector::select_from_ref(
-            scope.runtime().root(), &request.branch, request.create_branch, request.include_dirty, max_slots, request.allow_new_project,
+        sink(WorktreePlanProgress { phase: "creating", files: 0, total_files: None, bytes: 0 });
+        with_creation_progress(sink, || worktrees::selector::select_from_ref(
+            scope.runtime().root(), &request.branch, request.create_branch, request.include_dirty, &policy, request.allow_new_project,
             request.start_ref.as_deref(),
-        )
-    }).await.map_err(|e| e.to_string())??;
-    register_record(&registry, &store, &record)?;
-    Ok(record)
+        ))
+    }).await.map_err(|e| e.to_string()).and_then(|result| result)
+        .and_then(|record| register_record(&registry, &store, &record).map(|()| record));
+    task.finish(result.as_ref().map(|_| ()).map_err(Clone::clone));
+    result
 }
 
 fn registered_source(registry: &ProjectRegistry, source: &str) -> Result<(), String> {
@@ -144,16 +235,27 @@ pub(crate) fn register_record(
     Ok(())
 }
 
+/// An empty destination creates `<container>/worktree-<id>`.
 #[tauri::command]
 pub async fn create_worktree(
-    request: CreateWorktreeRequest,
+    mut request: CreateWorktreeRequest,
     registry: State<'_, Arc<ProjectRegistry>>,
     store: State<'_, Arc<SessionStore>>,
+    config: State<'_, Arc<AppConfig>>,
 ) -> Result<ManagedWorktree, String> {
     registered_source(&registry, &request.source_root)?;
-    let record = tauri::async_runtime::spawn_blocking(move || worktrees::create(&request))
-        .await
-        .map_err(|e| e.to_string())??;
+    let policy = worktree_policy(&config, &registry)?;
+    let record = tauri::async_runtime::spawn_blocking(move || {
+        if request.destination.trim().is_empty() {
+            request.destination = policy
+                .new_checkout(Path::new(&request.source_root), "worktree")?
+                .to_string_lossy()
+                .into();
+        }
+        worktrees::create(&request)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     register_record(&registry, &store, &record)?;
     Ok(record)
 }
@@ -255,17 +357,29 @@ pub fn bind_session_worktree(
     store.bind_session_checkout(&session_id, id.as_str(), expected_epoch)
 }
 
+/// An empty pool root reuses a released compatible slot where it lives,
+/// otherwise uses the configured container.
 #[tauri::command]
 pub async fn acquire_unity_project_slot(
-    request: AcquirePoolRequest,
+    mut request: AcquirePoolRequest,
     registry: State<'_, Arc<ProjectRegistry>>,
     store: State<'_, Arc<SessionStore>>,
+    config: State<'_, Arc<AppConfig>>,
     allow_new_project: Option<bool>,
 ) -> Result<PoolAcquisition, String> {
     registered_source(&registry, &request.source_root)?;
-    let acquired = tauri::async_runtime::spawn_blocking(move || pool::acquire_with_creation_policy(&request, allow_new_project.unwrap_or(false)))
-        .await
-        .map_err(|e| e.to_string())??;
+    let policy = worktree_policy(&config, &registry)?;
+    let acquired = tauri::async_runtime::spawn_blocking(move || {
+        if request.pool_root.trim().is_empty() {
+            request.pool_root = policy
+                .pool_root_for_commit(Path::new(&request.source_root), &request.commit)?
+                .to_string_lossy()
+                .into();
+        }
+        pool::acquire_with_creation_policy(&request, allow_new_project.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     register_record(&registry, &store, &acquired.worktree)?;
     Ok(acquired)
 }

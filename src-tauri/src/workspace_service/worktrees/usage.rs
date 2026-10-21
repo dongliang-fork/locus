@@ -1,6 +1,7 @@
 //! Read-only pool usage and creation estimates. Previewing never creates a slot.
 use super::*;
 use super::estimate::{Progress, is_alias, library_bytes};
+use super::location::{editor_version_at, reusable_pool_container, WorktreePolicy};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +21,9 @@ pub struct WorktreeCreationPlan {
     pub requires_new_project: bool,
     pub at_capacity: bool,
     pub budget: Option<WorktreeDiskBudget>,
+    /// Pool root or checkout container the creation will use. Callers pass
+    /// it back so execution uses the directory that was reviewed.
+    pub directory: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,10 +243,12 @@ pub fn creation_plan(
     directory: Option<&Path>,
     max_slots: usize,
 ) -> Result<WorktreeCreationPlan, String> {
-    creation_plan_with_progress(source, start_ref, include_dirty, pool_mode, directory, max_slots, &mut Progress::new(&|_| {}))
+    creation_plan_with_progress(source, start_ref, include_dirty, pool_mode, directory, &WorktreePolicy::beside_repository(max_slots), &mut Progress::new(&|_| {}))
 }
 
-pub fn creation_plan_with_progress(source: &Path, start_ref: &str, include_dirty: bool, pool_mode: bool, directory: Option<&Path>, max_slots: usize, progress: &mut Progress<'_>) -> Result<WorktreeCreationPlan, String> {
+/// `directory: None` applies the same rule as the picker: reuse a released
+/// compatible slot where it lives, otherwise use the configured container.
+pub fn creation_plan_with_progress(source: &Path, start_ref: &str, include_dirty: bool, pool_mode: bool, directory: Option<&Path>, policy: &WorktreePolicy, progress: &mut Progress<'_>) -> Result<WorktreeCreationPlan, String> {
     progress.send("checking", 0, None, 0);
     if start_ref.starts_with('-') {
         return Err("Invalid start revision".into());
@@ -251,47 +257,20 @@ pub fn creation_plan_with_progress(source: &Path, start_ref: &str, include_dirty
         source,
         &["rev-parse", "--verify", &format!("{start_ref}^{{commit}}")],
     )?;
-    let repo = canonical(Path::new(&git_text(
-        source,
-        &["rev-parse", "--show-toplevel"],
-    )?))?;
-    let relative = existing_path_relative(&repo, source)?.ok_or("Source is outside repository")?;
-    let version_path = relative
-        .join("ProjectSettings/ProjectVersion.txt")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let version = git_text(&repo, &["show", &format!("{oid}:{version_path}")]).unwrap_or_default();
-    let editor = version
-        .lines()
-        .find_map(|line| line.strip_prefix("m_EditorVersion:").map(str::trim))
-        .unwrap_or("");
+    let editor = editor_version_at(source, &oid)?;
+    let editor = editor.as_str();
     let compatible = pool_mode
         && editor.starts_with("6000.5.")
         && (!include_dirty || editor_version(source).as_deref() == Some(editor));
     let records = list(source)?;
-    let mut pools: Vec<_> = records
-        .iter()
-        .filter(|item| {
-            item.pool_slot
-                && item.managed
-                && item.editor_version.as_deref() == Some(editor)
-                && matches!(item.lifecycle.as_str(), "available" | "active")
-        })
-        .collect();
-    pools.sort_by_cached_key(|item| {
-        (
-            !crate::workspace_service::pool::can_reuse(item),
-            item.checkout_id.clone(),
-        )
-    });
     let container = match directory {
         Some(path) => path.to_path_buf(),
-        None => match pools
-            .iter()
-            .find_map(|item| Path::new(&item.repo_root).parent())
+        None => match compatible
+            .then(|| reusable_pool_container(&records, editor))
+            .flatten()
         {
-            Some(path) if compatible => path.to_path_buf(),
-            _ => selector::pool_root_path(source)?,
+            Some(path) => path,
+            None => policy.container(source)?,
         },
     };
     let in_container = |item: &&ManagedWorktree| {
@@ -300,17 +279,17 @@ pub fn creation_plan_with_progress(source: &Path, start_ref: &str, include_dirty
             .is_some_and(|parent| path_key(parent) == path_key(&container))
     };
     let reusable = compatible
-        && pools
+        && records
             .iter()
-            .copied()
+            .filter(|item| item.pool_slot && item.editor_version.as_deref() == Some(editor))
             .filter(in_container)
-            .any(|item| crate::workspace_service::pool::can_reuse(item));
+            .any(crate::workspace_service::pool::can_reuse);
     let occupied = records
         .iter()
         .filter(|item| item.pool_slot && item.lifecycle != "removed")
         .filter(in_container)
         .count();
-    let at_capacity = compatible && !reusable && occupied >= max_slots;
+    let at_capacity = compatible && !reusable && policy.max_slots.is_some_and(|limit| occupied >= limit);
     Ok(WorktreeCreationPlan {
         start_oid: oid.clone(),
         requires_new_project: !reusable,
@@ -320,6 +299,7 @@ pub fn creation_plan_with_progress(source: &Path, start_ref: &str, include_dirty
         } else {
             Some(disk_budget_with_progress(source, &oid, include_dirty, &container, progress)?)
         },
+        directory: container.to_string_lossy().into(),
     })
 }
 
@@ -330,10 +310,10 @@ pub fn selection_plan(
     include_dirty: bool,
     max_slots: usize,
 ) -> Result<WorktreeCreationPlan, String> {
-    selection_plan_with_progress(source, branch, create_branch, include_dirty, max_slots, None, &mut Progress::new(&|_| {}))
+    selection_plan_with_progress(source, branch, create_branch, include_dirty, &WorktreePolicy::beside_repository(max_slots), None, &mut Progress::new(&|_| {}))
 }
 
-pub fn selection_plan_with_progress(source: &Path, branch: &str, create_branch: bool, include_dirty: bool, max_slots: usize, start_ref: Option<&str>, progress: &mut Progress<'_>) -> Result<WorktreeCreationPlan, String> {
+pub fn selection_plan_with_progress(source: &Path, branch: &str, create_branch: bool, include_dirty: bool, policy: &WorktreePolicy, start_ref: Option<&str>, progress: &mut Progress<'_>) -> Result<WorktreeCreationPlan, String> {
     progress.send("checking", 0, None, 0);
     let start = selector::selection_start(source, branch, create_branch, include_dirty, start_ref)?;
     if branch.is_empty() || branch.starts_with(['-', '@']) {
@@ -362,6 +342,7 @@ pub fn selection_plan_with_progress(source: &Path, branch: &str, create_branch: 
                 requires_new_project: false,
                 at_capacity: false,
                 budget: None,
+                directory: item.root.unwrap_or_default(),
             });
         }
     }
@@ -371,7 +352,7 @@ pub fn selection_plan_with_progress(source: &Path, branch: &str, create_branch: 
         include_dirty,
         true,
         None,
-        max_slots,
+        policy,
         progress,
     )
 }
@@ -437,7 +418,7 @@ mod tests {
         assert_eq!(rows.iter().filter(|row| row.usage.is_some()).count(), 2);
         assert_eq!(rows.iter().filter(|row| row.error.is_some()).count(), 1);
         assert!(!common.join("locus-worktrees").exists());
-        assert!(!selector::pool_root_path(&source).unwrap().exists());
+        assert!(!location::WorktreePolicy::beside_repository(1).container(&source).unwrap().exists());
         assert_eq!(std::fs::read_dir(plain).unwrap().count(), 0);
     }
 
@@ -467,7 +448,7 @@ mod tests {
             canonical(&external).unwrap()
         );
         assert!(!selected.pool_slot);
-        assert!(!selector::pool_root_path(&source).unwrap().exists());
+        assert!(!location::WorktreePolicy::beside_repository(0).container(&source).unwrap().exists());
         assert!(pool_usage(&source).unwrap().items.is_empty());
     }
 
@@ -476,7 +457,7 @@ mod tests {
         let (_temp, source) = fixture();
         let events = std::sync::Mutex::new(Vec::new());
         let report = |event: estimate::WorktreePlanProgress| events.lock().unwrap().push(event.phase);
-        let plan = selection_plan_with_progress(&source, "codex/full", true, false, 0, None, &mut Progress::new(&report)).unwrap();
+        let plan = selection_plan_with_progress(&source, "codex/full", true, false, &WorktreePolicy::beside_repository(0), None, &mut Progress::new(&report)).unwrap();
         assert!(plan.at_capacity);
         assert!(plan.budget.is_none());
         let events = events.lock().unwrap();
@@ -487,9 +468,10 @@ mod tests {
     #[test]
     fn empty_pool_is_only_estimated_until_new_project_is_confirmed() {
         let (_temp, source) = fixture();
-        let container = selector::pool_root_path(&source).unwrap();
+        let container = WorktreePolicy::beside_repository(2).container(&source).unwrap();
         let plan = selection_plan(&source, "codex/planned", true, true, 2).unwrap();
         assert!(plan.requires_new_project);
+        assert_eq!(plan.directory, container.to_string_lossy());
         assert!(plan.budget.as_ref().unwrap().checkout_bytes > 0);
         assert!(!plan.budget.as_ref().unwrap().cache_known);
         assert!(!container.exists());

@@ -44,6 +44,42 @@ impl<'a> Progress<'a> {
     }
 }
 
+/// Receives checkout progress from steps several call levels below the public
+/// entry points (worktree creation, pool acquisition).
+pub type ProgressSink = std::sync::Arc<dyn Fn(WorktreePlanProgress) + Send + Sync>;
+
+thread_local! {
+    static CREATION_PROGRESS: std::cell::RefCell<Option<ProgressSink>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs `sink` for `run`, which must execute synchronously on this thread.
+/// Scoping it here keeps the many creation entry points' signatures unchanged.
+pub fn with_creation_progress<R>(sink: ProgressSink, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<ProgressSink>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            CREATION_PROGRESS.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(CREATION_PROGRESS.with(|slot| slot.borrow_mut().replace(sink)));
+    run()
+}
+
+pub(super) fn creation_progress() -> Option<ProgressSink> {
+    CREATION_PROGRESS.with(|slot| slot.borrow().clone())
+}
+
+/// Reads git's progress meter, `<label>: NN% (done/total)[, done.]`. The label
+/// is ignored because localized git builds translate it.
+pub(super) fn git_progress_counts(segment: &str) -> Option<(u64, u64)> {
+    let (_, meter) = segment.rsplit_once("% (")?;
+    let (counts, _) = meter.split_once(')')?;
+    let (done, total) = counts.split_once('/')?;
+    Some((done.trim().parse().ok()?, total.trim().parse().ok()?))
+}
+
 pub(super) fn is_alias(metadata: &std::fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
@@ -257,6 +293,26 @@ mod tests {
             library_bytes(&library, &mut Progress::new(&report)).unwrap(),
             256
         );
+    }
+
+    #[test]
+    fn git_progress_meter_is_parsed_independent_of_label() {
+        assert_eq!(git_progress_counts("Updating files:  45% (1350/3000)"), Some((1350, 3000)));
+        assert_eq!(git_progress_counts("更新文件: 100% (3000/3000), done."), Some((3000, 3000)));
+        assert_eq!(git_progress_counts("Preparing worktree (new branch 'a')"), None);
+        assert_eq!(git_progress_counts("HEAD is now at e820418 init"), None);
+    }
+
+    #[test]
+    fn creation_progress_is_scoped_to_the_call() {
+        assert!(creation_progress().is_none());
+        let events = std::sync::Arc::new(Mutex::new(0));
+        let counter = std::sync::Arc::clone(&events);
+        with_creation_progress(std::sync::Arc::new(move |_| *counter.lock().unwrap() += 1), || {
+            (creation_progress().unwrap())(WorktreePlanProgress { phase: "creating", files: 1, total_files: Some(2), bytes: 0 });
+        });
+        assert!(creation_progress().is_none());
+        assert_eq!(*events.lock().unwrap(), 1);
     }
 
     #[cfg(windows)]

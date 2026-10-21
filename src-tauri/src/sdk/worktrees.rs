@@ -45,6 +45,13 @@ fn target_epoch(reference: &WorkspaceRef) -> Result<u64, String> {
         "Worktree retirement requires its explicit materialization epoch; query worktrees.get first".into())
 }
 
+fn optional(value: Option<String>, name: &str) -> Result<String, String> {
+    match value {
+        Some(value) if value.trim().is_empty() => Err(format!("{name} cannot be empty; omit it to use the default directory")),
+        value => Ok(value.unwrap_or_default()),
+    }
+}
+
 pub(super) async fn dispatch(app: &AppHandle, action: &str, value: Value) -> Result<Value, String> {
     use crate::commands;
     let params: Params = parse_params(value)?;
@@ -52,7 +59,18 @@ pub(super) async fn dispatch(app: &AppHandle, action: &str, value: Value) -> Res
     let source = scope.runtime().root().to_string_lossy().into_owned();
     let registry = app.state::<Arc<ProjectRegistry>>();
     let sessions = app.state::<Arc<SessionStore>>();
+    let config = app.state::<Arc<crate::config::AppConfig>>();
     match action {
+        "defaults" => {
+            let policy = commands::worktree_policy(&config, &registry)?;
+            let (root_source, max_slots) = (policy.root_source(), policy.max_slots);
+            let container = tauri::async_runtime::spawn_blocking(move || {
+                policy.container(std::path::Path::new(&source))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            Ok(json!({"container": container, "rootSource": root_source, "maxSlots": max_slots}))
+        }
         "list" => {
             let records = commands::list_managed_worktrees(source, registry.clone()).await?;
             records
@@ -106,13 +124,14 @@ pub(super) async fn dispatch(app: &AppHandle, action: &str, value: Value) -> Res
                 let record = commands::create_worktree(
                     store::CreateWorktreeRequest {
                         source_root: source,
-                        destination: required(params.destination, "destination")?,
+                        destination: optional(params.destination, "destination")?,
                         branch: required(params.branch, "branch")?,
                         start_ref: params.start_ref,
                         include_dirty: params.include_dirty,
                     },
                     registry.clone(),
                     sessions,
+                    config,
                 )
                 .await?;
                 return descriptor(&registry, record);
@@ -127,20 +146,23 @@ pub(super) async fn dispatch(app: &AppHandle, action: &str, value: Value) -> Res
                 .await?;
                 return descriptor(&registry, record);
             }
+            let max_slots = match params.max_slots {
+                Some(0) => return Err("maxSlots must be positive".into()),
+                Some(value) => Some(value),
+                None => commands::worktree_policy(&config, &registry)?.max_slots,
+            };
             let acquired = commands::acquire_unity_project_slot(
                 crate::workspace_service::pool::AcquirePoolRequest {
                     source_root: source,
-                    pool_root: required(params.pool_root, "poolRoot")?,
+                    pool_root: optional(params.pool_root, "poolRoot")?,
                     commit: required(params.commit, "commit")?,
                     branch: params.branch,
-                    max_slots: params
-                        .max_slots
-                        .filter(|v| *v > 0)
-                        .ok_or("maxSlots must be positive")?,
+                    max_slots,
                     assignment_id: params.assignment_id,
                 },
                 registry.clone(),
                 sessions,
+                config,
                 Some(true),
             )
             .await?;
@@ -210,5 +232,12 @@ mod tests {
             "workspaceRef": {"checkoutId":"source"}, "includeDity": true,
         }))
         .is_err());
+    }
+
+    #[test]
+    fn omitted_directories_use_defaults_but_blank_values_are_rejected() {
+        assert_eq!(optional(None, "destination").unwrap(), "");
+        assert_eq!(optional(Some("F:/wt".into()), "destination").unwrap(), "F:/wt");
+        assert!(optional(Some("  ".into()), "poolRoot").unwrap_err().contains("omit it"));
     }
 }

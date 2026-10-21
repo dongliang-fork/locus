@@ -94,7 +94,8 @@ beforeEach(() => {
   mocks.invoke.mockImplementation(async (command: string, args: { request?: { startRef?: string } }) => {
     if (command === "list_managed_worktrees") return records;
     if (command === "get_worktree_pool_usage") return { items: records.map(worktree => ({ worktree, sizeBytes: 1024 })), totalBytes: records.length * 1024, availableProjects: 0 };
-    if (command === "plan_worktree_creation") return { startOid: args.request?.startRef, requiresNewProject: false, atCapacity: false, budget: null };
+    if (command === "get_worktree_defaults") return { container: "F:/Game/source.worktrees", rootSource: "repository", maxSlots: 3 };
+    if (command === "plan_worktree_creation") return { startOid: args.request?.startRef, requiresNewProject: false, atCapacity: false, budget: null, directory: "F:/Game/source.worktrees" };
     if (command === "create_worktree" || command === "import_worktree") return { ...created };
     if (command === "acquire_unity_project_slot") {
       return { worktree: { ...created }, reused: false, preservedLibrary: false };
@@ -152,7 +153,29 @@ describe("worktree manager interactions", () => {
     } });
     submit(); await settle(); button("worktrees.budget.confirm").click(); await settle();
     expect(mocks.invoke).toHaveBeenCalledWith("acquire_unity_project_slot", { allowNewProject: true, request: {
-      sourceRoot, poolRoot: "F:/Game/new", commit: "budget-head", branch: "codex/new", maxSlots: 4,
+      sourceRoot, poolRoot: "F:/Game/new", commit: "budget-head", branch: "codex/new", maxSlots: 3,
+    } });
+  });
+  it("leaves an empty directory to the configured default and executes in the reviewed directory", async () => {
+    await mount();
+    button("worktrees.create").click(); await settle();
+    await fill("worktrees.branch", "codex/default");
+    expect(field("worktrees.destination").placeholder).toBe("F:/Game/source.worktrees");
+    expect(root.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(false);
+    submit(); await settle();
+    const plan = [...mocks.invoke.mock.calls].find(([command]) => command === "plan_worktree_creation")![1];
+    expect(plan.request).not.toHaveProperty("directory");
+    expect(plan.request.maxSlots).toBe(3);
+    expect(mocks.invoke).toHaveBeenCalledWith("create_worktree", { request: {
+      sourceRoot, branch: "codex/default", startRef: "HEAD", includeDirty: false,
+    } });
+    await settle();
+
+    button("worktrees.acquire").click(); await settle();
+    mocks.invoke.mockResolvedValueOnce({ startOid: "pool-head", requiresNewProject: false, atCapacity: false, budget: null, directory: "E:/Pools/source.worktrees" });
+    submit(); await settle();
+    expect(mocks.invoke).toHaveBeenCalledWith("acquire_unity_project_slot", { allowNewProject: false, request: {
+      sourceRoot, poolRoot: "E:/Pools/source.worktrees", commit: "pool-head", branch: "codex/default", maxSlots: 3,
     } });
   });
   it("registers the source without changing focus and blocks actions during registration", async () => {
@@ -212,12 +235,22 @@ describe("worktree manager interactions", () => {
 
   it("rejects missing or invalid creation inputs before sending any mutation", async () => {
     await mount(); await beginCreate(true);
-    for (const value of ["", "0", "-1", "1.5", "9007199254740992"]) {
+    for (const value of ["0", "-1", "1.5", "9007199254740992"]) {
       await fill("worktrees.maxSlots", value);
       expect(root.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true);
       submit(); await settle();
     }
     expect(mocks.invoke.mock.calls.some(([command]) => command === "acquire_unity_project_slot")).toBe(false);
+  });
+
+  it("leaves the pool unlimited when no physical-slot budget is supplied", async () => {
+    await mount(); await beginCreate(true);
+    await fill("worktrees.maxSlots", "");
+    expect(root.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(false);
+    submit(); await settle();
+    expect(mocks.invoke).toHaveBeenCalledWith("acquire_unity_project_slot", expect.objectContaining({
+      request: expect.objectContaining({ maxSlots: null }),
+    }));
   });
 
   it("keeps focus and editable form when creation fails, then permits retry", async () => {

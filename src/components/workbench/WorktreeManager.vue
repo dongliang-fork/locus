@@ -11,7 +11,7 @@ import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
 import { openWorkspace } from "../../services/project";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
-import { createWorktree, listManagedWorktrees, importWorktree, removeManagedWorktree, acquireUnityProjectSlot, releaseUnityProjectSlot, getWorktreePoolUsage, planWorktreeCreation, type WorktreePoolUsage, type WorktreeCreationPlan, type ManagedWorktree } from "../../services/worktrees";
+import { createWorktree, listManagedWorktrees, importWorktree, removeManagedWorktree, acquireUnityProjectSlot, releaseUnityProjectSlot, getWorktreePoolUsage, getWorktreeDefaults, planWorktreeCreation, type WorktreePoolUsage, type WorktreeCreationPlan, type WorktreeDefaults, type ManagedWorktree } from "../../services/worktrees";
 
 const props = defineProps<{ sourceRoot: string }>();
 const emit = defineEmits<{ close: [] }>();
@@ -30,14 +30,15 @@ const startRef = ref("HEAD");
 const destination = ref("");
 const includeDirty = ref(false);
 const poolMode = ref(false);
-const maxSlots = ref(4);
+const maxSlots = ref<number | string>("");
 const usage = ref<WorktreePoolUsage | null>(null);
+const defaults = ref<WorktreeDefaults | null>(null);
 const pendingCreation = ref<{ plan: WorktreeCreationPlan; run: (allowNewProject: boolean) => Promise<void> } | null>(null);
 let registeredSource: string | null = null;
-const formValid = computed(() => destination.value.trim().length > 0
-  && (includeDirty.value && !poolMode.value || startRef.value.trim().length > 0)
+// An empty directory uses the configured container shown as the placeholder.
+const formValid = computed(() => (includeDirty.value && !poolMode.value || startRef.value.trim().length > 0)
   && (poolMode.value
-    ? Number.isSafeInteger(maxSlots.value) && maxSlots.value > 0
+    ? maxSlots.value === "" || (typeof maxSlots.value === "number" && Number.isSafeInteger(maxSlots.value) && maxSlots.value > 0)
     : branch.value.trim().length > 0));
 onMounted(() => { dialog.value?.showModal(); void perform(refresh); });
 
@@ -50,6 +51,9 @@ async function refresh() {
   await ensureSource();
   items.value = await listManagedWorktrees(props.sourceRoot);
   usage.value = await getWorktreePoolUsage(props.sourceRoot);
+  const initial = !defaults.value;
+  defaults.value = await getWorktreeDefaults(props.sourceRoot);
+  if (initial) maxSlots.value = defaults.value.maxSlots ?? "";
 }
 async function perform(action: () => Promise<unknown>) {
   if (busy.value) return;
@@ -74,8 +78,8 @@ async function create() {
     const target = destination.value.trim();
     const name = branch.value.trim();
     const dirty = !pool && includeDirty.value;
-    const capacity = maxSlots.value;
-    const plan = await planWorktreeCreation({ sourceRoot, directory: target, poolMode: pool,
+    const capacity = typeof maxSlots.value === "number" ? maxSlots.value : null;
+    const plan = await planWorktreeCreation({ sourceRoot, ...(target ? { directory: target } : {}), poolMode: pool,
       startRef: dirty ? "HEAD" : startRef.value.trim(), includeDirty: dirty, maxSlots: capacity }, value => {
         if (id === planId) progress.value = value;
       });
@@ -83,10 +87,11 @@ async function create() {
     planning.value = false; progress.value = null;
     const run = async (allowNewProject: boolean) => {
       if (pool) {
-        const acquired = await acquireUnityProjectSlot({ sourceRoot, poolRoot: target, commit: plan.startOid, branch: name || null, maxSlots: capacity }, allowNewProject);
+        // Acquire in the pool root that was reviewed, including a reusable slot's directory.
+        const acquired = await acquireUnityProjectSlot({ sourceRoot, poolRoot: target || plan.directory, commit: plan.startOid, branch: name || null, maxSlots: capacity }, allowNewProject);
         await created(acquired.worktree);
       } else {
-        await created(await createWorktree({ sourceRoot, destination: target, branch: name, startRef: plan.startOid, includeDirty: dirty }));
+        await created(await createWorktree({ sourceRoot, ...(target ? { destination: target } : {}), branch: name, startRef: plan.startOid, includeDirty: dirty }));
       }
     };
     if (plan.requiresNewProject || plan.atCapacity) pendingCreation.value = { plan, run };
@@ -167,8 +172,8 @@ function close() { if (!busy.value) { cancelPlanning(); emit("close"); } }
     <form v-else-if="creating && !planning" class="worktree-form" @submit.prevent="create">
       <label>{{ t("worktrees.branch") }}<input v-model="branch" :required="!poolMode" :disabled="disabled" /></label>
       <label>{{ t("worktrees.start") }}<input v-model="startRef" required :disabled="disabled || (!poolMode && includeDirty)" /></label>
-      <label class="wide">{{ t(poolMode ? "worktrees.poolRoot" : "worktrees.destination") }}<input v-model="destination" required :disabled="disabled" spellcheck="false" /></label>
-      <label v-if="poolMode">{{ t("worktrees.maxSlots") }}<input v-model.number="maxSlots" type="number" min="1" step="1" required :disabled="disabled" /></label>
+      <label class="wide">{{ t(poolMode ? "worktrees.poolRoot" : "worktrees.destination") }}<input v-model="destination" :placeholder="defaults?.container" :title="defaults?.container" :disabled="disabled" spellcheck="false" /></label>
+      <label v-if="poolMode">{{ t("worktrees.maxSlots") }}<input v-model.number="maxSlots" type="number" min="1" step="1" :placeholder="t('worktrees.unlimitedSlots')" :disabled="disabled" /></label>
       <label v-else class="include-dirty"><BaseCheckbox v-model="includeDirty" :aria-label="t('worktrees.includeDirty')" :disabled="disabled" @update:model-value="startRef = 'HEAD'" />{{ t("worktrees.includeDirty") }}</label>
       <div class="form-actions"><BaseButton type="submit" :disabled="disabled || !formValid">{{ t(poolMode ? "worktrees.acquire" : "worktrees.create") }}</BaseButton><BaseButton :disabled="disabled" @click="creating = false">{{ t("common.cancel") }}</BaseButton></div>
     </form>
@@ -202,6 +207,7 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 label { display: flex; flex-direction: column; gap: 6px; color: var(--text-secondary); font-size: 12px; }
 .wide, .form-actions { grid-column: 1 / -1; }
 input { min-width: 0; padding: 6px 8px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--input-bg, var(--bg-color)); color: var(--text-color); font-family: var(--font-mono-identifier); }
+input::placeholder { color: var(--text-secondary); opacity: 0.7; }
 .include-dirty { flex-direction: row; align-items: center; }
 .form-actions { display: flex; gap: 8px; }
 .worktree-list { padding: 4px 0; max-height: 40vh; overflow: auto; }

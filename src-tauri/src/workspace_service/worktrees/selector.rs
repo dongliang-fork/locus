@@ -1,5 +1,6 @@
 //! Chat's branch picker delegates materialization to the existing project pool.
 use super::*;
+use super::location::{editor_version_at, reusable_pool_container, WorktreePolicy};
 use crate::workspace_service::pool::{self, AcquirePoolRequest};
 
 #[derive(Debug, Serialize)]
@@ -91,37 +92,6 @@ pub fn branches(source: &Path) -> Result<Vec<WorktreeBranchOption>, String> {
     Ok(options)
 }
 
-/// A stable sibling container is shared by selections made from any linked checkout.
-fn pool_root(source: &Path) -> Result<PathBuf, String> {
-    let container = pool_root_path(source)?;
-    match std::fs::create_dir(&container) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.to_string()),
-    }
-    if !container.is_dir()
-        || path_key(&canonical(&container)?) != path_key(&container)
-        || std::fs::symlink_metadata(&container)
-            .map_err(io_error)?
-            .file_type()
-            .is_symlink()
-    {
-        return Err("Worktree container must be a directory without links".into());
-    }
-    Ok(container)
-}
-
-pub(super) fn pool_root_path(source: &Path) -> Result<PathBuf, String> {
-    let common = resolve_git_common_dir(source).ok_or("Workspace is not a Git checkout")?;
-    let main = canonical(common.parent().ok_or("Git directory has no parent")?)?;
-    let parent = main
-        .parent()
-        .ok_or("Repository has no parent for worktrees")?;
-    let name = main.file_name().ok_or("Repository directory has no name")?;
-    let container = parent.join(format!("{}.worktrees", name.to_string_lossy()));
-    Ok(container)
-}
-
 pub fn select(
     source: &Path,
     branch: &str,
@@ -147,7 +117,15 @@ pub fn select_with_creation_policy(
     max_slots: usize,
     allow_new_project: bool,
 ) -> Result<ManagedWorktree, String> {
-    select_from_ref(source, branch, create_branch, include_dirty, max_slots, allow_new_project, None)
+    select_from_ref(
+        source,
+        branch,
+        create_branch,
+        include_dirty,
+        &WorktreePolicy::beside_repository(max_slots),
+        allow_new_project,
+        None,
+    )
 }
 
 /// Remote refs are explicit creation sources; they never replace a local branch.
@@ -172,7 +150,7 @@ pub fn select_from_ref(
     branch: &str,
     create_branch: bool,
     include_dirty: bool,
-    max_slots: usize,
+    policy: &WorktreePolicy,
     allow_new_project: bool,
     start_ref: Option<&str>,
 ) -> Result<ManagedWorktree, String> {
@@ -210,16 +188,8 @@ pub fn select_from_ref(
         source,
         &["rev-parse", "--show-toplevel"],
     )?))?;
-    let relative = existing_path_relative(&repo, source)?.ok_or("Project is outside repository")?;
-    let version_path = relative
-        .join("ProjectSettings/ProjectVersion.txt")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let version = git_text(&repo, &["show", &format!("{oid}:{version_path}")]).unwrap_or_default();
-    let editor = version
-        .lines()
-        .find_map(|line| line.strip_prefix("m_EditorVersion:").map(str::trim))
-        .unwrap_or("");
+    let editor = editor_version_at(source, &oid)?;
+    let editor = editor.as_str();
     if !editor.starts_with("6000.5.")
         || (include_dirty && editor_version(source).as_deref() != Some(editor))
     {
@@ -231,10 +201,7 @@ pub fn select_from_ref(
         return create_for_branch(
             &CreateWorktreeRequest {
                 source_root: source.to_string_lossy().into(),
-                destination: pool_root(source)?
-                    .join(format!("chat-{}", uuid::Uuid::new_v4().simple()))
-                    .to_string_lossy()
-                    .into(),
+                destination: policy.new_checkout(source, "chat")?.to_string_lossy().into(),
                 branch: branch.into(),
                 start_ref: Some(oid),
                 include_dirty,
@@ -242,33 +209,16 @@ pub fn select_from_ref(
             !create_branch,
         );
     }
-    // WorktreeManager / SDK callers may already own a pool at a custom path.
-    // Prefer its compatible released slots instead of creating a parallel pool.
-    let mut pools: Vec<_> = list(source)?
-        .into_iter()
-        .filter(|item| {
-            item.pool_slot
-                && item.managed
-                && item.editor_version.as_deref() == Some(editor)
-                && matches!(item.lifecycle.as_str(), "available" | "active")
-        })
-        .collect();
-    pools.sort_by_cached_key(|item| {
-        (
-            !pool::can_reuse(item),
-            item.checkout_id.clone(),
-        )
-    });
-    let container = match pools
-        .iter()
-        .find_map(|item| Path::new(&item.repo_root).parent().map(Path::to_path_buf))
-    {
+    // A released compatible slot is reused wherever it lives, including a
+    // custom pool created by WorktreeManager / SDK callers. A new slot always
+    // goes to the configured container.
+    let container = match reusable_pool_container(&list(source)?, editor) {
         Some(path) => canonical(&path)?,
         None => {
             if !allow_new_project {
                 return Err(pool::NEW_PROJECT_REQUIRED.into());
             }
-            pool_root(source)?
+            policy.ensure_container(source)?
         }
     };
     ensure_git_idle(&repo)?;
@@ -297,7 +247,7 @@ pub fn select_from_ref(
             pool_root: container.to_string_lossy().into(),
             commit: oid.clone(),
             branch: create_branch.then(|| branch.into()),
-            max_slots,
+            max_slots: policy.max_slots,
             assignment_id: None,
         },
         allow_new_project,
@@ -376,10 +326,11 @@ mod tests {
             git(&source, &["commit", "-m", "local ahead"]).unwrap();
             let local_oid = git_text(&source, &["rev-parse", "HEAD"]).unwrap();
             std::fs::write(source.join("Assets/draft.asset"), "local draft").unwrap();
-            let plan = usage::selection_plan_with_progress(&source, "白盒-4", true, false, 2, Some("refs/remotes/origin/白盒-4"), &mut estimate::Progress::new(&|_| {})).unwrap();
+            let policy = WorktreePolicy::beside_repository(2);
+            let plan = usage::selection_plan_with_progress(&source, "白盒-4", true, false, &policy, Some("refs/remotes/origin/白盒-4"), &mut estimate::Progress::new(&|_| {})).unwrap();
             assert_eq!(plan.start_oid, remote_oid);
             assert!(git(&source, &["show-ref", "--verify", "refs/heads/白盒-4"]).is_err());
-            let created = select_from_ref(&source, "白盒-4", true, false, 2, true, Some("refs/remotes/origin/白盒-4")).unwrap();
+            let created = select_from_ref(&source, "白盒-4", true, false, &policy, true, Some("refs/remotes/origin/白盒-4")).unwrap();
             assert_eq!(created.head_oid, remote_oid);
             assert_eq!(created.pool_slot, editor.starts_with("6000.5."));
             assert_eq!(created.branch.as_deref(), Some("refs/heads/白盒-4"));
@@ -387,7 +338,7 @@ mod tests {
             assert!(!Path::new(&created.root).join("Assets/draft.asset").exists());
             assert_eq!(git_text(&source, &["rev-parse", "HEAD"]).unwrap(), local_oid);
             assert!(source.join("Assets/draft.asset").is_file());
-            assert!(select_from_ref(&source, "白盒-4", true, false, 2, true, Some("refs/remotes/origin/白盒-4")).unwrap_err().contains("already exists"));
+            assert!(select_from_ref(&source, "白盒-4", true, false, &policy, true, Some("refs/remotes/origin/白盒-4")).unwrap_err().contains("already exists"));
         }
     }
 
@@ -542,9 +493,14 @@ mod tests {
         git(&source, &["branch", "feature/legacy"]).unwrap();
         let target = select(&source, "feature/legacy", false, false, 1).unwrap();
         assert!(!target.pool_slot);
+        let policy = WorktreePolicy::beside_repository(1);
         assert_eq!(
-            pool_root(&source).unwrap(),
-            pool_root(Path::new(&target.root)).unwrap()
+            policy.container(&source).unwrap(),
+            policy.container(Path::new(&target.root)).unwrap()
+        );
+        assert_eq!(
+            Path::new(&target.repo_root).parent().unwrap(),
+            policy.container(&source).unwrap()
         );
         assert_eq!(
             git_text(Path::new(&target.root), &["symbolic-ref", "HEAD"]).unwrap(),
@@ -564,7 +520,7 @@ mod tests {
             pool_root: custom.to_string_lossy().into(),
             commit: "HEAD".into(),
             branch: Some("codex/sdk-created".into()),
-            max_slots: 1,
+            max_slots: Some(1),
             assignment_id: None,
         })
         .unwrap()
@@ -579,5 +535,34 @@ mod tests {
         let selected = select(&source, "codex/from-picker", true, false, 1).unwrap();
         assert_eq!(first.checkout_id, selected.checkout_id);
         assert_eq!(Path::new(&selected.repo_root).parent().unwrap(), custom);
+    }
+
+    #[test]
+    fn picker_creates_new_slots_in_the_configured_root_and_reuses_released_slots_elsewhere() {
+        let (temp, source) = fixture();
+        let old = select(&source, "codex/old-root", true, false, 2).unwrap();
+        let configured = temp.path().join("configured-root");
+        std::fs::create_dir(&configured).unwrap();
+        let policy = location::WorktreePolicy::with_root(
+            configured.clone(),
+            location::WorktreeRootSource::Settings,
+            2,
+        );
+        let container = policy.container(&source).unwrap();
+        // The old slot is still assigned, so a new slot follows the new root
+        // instead of joining the old pool directory.
+        let created = select_from_ref(&source, "codex/new-root", true, false, &policy, true, None).unwrap();
+        assert_eq!(Path::new(&created.repo_root).parent().unwrap(), container);
+        assert!(created.pool_slot);
+        pool::release(
+            &source,
+            &old.checkout_id,
+            old.assignment_id.as_deref().unwrap(),
+            old.materialization_epoch,
+        )
+        .unwrap();
+        let reused = select_from_ref(&source, "codex/reuse-old", true, false, &policy, false, None).unwrap();
+        assert_eq!(reused.checkout_id, old.checkout_id);
+        assert_ne!(Path::new(&reused.repo_root).parent().unwrap(), container);
     }
 }

@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { open } from "@tauri-apps/plugin-dialog";
 import { t } from "../../i18n";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
-import { getAllWorktreePoolUsage, type WorktreeProjectUsage } from "../../services/worktrees";
+import { getAllWorktreePoolUsage, getWorktreeRootSettings, setWorktreeRootSetting, type WorktreeProjectUsage, type WorktreeRootSettings } from "../../services/worktrees";
 import { normalizeAppError } from "../../services/errors";
 import { formatWorktreeBytes } from "../../utils/worktreeDiskUsage";
 import BaseButton from "../ui/BaseButton.vue";
@@ -31,6 +32,26 @@ async function refresh() {
   finally { if (current === revision) loading.value = false; }
 }
 function closeManager() { managerSource.value = null; void refresh(); }
+
+const rootSettings = ref<WorktreeRootSettings | null>(null);
+const rootBusy = ref(false);
+const rootError = ref("");
+const effectiveRoot = computed(() => rootSettings.value?.processRoot ?? rootSettings.value?.settingsRoot ?? null);
+const rootLocked = computed(() => !!rootSettings.value?.processRoot);
+async function updateRoot(action: () => Promise<WorktreeRootSettings | null>) {
+  if (rootBusy.value) return;
+  rootBusy.value = true; rootError.value = "";
+  try { rootSettings.value = await action() ?? rootSettings.value; }
+  catch (cause) { rootError.value = normalizeAppError(cause).message; }
+  finally { rootBusy.value = false; }
+}
+function chooseRoot() {
+  return updateRoot(async () => {
+    const selected = await open({ directory: true, multiple: false, defaultPath: rootSettings.value?.settingsRoot ?? undefined });
+    return typeof selected === "string" && selected.trim() ? setWorktreeRootSetting(selected) : null;
+  });
+}
+onMounted(() => { void updateRoot(getWorktreeRootSettings); });
 watch(() => workspaces.projects.map(project => [project.projectId, ...project.checkouts.map(checkout => checkout.root)].join("\0")).join("\n"), refresh, { immediate: true });
 onUnmounted(() => { revision++; });
 </script>
@@ -39,6 +60,16 @@ onUnmounted(() => { revision++; });
   <div class="worktree-pool-settings">
     <div class="section-label">{{ t('worktrees.pool.title') }}</div>
     <div class="pool-panel" :aria-busy="loading">
+      <div class="pool-location" :aria-busy="rootBusy">
+        <div class="pool-location-row">
+          <span class="pool-location-label">{{ t('worktrees.location.label') }}</span>
+          <code class="pool-location-path" :title="effectiveRoot ?? undefined">{{ effectiveRoot ?? t('worktrees.location.repository') }}</code>
+          <BaseButton :disabled="rootBusy || !rootSettings || rootLocked" @click="chooseRoot">{{ t('worktrees.location.change') }}</BaseButton>
+          <BaseButton v-if="rootSettings?.settingsRoot && !rootLocked" :disabled="rootBusy" @click="updateRoot(() => setWorktreeRootSetting(null))">{{ t('worktrees.location.reset') }}</BaseButton>
+        </div>
+        <p v-if="rootLocked" class="pool-location-note">{{ t('worktrees.location.process') }}</p>
+        <p v-if="rootError" class="pool-error" role="alert">{{ rootError }}</p>
+      </div>
       <div class="pool-toolbar">
         <span class="pool-summary">{{ loading ? t('worktrees.pool.measuring') : t('worktrees.pool.summary', totals.count, totals.available, formatWorktreeBytes(totals.bytes)) }}</span>
         <BaseButton :disabled="loading" @click="refresh">{{ t('common.refresh') }}</BaseButton>
@@ -65,6 +96,11 @@ onUnmounted(() => { revision++; });
 .worktree-pool-settings { margin-top: 24px; max-width: 760px; }
 .section-label { margin-bottom: 12px; font-size: 13px; font-weight: 600; }
 .pool-panel { border: 1px solid var(--border-color); border-radius: 10px; overflow: hidden; }
+.pool-location { padding: 10px 16px; border-bottom: 1px solid var(--border-color); font-size: 12px; }
+.pool-location-row { display: flex; align-items: center; gap: 10px; }
+.pool-location-label { flex-shrink: 0; color: var(--text-secondary); }
+.pool-location-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono-identifier); font-size: 11px; color: var(--text-color); }
+.pool-location-note { margin: 6px 0 0; color: var(--text-secondary); font-size: 11px; }
 .pool-toolbar { display: flex; align-items: center; gap: 10px; padding: 12px 16px; background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%); }
 .pool-summary { flex: 1; min-width: 0; color: var(--text-secondary); font-size: 12px; font-variant-numeric: tabular-nums; }
 .pool-table-scroll { overflow-x: auto; }

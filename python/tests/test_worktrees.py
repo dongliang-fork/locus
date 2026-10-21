@@ -38,6 +38,8 @@ class Client(locus.Client):
             return [{"name":"unity_execute"}]
         if method in {"worktrees.discover", "worktrees.operations"}:
             return []
+        if method == "worktrees.defaults":
+            return {"container": "F:/source.worktrees", "rootSource": "settings", "maxSlots": None}
         if method == "tools.call":
             await asyncio.sleep(0)
             return {"name": params["name"], "output": params["workspaceRef"]["checkoutId"], "isError": False}
@@ -86,6 +88,23 @@ class WorktreeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.worktree.workspace_ref.expected_materialization_epoch, 2)
         await self.client.worktrees.remove(wt)
         self.assertEqual(self.client.calls[-1][1]["worktree"], wt.workspace_ref.to_payload())
+
+    async def test_omitted_directories_and_capacity_use_backend_defaults(self):
+        defaults = await self.client.worktrees.defaults()
+        self.assertEqual(defaults, locus.WorktreeDefaults("F:/source.worktrees", "settings", None))
+        await self.client.worktrees.create(branch="codex/default")
+        params = self.client.calls[-1][1]
+        self.assertIsNone(params["destination"])
+        await self.client.worktrees.acquire(commit="HEAD")
+        params = self.client.calls[-1][1]
+        self.assertIsNone(params["poolRoot"])
+        self.assertIsNone(params["maxSlots"])
+        calls = len(self.client.calls)
+        with self.assertRaises(ValueError):
+            await self.client.worktrees.create(branch="codex/blank", destination=" ")
+        with self.assertRaises(ValueError):
+            await self.client.worktrees.acquire(commit="HEAD", pool_root="")
+        self.assertEqual(len(self.client.calls), calls)
 
     async def test_parallel_calls_have_independent_targets_and_ambient_directory(self):
         cwd = os.getcwd()

@@ -318,7 +318,7 @@ pub(super) async fn run(
         pool_root: pool_root.to_string_lossy().into(),
         commit: baseline,
         branch: None,
-        max_slots: 1,
+        max_slots: Some(1),
         assignment_id: Some(format!("pool-{token}-a")),
     };
     let first = pool::acquire(&request)?;
